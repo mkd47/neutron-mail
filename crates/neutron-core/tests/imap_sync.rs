@@ -156,11 +156,10 @@ async fn rejects_untrusted_certificate() {
         return;
     }
     let mut cfg = common::config(Security::Tls);
-    cfg.extra_ca_pem = None; // self-signed test cert is not in the Mozilla roots
-    let err = imap::connect(&cfg, common::PASSWORD)
-        .await
-        .err()
-        .expect("must fail");
+    cfg.extra_ca_pem = None; // private test CA is not in the Mozilla roots
+    let Err(err) = imap::connect(&cfg, common::PASSWORD).await else {
+        panic!("connection with an untrusted certificate must fail");
+    };
     assert!(err.to_string().to_lowercase().contains("tls"), "{err}");
 }
 
