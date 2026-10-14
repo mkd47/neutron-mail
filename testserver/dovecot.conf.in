@@ -1,0 +1,55 @@
+dovecot_config_version = 2.4.0
+listen = 127.0.0.1
+dovecot_storage_version = 2.4.0
+base_dir = @BASE@/run
+state_dir = @BASE@/run/state
+instance_name = nmtest
+default_internal_user = @USER@
+default_internal_group = @GROUP@
+default_login_user = @USER@
+protocols = imap
+log_path = @BASE@/dovecot.log
+auth_mechanisms = plain login
+auth_allow_cleartext = yes
+ssl = yes
+ssl_server_cert_file = @BASE@/certs/cert.pem
+ssl_server_key_file = @BASE@/certs/key.pem
+mail_driver = maildir
+mail_path = ~/Maildir
+mail_home = @BASE@/mail/%{user | username}
+passdb passwd-file {
+  passwd_file_path = @BASE@/users
+}
+userdb passwd-file {
+  passwd_file_path = @BASE@/users
+}
+service imap-login {
+  inet_listener imap {
+    port = 10143
+  }
+  inet_listener imaps {
+    port = 10993
+    ssl = yes
+  }
+}
+service anvil {
+  chroot =
+}
+service imap-login {
+  chroot =
+}
+namespace inbox {
+  inbox = yes
+  mailbox Sent {
+    special_use = \Sent
+    auto = subscribe
+  }
+  mailbox Drafts {
+    special_use = \Drafts
+    auto = subscribe
+  }
+  mailbox Trash {
+    special_use = \Trash
+    auto = subscribe
+  }
+}

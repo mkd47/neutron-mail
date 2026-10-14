@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/neutron-core"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-TBD"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
