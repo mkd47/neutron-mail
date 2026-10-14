@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Least privilege: the main window may call only Neutron's own commands and listen for its sync event. No fs, shell, http, opener or other plugins are enabled.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-app-info",
+    "allow-list-accounts",
+    "allow-add-account",
+    "allow-remove-account",
+    "allow-set-password",
+    "allow-sync-account",
+    "allow-list-folders",
+    "allow-list-messages",
+    "allow-get-message",
+    "allow-search",
+    "allow-send-message"
+  ]
+}
