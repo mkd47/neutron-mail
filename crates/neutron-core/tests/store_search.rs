@@ -153,3 +153,23 @@ fn database_file_is_private() {
         0o600
     );
 }
+
+#[test]
+fn extra_ca_accepts_trimmed_and_crlf_pem_and_errors_concisely() {
+    // A real (throwaway) self-signed certificate is not needed: use the test
+    // CA if the test server has been started, otherwise skip quietly.
+    let base = std::env::var("NM_TEST_BASE").unwrap_or_else(|_| "/workspace/testmail".into());
+    if let Ok(pem) = std::fs::read_to_string(format!("{base}/certs/ca.pem")) {
+        assert_eq!(
+            neutron_core::tls::parse_extra_ca(pem.trim()).unwrap().len(),
+            1
+        );
+        let crlf = pem.replace('\n', "\r\n");
+        assert_eq!(neutron_core::tls::parse_extra_ca(&crlf).unwrap().len(), 1);
+    }
+    let broken = "-----BEGIN CERTIFICATE-----\nAAAA\n";
+    let err = neutron_core::tls::parse_extra_ca(broken)
+        .unwrap_err()
+        .to_string();
+    assert!(err.len() < 120, "error should be concise: {err}");
+}

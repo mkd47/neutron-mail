@@ -12,9 +12,16 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 use crate::{Error, Result};
 
 pub fn parse_extra_ca(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let certs: Vec<_> = CertificateDer::pem_slice_iter(pem.as_bytes())
+    // Pasted PEM often loses its final newline (or has CRLF), which the
+    // parser rejects as a missing end marker. Normalize first. The error
+    // deliberately omits the parser's detail, which echoes raw bytes.
+    let mut normalized = pem.replace("\r\n", "\n").trim().to_owned();
+    normalized.push('\n');
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(normalized.as_bytes())
         .collect::<std::result::Result<_, _>>()
-        .map_err(|e| Error::Tls(format!("invalid CA certificate PEM: {e}")))?;
+        .map_err(|_| {
+            Error::Tls("invalid CA certificate: expected a PEM \"BEGIN CERTIFICATE\" block".into())
+        })?;
     if certs.is_empty() {
         return Err(Error::Tls("no certificate found in CA PEM".into()));
     }
