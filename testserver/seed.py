@@ -5,7 +5,7 @@ import imaplib, ssl, time, os
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
-ctx = ssl.create_default_context(cafile=os.environ.get("NM_TEST_CA", "/workspace/testmail/certs/ca.pem"))
+ctx = ssl.create_default_context(cafile=os.environ.get("NM_TEST_CA", os.environ.get("NM_TEST_BASE", "/workspace/testmail") + "/certs/ca.pem"))
 M = imaplib.IMAP4_SSL("127.0.0.1", 10993, ssl_context=ctx)
 M.login("kaan@localhost", "testpass")
 

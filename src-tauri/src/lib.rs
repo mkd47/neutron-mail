@@ -31,6 +31,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            restrict_dir(&dir);
             let store = Arc::new(Store::open(&dir.join("cache.sqlite3"))?);
             let secrets = Arc::new(SecretStore::detect());
             tracing::info!(backend = ?secrets.backend(), "secret storage selected");
@@ -62,4 +64,15 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");
+}
+
+/// The data dir holds the mail cache and WebKit storage: owner-only access.
+fn restrict_dir(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!("could not restrict data directory permissions: {e}");
+        }
+    }
 }

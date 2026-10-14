@@ -169,7 +169,12 @@ async fn rejects_wrong_password() {
         return;
     }
     let cfg = common::config(Security::Tls);
-    assert!(imap::connect(&cfg, "wrong").await.is_err());
+    let secret = "wrong-Secret-1234";
+    let Err(err) = imap::connect(&cfg, secret).await else {
+        panic!("login with a wrong password must fail");
+    };
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains(secret), "error leaks the password: {shown}");
 }
 
 #[tokio::test]

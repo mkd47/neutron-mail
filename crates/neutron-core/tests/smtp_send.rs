@@ -52,7 +52,7 @@ async fn smtp_rejects_bad_credentials() {
     let cfg = common::config(Security::Tls);
     let r = smtp::send(
         &cfg,
-        "wrong",
+        "wrong-Secret-1234",
         &OutgoingMessage {
             to: vec!["kaan@localhost".into()],
             cc: vec![],
@@ -61,7 +61,14 @@ async fn smtp_rejects_bad_credentials() {
         },
     )
     .await;
-    assert!(r.is_err());
+    let Err(err) = r else {
+        panic!("send with bad credentials must fail");
+    };
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains("wrong-Secret-1234"),
+        "error leaks the password: {shown}"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +89,14 @@ async fn smtp_rejects_untrusted_certificate() {
         },
     )
     .await;
-    assert!(r.is_err());
+    let Err(err) = r else {
+        panic!("send with bad credentials must fail");
+    };
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains("wrong-Secret-1234"),
+        "error leaks the password: {shown}"
+    );
 }
 
 #[test]
