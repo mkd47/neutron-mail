@@ -29,6 +29,12 @@
   let messages = $state<MessageSummary[]>([]);
   let selectedId = $state<number | null>(null);
   let detail = $state<MessageView | null>(null);
+  let accountVersion = 0;
+  let folderRequest = 0;
+  let messageRequest = 0;
+  let detailRequest = 0;
+  let searchRequest = 0;
+  let navigationRequest = 0;
   let loadRemote = $state(false);
   let link = $state<LinkInfo | null>(null);
   let hoverUrl = $state<string | null>(null);
@@ -65,22 +71,29 @@
     } catch (e) { showToast(errorText(e), true); }
   }
   async function openMessageById(id: number) {
+    const navigation = ++navigationRequest;
+    detailRequest++;
     try {
       const d = await api.getMessage(id, theme === "dark", false);
-      for (const a of [account!, ...accounts.filter((x) => x.id !== account?.id)]) {
+      if (navigation !== navigationRequest) return;
+      const candidates = account ? [account, ...accounts.filter((x) => x.id !== account?.id)] : accounts;
+      for (const a of candidates) {
         const fs = a.id === account?.id ? folders : await api.listFolders(a.id);
+        if (navigation !== navigationRequest) return;
         const f = fs.find((x) => x.id === d.folder_id);
         if (!f) continue;
         appView = "mail"; showSettings = false; showRules = false;
-        if (a.id !== account?.id) { account = a; folders = fs; }
-        folder = f; hits = null; query = ""; messages = []; picked = [id];
+        if (a.id !== account?.id) { accountVersion++; folderRequest++; account = a; folders = fs; }
+        searchRequest++; clearTimeout(searchTimer);
+        folder = f; hits = null; query = ""; messages = []; picked = [id]; selectedId = id; detail = null;
         await refreshMessages();
-        selectedId = id; detail = d; loadRemote = false;
+        if (navigation !== navigationRequest) return;
+        detail = d; loadRemote = false;
         await refreshFolders();
         return;
       }
       showToast("The message's folder wasn't found", true);
-    } catch (e) { showToast(errorText(e), true); }
+    } catch (e) { if (navigation === navigationRequest) showToast(errorText(e), true); }
   }
   // Multi-selection in the message list (Ctrl/Shift click).
   let picked = $state<number[]>([]);
@@ -107,7 +120,7 @@
     accounts = accounts.filter((a) => a.id !== id);
     showToast("Account removed");
     if (accounts[0]) await selectAccount(accounts[0]);
-    else { account = null; folders = []; messages = []; detail = null; showSetup = true; }
+    else { accountVersion++; navigationRequest++; detailRequest++; searchRequest++; account = null; folders = []; messages = []; detail = null; selectedId = null; picked = []; showSetup = true; }
   }
   let compose = $state<ComposeDraft | null>(null);
   let agendaKey = $state(0);
@@ -151,13 +164,17 @@
 
   async function refreshFolders() {
     if (!account) return;
-    folders = await api.listFolders(account.id);
+    const id = account.id, version = accountVersion, request = ++folderRequest;
+    const result = await api.listFolders(id);
+    if (version !== accountVersion || account?.id !== id || request !== folderRequest) return;
+    folders = result;
     if (folder) folder = folders.find((f) => f.id === folder!.id) ?? null;
     if (!folder) folder = folders.find((f) => f.role === "inbox") ?? folders[0] ?? null;
   }
   const PAGE = 200;
   let loadingMore = false;
   async function refreshMessages() {
+    const request = ++messageRequest, version = accountVersion;
     if (!folder) { messages = []; return; }
     // Keep as many rows as were already loaded (paged by the backend's 500 cap).
     const want = Math.max(PAGE, messages.length), id = folder.id;
@@ -165,32 +182,44 @@
     while (out.length < want) {
       const n = Math.min(500, want - out.length);
       const page = await api.listMessages(id, out.length, n);
+      if (version !== accountVersion || folder?.id !== id || request !== messageRequest) return;
       out.push(...page);
       if (page.length < n) break;
     }
-    if (folder?.id === id) messages = out;
+    messages = out;
   }
   async function loadMore() {
     if (!folder || hits || loadingMore) return;
     const total = folders.find((f) => f.id === folder!.id)?.total ?? 0;
     if (messages.length >= total) return;
     loadingMore = true;
+    const request = messageRequest, version = accountVersion, id = folder.id;
     try {
-      const id = folder.id;
       const page = await api.listMessages(id, messages.length, PAGE);
-      if (folder?.id === id) messages = [...messages, ...page.filter((m) => !messages.some((x) => x.id === m.id))];
-    } finally { loadingMore = false; }
+      if (version === accountVersion && folder?.id === id && request === messageRequest) {
+        const existing = new Set(messages.map((m) => m.id));
+        messages = [...messages, ...page.filter((m) => !existing.has(m.id))];
+      }
+    } catch (e) { if (version === accountVersion && folder?.id === id) showToast(errorText(e), true); }
+    finally { loadingMore = false; }
   }
   function onListScroll(e: Event) {
     const el = e.currentTarget as HTMLElement;
     if (el.scrollTop + el.clientHeight > el.scrollHeight - 600) void loadMore();
   }
   async function selectAccount(a: Account) {
-    account = a; folder = null; messages = []; detail = null; selectedId = null; hits = null; query = "";
-    await refreshFolders(); await refreshMessages();
-    void sync();
+    const version = ++accountVersion;
+    navigationRequest++; detailRequest++; searchRequest++; messageRequest++;
+    clearTimeout(searchTimer);
+    account = a; folder = null; messages = []; detail = null; selectedId = null; hits = null; query = ""; picked = []; anchor = null;
+    await refreshFolders();
+    if (version !== accountVersion) return;
+    await refreshMessages();
+    if (version === accountVersion) void sync();
   }
   async function selectFolder(f: Folder) {
+    navigationRequest++; detailRequest++; searchRequest++;
+    clearTimeout(searchTimer);
     folder = f; hits = null; query = ""; detail = null; selectedId = null; messages = []; picked = [];
     await refreshMessages();
   }
@@ -326,44 +355,59 @@
   }
 
   async function open(m: MessageSummary) {
-    selectedId = m.id; loadRemote = false;
+    navigationRequest++;
+    const request = ++detailRequest, version = accountVersion;
+    selectedId = m.id; loadRemote = false; detail = null;
     try {
-      detail = await api.getMessage(m.id, theme === "dark", false);
+      const result = await api.getMessage(m.id, theme === "dark", false);
+      if (version !== accountVersion || request !== detailRequest || selectedId !== m.id) return;
+      detail = result;
       if (!m.seen) { m.seen = true; await refreshFolders(); }
-    } catch (e) { status = errorText(e); }
+    } catch (e) { if (version === accountVersion && request === detailRequest) status = errorText(e); }
   }
+  const syncingAccounts = new Set<number>();
   async function sync() {
-    if (!account || syncing) return;
-    syncing = true; status = "Syncing…";
+    if (!account || syncingAccounts.has(account.id)) return;
+    const id = account.id, version = accountVersion;
+    syncingAccounts.add(id); syncing = true; status = "Syncing…";
     try {
-      const r = await api.syncAccount(account.id);
+      const r = await api.syncAccount(id);
+      if (version !== accountVersion || account?.id !== id) return;
       status = r.failed_folders.length ? `Synced with errors: ${r.failed_folders.join(", ")}` : `Up to date · ${r.new_messages} new${r.rules_matched ? ` · ${r.rules_matched} matched rules` : ""}`;
       if (r.rule_errors.length) showToast(`Rules: ${r.rule_errors.join("; ")}`, true);
-      await refreshFolders(); await refreshMessages();
-    } catch (e) { status = errorText(e); } finally { syncing = false; }
+      await refreshFolders();
+      if (version === accountVersion) await refreshMessages();
+    } catch (e) { if (version === accountVersion) status = errorText(e); }
+    finally { syncingAccounts.delete(id); syncing = account !== null && syncingAccounts.has(account.id); }
   }
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
   function onSearch() {
     clearTimeout(searchTimer);
+    const request = ++searchRequest, version = accountVersion, id = account?.id, text = query;
+    if (!id || !text.trim()) { hits = null; return; }
     searchTimer = setTimeout(async () => {
-      if (!account || !query.trim()) { hits = null; return; }
-      try { hits = await api.search(account.id, query); } catch (e) { status = errorText(e); }
+      try {
+        const result = await api.search(id, text);
+        if (version === accountVersion && request === searchRequest && query === text) hits = result;
+      } catch (e) { if (version === accountVersion && request === searchRequest) status = errorText(e); }
     }, 200);
   }
-  async function reload(remote: boolean) {
+  async function reload(remote: boolean, quiet = false) {
     if (selectedId === null) return;
+    const id = selectedId, request = ++detailRequest, version = accountVersion;
     loadRemote = remote;
-    try { detail = await api.getMessage(selectedId, theme === "dark", remote); }
-    catch (e) { showToast(errorText(e), true); }
-    if (remote && detail && detail.remote_images_failed > 0)
-      showToast(`${detail.remote_images_failed} remote image(s) could not be loaded (blocked host, not an image, or too large).`, true);
+    try {
+      const result = await api.getMessage(id, theme === "dark", remote);
+      if (version !== accountVersion || request !== detailRequest || selectedId !== id) return;
+      detail = result;
+      if (!quiet && remote && result.remote_images_failed > 0)
+        showToast(`${result.remote_images_failed} remote image(s) could not be loaded (blocked host, not an image, or too large).`, true);
+    } catch (e) { if (!quiet && version === accountVersion && request === detailRequest) showToast(errorText(e), true); }
   }
-  // Re-render the open message when the theme changes so the iframe document matches.
-  // Only the theme is tracked: opening a message or loading remote images
-  // already fetches it, so tracking those too would fetch remote images twice.
+  // Only theme changes trigger this effect; selection and image actions fetch separately.
   $effect(() => {
-    const dark = theme === "dark";
-    untrack(() => { if (selectedId !== null) api.getMessage(selectedId, dark, loadRemote).then((d) => (detail = d)).catch(() => {}); });
+    void theme;
+    untrack(() => { if (selectedId !== null) void reload(loadRemote, true); });
   });
   async function composerDone(r: ComposerResult) {
     if (r.kind === "sent") { showToast(r.warning ?? "Message sent", r.warning !== null); await sync(); }

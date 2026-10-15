@@ -3,6 +3,7 @@
   // then addresses from the mail cache). Keyboard: Up/Down to move, Enter or
   // Tab to pick, Escape to close; typing "," ";" or Enter commits raw text.
   import { api, type ContactSuggestion } from "./api";
+  import { onDestroy } from "svelte";
 
   let { label, accountId, values = $bindable([]), autofocus = false }:
     { label: string; accountId: number; values: string[]; autofocus?: boolean } = $props();
@@ -17,6 +18,7 @@
   const listId = `ac-${Math.random().toString(36).slice(2)}`;
 
   $effect(() => { if (autofocus) input?.focus(); });
+  onDestroy(() => { clearTimeout(timer); seq++; });
 
   function format(s: ContactSuggestion) {
     return s.name ? `${s.name} <${s.email}>` : s.email;
@@ -34,9 +36,9 @@
   function onInput() {
     if (/[,;]$/.test(text)) { add(text); return; }
     clearTimeout(timer);
+    const mine = ++seq;
     const q = text.trim();
     if (q.length < 2) { suggestions = []; open = false; return; }
-    const mine = ++seq;
     timer = setTimeout(async () => {
       try {
         const r = await api.suggestContacts(accountId, q);
@@ -44,10 +46,21 @@
         const taken = new Set(values.map((v) => v.toLowerCase()));
         suggestions = r.filter((s) => !taken.has(format(s).toLowerCase()));
         active = 0; open = suggestions.length > 0;
-      } catch { suggestions = []; open = false; }
+      } catch { if (mine === seq) { suggestions = []; open = false; } }
     }, 150);
   }
+  function onBlur() {
+    // Blur runs before Send's click. Commit now, so a typed recipient is
+    // included even when the user never pressed Enter or picked a chip.
+    if (text.trim()) add(text);
+    else { clearTimeout(timer); seq++; open = false; }
+  }
   function onKey(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      // Commit the typed address before the shortcut bubbles to Composer.
+      if (text.trim()) add(text);
+      return;
+    }
     if (open && e.key === "ArrowDown") { e.preventDefault(); active = (active + 1) % suggestions.length; }
     else if (open && e.key === "ArrowUp") { e.preventDefault(); active = (active - 1 + suggestions.length) % suggestions.length; }
     else if (open && (e.key === "Enter" || e.key === "Tab") && suggestions[active]) { e.preventDefault(); add(format(suggestions[active])); }
@@ -66,7 +79,7 @@
     {/each}
     <div class="wrap">
       <input bind:this={input} bind:value={text} oninput={onInput} onkeydown={onKey}
-        onblur={() => setTimeout(() => { open = false; if (text.trim()) add(text); }, 150)}
+        onblur={onBlur}
         role="combobox" aria-expanded={open} aria-controls={listId} aria-autocomplete="list"
         aria-label={`${label} recipients`} autocomplete="off" spellcheck="false" />
       {#if open}

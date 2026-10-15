@@ -1,10 +1,10 @@
 <script lang="ts">
   // Notes: folders, tags, search, a sanitized rich-text editor with
   // checklists, and links to emails. Stored locally (encrypted cache).
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { api, errorText, pimApi, type Note, type NoteFolder, type NoteSummary, type Tag } from "./api";
+  import { api, errorText, pimApi, type Note, type NoteInput, type NoteFolder, type NoteSummary, type Tag } from "./api";
 
   let { openId = null, onOpenEmail, onStatus }:
     { openId?: number | null; onOpenEmail: (link: Note["links"][number]) => void; onStatus: (t: string, warn?: boolean) => void } = $props();
@@ -18,6 +18,12 @@
   let title = $state("");
   let editor = $state<HTMLDivElement | null>(null);
   let dirty = false;
+  let revision = 0;
+  let openRequest = 0;
+  let listRequest = 0;
+  let sideRequest = 0;
+  let destroyed = false;
+  let saveQueue: Promise<boolean> = Promise.resolve(true);
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let saving = $state<"" | "saving" | "saved">("");
   let tagInput = $state("");
@@ -27,45 +33,77 @@
   let block = $state("p");
 
   async function loadSide() {
-    [folders, tags] = await Promise.all([pimApi.noteFolders(), pimApi.tags()]);
+    const request = ++sideRequest;
+    const result = await Promise.all([pimApi.noteFolders(), pimApi.tags()]);
+    if (!destroyed && request === sideRequest) [folders, tags] = result;
   }
   async function loadList() {
-    notes = await pimApi.notes({ folder_id: filter.folder, tag: filter.tag, query });
+    const request = ++listRequest;
+    const result = await pimApi.notes({ folder_id: filter.folder, tag: filter.tag, query });
+    if (!destroyed && request === listRequest) notes = result;
   }
   onMount(async () => {
     try {
-      await loadSide(); await loadList();
+      await Promise.all([loadSide(), loadList()]);
+      if (destroyed || note || openRequest) return;
       if (openId !== null) await open(openId);
       else if (notes[0]) await open(notes[0].id);
     } catch (e) { onStatus(errorText(e), true); }
   });
   $effect(() => { const id = openId; if (id !== null) untrack(() => { if (note?.id !== id) void open(id); }); });
+  onDestroy(() => {
+    destroyed = true; openRequest++; listRequest++; sideRequest++;
+    clearTimeout(searchTimer);
+    // changed() keeps the body in state, so teardown never depends on a live DOM node.
+    void flush();
+  });
 
   async function open(id: number) {
-    await flush();
+    const request = ++openRequest;
+    if (!await flushAll() || destroyed || request !== openRequest) return;
     try {
-      note = await pimApi.note(id); title = note.title; menu = false; confirmDelete = false;
+      const loaded = await pimApi.note(id);
+      if (destroyed || request !== openRequest) return;
+      note = loaded; title = loaded.title; revision++; saving = ""; menu = false; confirmDelete = false;
       await tick();
-      if (editor) editor.innerHTML = note.html;
+      if (!destroyed && request === openRequest && editor) editor.innerHTML = loaded.html;
     } catch (e) { onStatus(errorText(e), true); }
   }
   function changed() {
-    dirty = true; saving = "saving";
+    if (!note) return;
+    note.html = editor?.innerHTML ?? note.html;
+    dirty = true; revision++; saving = "saving";
     clearTimeout(saveTimer); saveTimer = setTimeout(() => void flush(), 600);
   }
-  async function flush() {
+  function flush(): Promise<boolean> {
     clearTimeout(saveTimer);
-    if (!dirty || !note) return;
+    if (!dirty || !note) return saveQueue;
+    const snapshot: NoteInput = { id: note.id, folder_id: note.folder_id, title, html: note.html, tags: [...note.tags], pinned: note.pinned };
+    const version = revision;
     dirty = false;
-    const id = note.id;
-    try {
-      const saved = await pimApi.saveNote({ id, folder_id: note.folder_id, title, html: editor?.innerHTML ?? note.html, tags: note.tags, pinned: note.pinned });
-      if (note?.id === id) { note = { ...saved }; saving = "saved"; }
-      await loadList(); await loadSide();
-    } catch (e) { onStatus(errorText(e), true); saving = ""; }
+    // Keep writes ordered; an older response must never replace a newer edit.
+    saveQueue = saveQueue.then(async () => {
+      try {
+        const saved = await pimApi.saveNote(snapshot);
+        if (!destroyed && note?.id === snapshot.id && revision === version) { note = saved; saving = "saved"; }
+      } catch (e) {
+        if (!destroyed && note?.id === snapshot.id && revision === version) { dirty = true; saving = ""; }
+        onStatus(errorText(e), true);
+        return false;
+      }
+      if (!destroyed) {
+        try { await Promise.all([loadList(), loadSide()]); } catch (e) { onStatus(errorText(e), true); }
+      }
+      return true;
+    });
+    return saveQueue;
+  }
+  async function flushAll() {
+    do { if (!await flush()) return false; } while (dirty);
+    return true;
   }
   async function create() {
-    await flush();
+    if (!await flushAll()) return;
     try {
       const n = await pimApi.saveNote({ id: null, folder_id: filter.folder, title: "Untitled note", html: "<p></p>", tags: filter.tag ? [filter.tag] : [], pinned: false });
       await loadList(); await loadSide(); await open(n.id);
@@ -74,17 +112,22 @@
   }
   async function remove() {
     if (!note) return;
+    if (!await flushAll() || !note) return;
+    const id = note.id;
     try {
-      await pimApi.deleteNote(note.id); dirty = false; note = null; confirmDelete = false;
+      await pimApi.deleteNote(id);
+      if (note?.id !== id) return;
+      clearTimeout(saveTimer); dirty = false; openRequest++; note = null; confirmDelete = false;
       await loadList(); await loadSide();
       if (notes[0]) await open(notes[0].id);
     } catch (e) { onStatus(errorText(e), true); }
   }
   async function setFilter(f: { folder: number | null; tag: string | null }) {
-    await flush(); filter = f; await loadList();
+    if (!await flushAll()) return;
+    filter = f; await loadList();
   }
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
-  function onSearch() { clearTimeout(searchTimer); searchTimer = setTimeout(() => void loadList(), 150); }
+  function onSearch() { listRequest++; clearTimeout(searchTimer); searchTimer = setTimeout(() => { void loadList().catch((e) => onStatus(errorText(e), true)); }, 150); }
   async function addFolder() {
     if (!newFolder?.trim()) { newFolder = null; return; }
     try { await pimApi.createNoteFolder(newFolder); newFolder = null; await loadSide(); } catch (e) { onStatus(errorText(e), true); }
@@ -98,7 +141,13 @@
   async function moveTo(folder: number | null) { if (!note) return; note.folder_id = folder; menu = false; changed(); await flush(); }
   async function unlink(mid: string) {
     if (!note) return;
-    try { note = await pimApi.unlinkNoteEmail(note.id, mid); await loadList(); } catch (e) { onStatus(errorText(e), true); }
+    if (!await flushAll() || !note) return;
+    const id = note.id;
+    try {
+      const result = await pimApi.unlinkNoteEmail(id, mid);
+      if (note?.id === id) note.links = result.links;
+      await loadList();
+    } catch (e) { onStatus(errorText(e), true); }
   }
 
   // ---- editor ----
@@ -142,15 +191,26 @@
     });
     if ((e.ctrlKey || e.metaKey) && ["b", "i", "u"].includes(e.key.toLowerCase())) { e.preventDefault(); exec({ b: "bold", i: "italic", u: "underline" }[e.key.toLowerCase()]!); }
   }
-  async function onPaste(e: ClipboardEvent) {
-    e.preventDefault();
-    const html = e.clipboardData?.getData("text/html"), text = e.clipboardData?.getData("text/plain") ?? "";
+  async function insertTransfer(data: DataTransfer | null) {
+    if (!note || !editor || !data) return;
+    const id = note.id, target = editor;
+    const selection = window.getSelection();
+    const range = selection?.rangeCount && target.contains(selection.anchorNode) ? selection.getRangeAt(0).cloneRange() : null;
+    const html = data.getData("text/html"), text = data.getData("text/plain");
+    let clean: string | null = null;
     if (html) {
-      try { document.execCommand("insertHTML", false, (await api.sanitizeComposeHtml(html)).replace(/<img[^>]*>/gi, "")); }
-      catch { document.execCommand("insertText", false, text); }
-    } else document.execCommand("insertText", false, text);
+      try { clean = (await api.sanitizeComposeHtml(html)).replace(/<img[^>]*>/gi, ""); }
+      catch { /* Plain text is safe if sanitization is unavailable. */ }
+    }
+    if (destroyed || note?.id !== id || editor !== target) return;
+    target.focus();
+    if (range) { const sel = window.getSelection(); sel?.removeAllRanges(); sel?.addRange(range); }
+    if (clean !== null) document.execCommand("insertHTML", false, clean);
+    else document.execCommand("insertText", false, text);
     changed();
   }
+  function onPaste(e: ClipboardEvent) { e.preventDefault(); void insertTransfer(e.clipboardData); }
+  function onDrop(e: DragEvent) { e.preventDefault(); void insertTransfer(e.dataTransfer); }
   const date = (s: number) => new Date(s * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
   const folderName = (id: number | null) => folders.find((f) => f.id === id)?.name ?? "No folder";
   const heading = $derived(filter.tag ? `#${filter.tag}` : filter.folder !== null ? folderName(filter.folder) : "All notes");
@@ -234,7 +294,7 @@
       <div class="scroll">
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div class="editor" bind:this={editor} contenteditable="true" role="textbox" aria-multiline="true" aria-label="Note text" tabindex="0"
-          oninput={changed} onclick={onEditorClick} onkeydown={onKeydown} onpaste={onPaste}></div>
+          oninput={changed} onclick={onEditorClick} onkeydown={onKeydown} onpaste={onPaste} ondrop={onDrop}></div>
         <div class="meta">
           <div class="tags">
             {#each note.tags as t (t)}<span class="chip">#{t}<button aria-label="Remove tag {t}" onclick={() => removeTag(t)}>×</button></span>{/each}

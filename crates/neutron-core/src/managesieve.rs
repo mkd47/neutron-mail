@@ -1,7 +1,8 @@
 //! Minimal ManageSieve client (RFC 5804): STARTTLS is mandatory before
 //! authentication (no plaintext fallback, certificates verified as for
 //! IMAP), then AUTHENTICATE PLAIN, PUTSCRIPT/CHECKSCRIPT, SETACTIVE,
-//! LISTSCRIPTS, GETSCRIPT, DELETESCRIPT.
+//! LISTSCRIPTS, GETSCRIPT, DELETESCRIPT. All responses, including the
+//! unauthenticated greeting, share a 2 MiB wire-byte and 16,384-token limit.
 
 use std::time::Duration;
 
@@ -16,6 +17,11 @@ pub const DEFAULT_PORT: u16 = 4190;
 pub const SCRIPT_NAME: &str = "neutron-mail";
 const MAX_LINE: usize = 64 * 1024;
 const MAX_LITERAL: usize = 1024 * 1024;
+// Enough for a maximum-sized script plus response framing, while bounding
+// memory across repeated literals and rows (also before STARTTLS).
+const MAX_RESPONSE_BYTES: usize = 2 * MAX_LITERAL;
+const MAX_RESPONSE_TOKENS: usize = 16_384;
+const MAX_RESPONSE_ROWS: usize = 10_000;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -33,6 +39,36 @@ struct Response {
     items: Vec<Vec<String>>,
     ok: bool,
     text: String,
+}
+
+struct ResponseBudget {
+    bytes: usize,
+    tokens: usize,
+}
+
+impl ResponseBudget {
+    fn new() -> Self {
+        Self {
+            bytes: MAX_RESPONSE_BYTES,
+            tokens: MAX_RESPONSE_TOKENS,
+        }
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| err("response too large"))?;
+        Ok(())
+    }
+
+    fn charge_token(&mut self) -> Result<()> {
+        self.tokens = self
+            .tokens
+            .checked_sub(1)
+            .ok_or_else(|| err("too many response tokens"))?;
+        Ok(())
+    }
 }
 
 struct Conn<S> {
@@ -66,17 +102,26 @@ fn quote(s: &str) -> Result<String> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
-    async fn read_line(&mut self) -> Result<String> {
+    async fn read_line(&mut self, budget: &mut ResponseBudget) -> Result<String> {
+        let limit = MAX_LINE.min(budget.bytes);
+        if limit == 0 {
+            return Err(err("response too large"));
+        }
         let mut buf = Vec::new();
         let n = (&mut self.io)
-            .take(MAX_LINE as u64)
+            .take(limit as u64)
             .read_until(b'\n', &mut buf)
             .await?;
         if n == 0 {
             return Err(err("connection closed"));
         }
+        budget.charge_bytes(n)?;
         if !buf.ends_with(b"\n") {
-            return Err(err("line too long"));
+            return Err(err(if limit < MAX_LINE {
+                "response too large"
+            } else {
+                "line too long"
+            }));
         }
         while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
             buf.pop();
@@ -85,13 +130,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 
     /// Tokenize one logical line (quoted strings, atoms, literals).
-    async fn read_tokens(&mut self) -> Result<Vec<String>> {
+    async fn read_tokens(&mut self, budget: &mut ResponseBudget) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        let mut line = self.read_line().await?;
+        let mut line = self.read_line(budget).await?;
         loop {
             let mut chars = line.char_indices().peekable();
             let mut literal: Option<usize> = None;
             while let Some((i, c)) = chars.next() {
+                if c != ' ' {
+                    budget.charge_token()?;
+                }
                 match c {
                     ' ' => {}
                     '"' => {
@@ -146,10 +194,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             match literal {
                 Some(n) => {
+                    // Reserve before allocation/read: many individually
+                    // legal literals must not evade the response limit.
+                    budget.charge_bytes(n)?;
                     let mut data = vec![0u8; n];
                     self.io.read_exact(&mut data).await?;
                     out.push(String::from_utf8(data).map_err(|_| err("non-UTF-8 literal"))?);
-                    line = self.read_line().await?;
+                    line = self.read_line(budget).await?;
                 }
                 None => return Ok(out),
             }
@@ -158,8 +209,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     async fn response(&mut self) -> Result<Response> {
         let mut items = Vec::new();
+        let mut budget = ResponseBudget::new();
         loop {
-            let t = self.read_tokens().await?;
+            let t = self.read_tokens(&mut budget).await?;
             let head = t
                 .first()
                 .map(|s| s.to_ascii_uppercase())
@@ -178,7 +230,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     text,
                 });
             }
-            if items.len() > 10_000 {
+            if items.len() >= MAX_RESPONSE_ROWS {
                 return Err(err("response too long"));
             }
             items.push(t);
@@ -390,5 +442,84 @@ impl Client {
 
     pub async fn logout(mut self) {
         let _ = timed(async { self.command("LOGOUT").await.map(|_| ()) }).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn parse_response(data: Vec<u8>) -> Result<Response> {
+        // Exercise the actual response parser over a bounded in-memory
+        // transport, including the path used for a pre-TLS greeting.
+        let (read, mut write) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            let _ = write.write_all(&data).await;
+        });
+        let mut conn = Conn {
+            io: BufReader::new(read),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), conn.response())
+            .await
+            .expect("bounded response parser stalled");
+        writer.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn maximum_script_and_normal_capabilities_are_accepted() {
+        let response = parse_response(
+            b"\"IMPLEMENTATION\" \"Dovecot\"\r\n\"STARTTLS\"\r\n\"SASL\" \"PLAIN\"\r\nOK\r\n"
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(response.ok);
+        assert!(Client::parse_caps(&response.items).starttls);
+
+        let mut script = format!("{{{MAX_LITERAL}}}\r\n").into_bytes();
+        script.extend(vec![b'x'; MAX_LITERAL]);
+        script.extend_from_slice(b"\r\nOK\r\n");
+        let response = parse_response(script).await.unwrap();
+        assert!(response.ok);
+        assert_eq!(response.items[0][0].len(), MAX_LITERAL);
+    }
+
+    #[tokio::test]
+    async fn literal_budget_applies_within_one_row_and_across_rows() {
+        for separator in [" ", "\r\n"] {
+            let mut data = format!("{{{MAX_LITERAL}}}\r\n").into_bytes();
+            data.extend(vec![b'x'; MAX_LITERAL]);
+            // No second body is sent. The declared length must fail the
+            // aggregate budget before allocating or waiting for its bytes.
+            data.extend_from_slice(format!("{separator}{{{MAX_LITERAL}}}\r\n").as_bytes());
+            let error = parse_response(data).await.unwrap_err().to_string();
+            assert!(error.contains("response too large"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn many_short_rows_share_the_wire_byte_budget() {
+        let row = format!("\"{}\"\r\n", "x".repeat(32 * 1024));
+        let mut data = row.repeat(MAX_RESPONSE_BYTES / row.len() + 1).into_bytes();
+        data.extend_from_slice(b"OK\r\n");
+        let error = parse_response(data).await.unwrap_err().to_string();
+        assert!(error.contains("response too large"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn empty_literals_cannot_create_unbounded_token_storage() {
+        let mut data = b"{0}\r\n".repeat(MAX_RESPONSE_TOKENS + 1);
+        data.extend_from_slice(b"\r\nOK\r\n");
+        let error = parse_response(data).await.unwrap_err().to_string();
+        assert!(error.contains("too many response tokens"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn token_budget_is_shared_across_rows() {
+        let mut data = b"\"x\" \"y\"\r\n".repeat(MAX_RESPONSE_TOKENS / 2 + 1);
+        data.extend_from_slice(b"OK\r\n");
+        let error = parse_response(data).await.unwrap_err().to_string();
+        assert!(error.contains("too many response tokens"), "{error}");
     }
 }

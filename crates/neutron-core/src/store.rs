@@ -114,6 +114,7 @@ fn migrate_folder_sync_state(conn: &Connection) -> Result<()> {
         ("highestmodseq", "INTEGER"),
         ("exists_count", "INTEGER"),
         ("window_days", "INTEGER"),
+        ("window_cutoff", "INTEGER"),
         ("display", "TEXT"),
         ("delimiter", "TEXT"),
         ("subscribed", "INTEGER NOT NULL DEFAULT 1"),
@@ -132,6 +133,9 @@ pub struct FolderSyncState {
     pub highestmodseq: Option<u64>,
     pub exists: u32,
     pub window_days: u32,
+    /// UTC midnight used for the last full SEARCH SINCE reconciliation.
+    /// None for an unlimited window or a checkpoint from an older cache.
+    pub window_cutoff: Option<i64>,
 }
 
 pub struct Store {
@@ -510,7 +514,7 @@ impl Store {
         if reset {
             db.execute("DELETE FROM messages WHERE folder_id = ?1", [folder_id])?;
             db.execute(
-                "UPDATE folders SET uidnext = NULL, highestmodseq = NULL, exists_count = NULL WHERE id = ?1",
+                "UPDATE folders SET uidnext = NULL, highestmodseq = NULL, exists_count = NULL, window_cutoff = NULL WHERE id = ?1",
                 [folder_id],
             )?;
         }
@@ -525,7 +529,7 @@ impl Store {
         Ok(self
             .db()
             .query_row(
-                "SELECT uidnext, highestmodseq, exists_count, window_days FROM folders WHERE id = ?1",
+                "SELECT uidnext, highestmodseq, exists_count, window_days, window_cutoff FROM folders WHERE id = ?1",
                 [folder_id],
                 |r| {
                     let un: Option<u32> = r.get(0)?;
@@ -538,6 +542,7 @@ impl Store {
                             exists,
                             highestmodseq: hm.map(|v| v as u64),
                             window_days: wd.unwrap_or(0),
+                            window_cutoff: r.get(4)?,
                         }),
                         _ => None,
                     })
@@ -550,13 +555,14 @@ impl Store {
     /// `None` clears the state (next sync is a full one).
     pub fn set_folder_sync_state(&self, folder_id: i64, st: Option<FolderSyncState>) -> Result<()> {
         self.db().execute(
-            "UPDATE folders SET uidnext = ?2, highestmodseq = ?3, exists_count = ?4, window_days = ?5 WHERE id = ?1",
+            "UPDATE folders SET uidnext = ?2, highestmodseq = ?3, exists_count = ?4, window_days = ?5, window_cutoff = ?6 WHERE id = ?1",
             params![
                 folder_id,
                 st.map(|s| s.uidnext),
                 st.and_then(|s| s.highestmodseq).map(|v| v as i64),
                 st.map(|s| s.exists),
-                st.map(|s| s.window_days)
+                st.map(|s| s.window_days),
+                st.and_then(|s| s.window_cutoff)
             ],
         )?;
         Ok(())
@@ -806,22 +812,22 @@ impl Store {
         id: i64,
         remote: &std::collections::HashMap<String, String>,
     ) -> Result<(MessageDetail, Vec<String>)> {
-        let mut d = self.message_detail(id)?;
-        let p = parse::parse(&self.raw(id)?);
+        let (summary, p) = self.parsed_message(id)?;
         let s = parse::sanitized_html_with(&p, remote);
         let urls = s
             .as_ref()
             .map(|s| s.remote_urls.clone())
             .unwrap_or_default();
-        if let Some(s) = s {
-            d.html = Some(s.html);
-            d.remote_images_blocked = s.remote_images_blocked;
-            d.remote_images_loaded = s.remote_images_loaded;
-        }
-        Ok((d, urls))
+        Ok((detail_from_parsed(summary, p, s), urls))
     }
 
     pub fn message_detail(&self, id: i64) -> Result<MessageDetail> {
+        let (summary, p) = self.parsed_message(id)?;
+        let sanitized = parse::sanitized_html(&p);
+        Ok(detail_from_parsed(summary, p, sanitized))
+    }
+
+    fn parsed_message(&self, id: i64) -> Result<(MessageSummary, ParsedMessage)> {
         let (summary, raw) = {
             let db = self.db();
             db.query_row(
@@ -832,18 +838,7 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("message {id}")))?
         };
-        let p = parse::parse(&raw);
-        let sanitized = parse::sanitized_html(&p);
-        Ok(MessageDetail {
-            summary,
-            to: p.to,
-            cc: p.cc,
-            text: p.text,
-            remote_images_blocked: sanitized.as_ref().map_or(0, |s| s.remote_images_blocked),
-            remote_images_loaded: sanitized.as_ref().map_or(0, |s| s.remote_images_loaded),
-            html: sanitized.map(|s| s.html),
-            attachments: p.attachments,
-        })
+        Ok((summary, parse::parse(&raw)))
     }
 
     pub fn search(&self, account_id: i64, input: &str, limit: i64) -> Result<Vec<SearchHit>> {
@@ -868,6 +863,23 @@ impl Store {
     }
 }
 
+fn detail_from_parsed(
+    summary: MessageSummary,
+    p: ParsedMessage,
+    sanitized: Option<crate::sanitize::Sanitized>,
+) -> MessageDetail {
+    MessageDetail {
+        summary,
+        to: p.to,
+        cc: p.cc,
+        text: p.text,
+        remote_images_blocked: sanitized.as_ref().map_or(0, |s| s.remote_images_blocked),
+        remote_images_loaded: sanitized.as_ref().map_or(0, |s| s.remote_images_loaded),
+        html: sanitized.map(|s| s.html),
+        attachments: p.attachments,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OpenReport {
     /// A plaintext cache was found and encrypted.
@@ -877,6 +889,15 @@ pub struct OpenReport {
 }
 
 fn insert_in_tx(tx: &rusqlite::Transaction<'_>, folder_id: i64, m: &NewMessage<'_>) -> Result<i64> {
+    // A repeated sync must leave the raw message, FTS index and address
+    // history consistent. Check before MIME parsing so retries are cheap.
+    if let Some(id) = tx
+        .prepare_cached("SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2")?
+        .query_row(params![folder_id, m.uid], |r| r.get(0))
+        .optional()?
+    {
+        return Ok(id);
+    }
     let p: ParsedMessage = parse::parse(m.raw);
     let body_index = if p.text.trim().is_empty() {
         p.html_raw
@@ -888,16 +909,11 @@ fn insert_in_tx(tx: &rusqlite::Transaction<'_>, folder_id: i64, m: &NewMessage<'
     };
     tx.execute(
             "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(folder_id, uid) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![folder_id, m.uid, p.message_id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.date, p.preview,
                     m.seen, m.flagged, !p.attachments.is_empty(), m.raw],
         )?;
-    let id: i64 = tx.query_row(
-        "SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2",
-        params![folder_id, m.uid],
-        |r| r.get(0),
-    )?;
+    let id = tx.last_insert_rowid();
     for (name, email) in &p.addresses {
         tx.execute(
             "INSERT INTO addresses (account_id, email, name, uses, last_seen)

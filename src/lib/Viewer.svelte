@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import Icon from "./Icon.svelte";
   import Composer from "./Composer.svelte";
   import InviteCard from "./InviteCard.svelte";
@@ -11,77 +12,151 @@
     onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void;
   } = $props();
 
+  type Selection = { messageId: number; accountId: number; generation: number };
+  let generation = 0;
+  let alive = true;
+  let lastSelection = "";
+  let composeRequest = 0;
+  let sourceRequest = 0;
+  let attachmentRequest = 0;
+  let todoRequest = 0;
+
+  // A result belongs to the selection that started it, even after A → B → A.
+  function selection(): Selection | null {
+    return message ? { messageId: message.id, accountId: account.id, generation } : null;
+  }
+  function isCurrent(origin: Selection) {
+    return alive && origin.generation === generation && origin.messageId === message?.id && origin.accountId === account.id;
+  }
+  onDestroy(() => { alive = false; });
+
   // "Add to To-do" popover (prefilled from the subject) and "Save to Notes".
   let todo = $state<{ title: string; due: string; list: number | null; priority: number } | null>(null);
   let lists = $state<TaskList[]>([]);
   let todoBusy = $state(false);
+  let notesBusy = $state(false);
+  let trustBusy = $state(false);
   async function openTodo() {
-    if (!message) return;
+    const origin = selection();
+    if (!origin || !message) return;
+    const request = ++todoRequest;
     if (todo) { todo = null; return; }
-    try { lists = await pimApi.taskLists(); } catch (e) { onStatus(errorText(e), true); return; }
-    todo = { title: message.subject || "(no subject)", due: "1", list: lists[0]?.id ?? null, priority: 0 };
+    const title = message.subject || "(no subject)";
+    try {
+      const loaded = await pimApi.taskLists();
+      if (!isCurrent(origin) || request !== todoRequest) return;
+      lists = loaded;
+      todo = { title, due: "1", list: loaded[0]?.id ?? null, priority: 0 };
+    } catch (e) { if (isCurrent(origin) && request === todoRequest) onStatus(errorText(e), true); }
   }
   async function addTodo() {
-    if (!message || !todo || !todo.title.trim()) return;
+    const origin = selection();
+    if (!origin || !todo || !todo.title.trim() || todoBusy) return;
+    const form = todo;
+    const task = { ...form };
     todoBusy = true;
     try {
-      const email = await pimApi.emailLink(message.id);
-      await pimApi.saveTask({ id: null, list_id: todo.list, parent_id: null, title: todo.title, notes: "",
-        due: todo.due === "" ? null : dayAt(Number(todo.due)), due_time: false, reminder: null, priority: todo.priority, email });
-      onStatus(`Added “${todo.title}” to To-do`); todo = null; onPimChanged();
-    } catch (e) { onStatus(errorText(e), true); } finally { todoBusy = false; }
+      const email = await pimApi.emailLink(origin.messageId);
+      await pimApi.saveTask({ id: null, list_id: task.list, parent_id: null, title: task.title, notes: "",
+        due: task.due === "" ? null : dayAt(Number(task.due)), due_time: false, reminder: null, priority: task.priority, email });
+      onPimChanged();
+      if (!isCurrent(origin)) return;
+      onStatus(`Added “${task.title}” to To-do`);
+      if (todo === form) todo = null;
+    } catch (e) { if (isCurrent(origin)) onStatus(errorText(e), true); }
+    finally { if (isCurrent(origin)) todoBusy = false; }
   }
   async function saveToNotes() {
-    if (!message) return;
+    const origin = selection();
+    if (!origin || notesBusy) return;
+    notesBusy = true;
     try {
-      const n = await pimApi.noteFromMessage(message.id, null);
-      onStatus(`Saved to Notes: “${n.title}”`); onPimChanged(); onOpenNote(n.id);
-    } catch (e) { onStatus(errorText(e), true); }
+      const n = await pimApi.noteFromMessage(origin.messageId, null);
+      onPimChanged();
+      if (!isCurrent(origin)) return;
+      onStatus(`Saved to Notes: “${n.title}”`); onOpenNote(n.id);
+    } catch (e) { if (isCurrent(origin)) onStatus(errorText(e), true); }
+    finally { if (isCurrent(origin)) notesBusy = false; }
   }
 
-  let reply = $state<{ mode: ComposeMode; draft: ComposeDraft; key: number } | null>(null);
+  let reply = $state<{ mode: ComposeMode; draft: ComposeDraft; key: number; origin: Selection; account: Account } | null>(null);
   let source = $state<string | null>(null);
-  let confirmOpen = $state<{ index: number; reason: string } | null>(null);
-  let lastId = -1;
-  $effect(() => {
-    // Switching messages closes source view and any inline composer.
-    const id = message?.id ?? -1;
-    if (id !== lastId) { lastId = id; source = null; reply = null; confirmOpen = null; todo = null; }
+  let sourceLoading = $state(false);
+  let confirmOpen = $state<{ origin: Selection; index: number; reason: string } | null>(null);
+  $effect.pre(() => {
+    // Reset before rendering another selection; requests also check live props.
+    const next = `${account.id}:${message?.id ?? -1}`;
+    if (next !== lastSelection) {
+      lastSelection = next; generation++;
+      source = null; sourceLoading = false; reply = null; confirmOpen = null; todo = null;
+      todoBusy = false; notesBusy = false; trustBusy = false;
+    }
   });
 
   const titles: Record<ComposeMode, string> = { reply: "Reply", reply_all: "Reply all", forward: "Forward", draft: "Edit draft" };
 
   async function startCompose(mode: ComposeMode) {
-    if (!message) return;
+    const origin = selection();
+    if (!origin) return;
+    const request = ++composeRequest;
+    const sender = { ...account };
     try {
-      reply = { mode, draft: await api.composePrefill(message.id, mode), key: Date.now() };
-      source = null;
-    } catch (e) { onStatus(errorText(e)); }
+      const draft = await api.composePrefill(origin.messageId, mode);
+      if (!isCurrent(origin) || request !== composeRequest) return;
+      reply = { mode, draft, key: request, origin, account: sender };
+      sourceRequest++; sourceLoading = false; source = null;
+    } catch (e) { if (isCurrent(origin) && request === composeRequest) onStatus(errorText(e)); }
   }
   async function toggleSource() {
-    if (!message) return;
-    if (source !== null) { source = null; return; }
-    try { source = await api.messageSource(message.id); } catch (e) { onStatus(errorText(e)); }
+    const origin = selection();
+    if (!origin) return;
+    const request = ++sourceRequest;
+    if (source !== null || sourceLoading) { source = null; sourceLoading = false; return; }
+    sourceLoading = true;
+    try {
+      const raw = await api.messageSource(origin.messageId);
+      if (isCurrent(origin) && request === sourceRequest) source = raw;
+    } catch (e) { if (isCurrent(origin) && request === sourceRequest) onStatus(errorText(e)); }
+    finally { if (isCurrent(origin) && request === sourceRequest) sourceLoading = false; }
   }
   async function trustSender() {
-    if (!message) return;
-    await api.setImageSenderTrust(account.id, message.from_addr, !message.sender_trusted);
-    onReload(!message.sender_trusted);
+    const origin = selection();
+    if (!origin || !message || trustBusy) return;
+    const trust = !message.sender_trusted;
+    const sender = message.from_addr;
+    trustBusy = true;
+    try {
+      await api.setImageSenderTrust(origin.accountId, sender, trust);
+      if (isCurrent(origin)) onReload(trust);
+    } catch (e) { if (isCurrent(origin)) onStatus(errorText(e), true); }
+    finally { if (isCurrent(origin)) trustBusy = false; }
   }
   async function save(index: number) {
-    if (!message) return;
-    try { const p = await api.saveAttachment(message.id, index); if (p) onStatus(`Saved to ${p}`); }
-    catch (e) { onStatus(errorText(e)); }
+    const origin = selection();
+    if (!origin) return;
+    try { const p = await api.saveAttachment(origin.messageId, index); if (p && isCurrent(origin)) onStatus(`Saved to ${p}`); }
+    catch (e) { if (isCurrent(origin)) onStatus(errorText(e)); }
   }
-  async function openAtt(index: number, confirmed = false) {
-    if (!message) return;
+  async function openAtt(index: number, confirmed = false, origin = selection()) {
+    if (!origin || !isCurrent(origin)) return;
+    const request = ++attachmentRequest;
+    confirmOpen = null;
     try {
-      const r = await api.openAttachment(message.id, index, confirmed);
-      if (r.status === "needs_confirmation") confirmOpen = { index, reason: r.reason ?? "" };
-      else { confirmOpen = null; onStatus("Opened with the default application"); }
-    } catch (e) { onStatus(errorText(e)); }
+      const r = await api.openAttachment(origin.messageId, index, confirmed);
+      if (!isCurrent(origin) || request !== attachmentRequest) return;
+      if (r.status === "needs_confirmation") confirmOpen = { origin, index, reason: r.reason ?? "" };
+      else onStatus("Opened with the default application");
+    } catch (e) { if (isCurrent(origin) && request === attachmentRequest) onStatus(errorText(e)); }
   }
-  function done(r: ComposerResult) { reply = null; onComposerDone(r); }
+  function confirmAttachment() {
+    const pending = confirmOpen;
+    confirmOpen = null;
+    if (pending) void openAtt(pending.index, true, pending.origin);
+  }
+  function done(key: number, origin: Selection, r: ComposerResult) {
+    if (!isCurrent(origin) || reply?.key !== key) return;
+    reply = null; onComposerDone(r);
+  }
 </script>
 
 {#if message}
@@ -113,10 +188,10 @@
             </form></div>
           {/if}
         </span>
-        <button class="tbtn" onclick={saveToNotes} title="Save this email as a note, linked to it"><Icon name="note" size={16} /> Save to Notes</button>
+        <button class="tbtn" onclick={saveToNotes} disabled={notesBusy} title="Save this email as a note, linked to it"><Icon name="note" size={16} /> Save to Notes</button>
         <span class="spacer"></span>
-        <button class="tbtn" onclick={toggleSource} aria-pressed={source !== null} title="View the raw message source">
-          <Icon name="code" size={16} /> {source !== null ? "Message" : "View source"}</button>
+        <button class="tbtn" onclick={toggleSource} aria-pressed={source !== null || sourceLoading} title="View the raw message source">
+          <Icon name="code" size={16} /> {sourceLoading ? "Cancel source" : source !== null ? "Message" : "View source"}</button>
       </div>
       <h1>{message.subject || "(no subject)"}</h1>
       <div class="head">
@@ -132,7 +207,12 @@
         <!-- Raw RFC 822 source as escaped text (Svelte text node, never HTML). -->
         <pre class="source" aria-label="Message source">{source}</pre>
       {:else}
-        <InviteCard messageId={message.id} {onStatus} onResponded={onCalendarChanged} />
+        {#key `${account.id}:${message.id}`}
+          {@const inviteOrigin = selection()}
+          <InviteCard messageId={message.id}
+            onStatus={(text, warn) => { if (inviteOrigin && isCurrent(inviteOrigin)) onStatus(text, warn); }}
+            onResponded={onCalendarChanged} />
+        {/key}
         {#if message.remote_images_blocked > 0 || message.remote_images_loaded > 0}
           <div class="notice" role="status">
             <Icon name="shield" size={16} />
@@ -143,7 +223,7 @@
               {#if message.remote_images_available > 0}<button class="link" onclick={() => onReload(true)}>Load remote images</button>{/if}
             {/if}
             {#if message.from_addr && message.remote_images_available > 0}
-              <button class="link" onclick={trustSender}>{message.sender_trusted ? "Stop loading for this sender" : "Always load from this sender"}</button>
+              <button class="link" onclick={trustSender} disabled={trustBusy}>{message.sender_trusted ? "Stop loading for this sender" : "Always load from this sender"}</button>
             {/if}
           </div>
         {/if}
@@ -171,9 +251,11 @@
     </div>
     {#if reply}
       {#key reply.key}
+        {@const composing = reply}
         <div class="inline-composer">
-          <Composer {account} draft={reply.draft} title={titles[reply.mode]} inline
-            replaceDraft={reply.mode === "draft" ? message.id : null} onDone={done} />
+          <Composer account={composing.account} draft={composing.draft} title={titles[composing.mode]} inline
+            replaceDraft={composing.mode === "draft" ? composing.origin.messageId : null}
+            onDone={(r) => done(composing.key, composing.origin, r)} />
         </div>
       {/key}
     {/if}
@@ -185,7 +267,7 @@
         <p>{confirmOpen.reason}</p>
         <div class="actions">
           <button class="btn" onclick={() => (confirmOpen = null)}>Cancel</button>
-          <button class="btn danger" onclick={() => confirmOpen && openAtt(confirmOpen.index, true)}>Open anyway</button>
+          <button class="btn danger" onclick={confirmAttachment}>Open anyway</button>
         </div>
       </div>
     </div>

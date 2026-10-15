@@ -74,6 +74,7 @@
   const total = $derived(carried.reduce((n, a) => n + a.size, 0) + picked.reduce((n, a) => n + a.size, 0));
 
   async function pick() {
+    if (busy) return;
     busy = "pick"; error = ""; notice = "";
     try {
       const r = await api.pickAttachments();
@@ -82,6 +83,7 @@
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
   async function send() {
+    if (busy) return;
     if (!to.length && !cc.length && !bcc.length) { error = "Add at least one recipient."; return; }
     busy = "send"; error = "";
     try {
@@ -94,6 +96,7 @@
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
   async function saveDraft() {
+    if (busy) return;
     busy = "draft"; error = "";
     try { await api.saveDraft(account.id, message(), replaceDraft); onDone({ kind: "draft" }); }
     catch (e) { error = errorText(e); } finally { busy = ""; }

@@ -1,0 +1,1 @@
+These public, test-only localhost credentials are used exclusively by the loopback IMAP protocol regression tests. They grant no production access. The certificates are valid from 2020-01-01 through 2050-01-01; the CA signing key was discarded. Never deploy or trust these fixtures outside tests.

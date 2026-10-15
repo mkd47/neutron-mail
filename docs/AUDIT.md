@@ -1,5 +1,7 @@
 # Neutron Mail – Security & Dependency Audit (prototype v0.1.0 + v0.2 features)
 
+Follow-up: [2026-10-15 correctness and resource audit](AUDIT-2026-10-15-follow-up.md).
+
 *Date: 2026-10-14/15 (Asia/Shanghai); updated 2026-10-15 for links, rich HTML, reply/forward/drafts, attachments and contacts. Scope: `crates/neutron-core`, `src-tauri`, `src/` (Svelte UI), `testserver/`.
 Performed on the build box (Debian 13, rustc 1.99, Node 20.19). Author: Kaan Durmus (with Grok Bot).*
 
