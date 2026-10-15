@@ -23,6 +23,65 @@ pub struct AppState {
     /// sees tokens, so it cannot make the backend read arbitrary paths.
     pub picked: std::sync::Mutex<HashMap<String, attachments::PickedFile>>,
     pub contacts: contacts::Contacts,
+    pub cache: CacheStatus,
+}
+
+/// How the mail cache is stored, shown in the UI.
+#[derive(Clone, serde::Serialize)]
+pub struct CacheStatus {
+    /// "encrypted" (SQLCipher, key in the keyring) or "memory" (no keyring:
+    /// nothing is written to disk, the cache lasts for this session only).
+    pub mode: &'static str,
+    /// One-off information for the user (migration done, unreadable cache…).
+    pub notice: Option<String>,
+}
+
+/// Open the encrypted cache, migrating a plaintext one; without a usable
+/// keyring keep everything in memory and leave existing files untouched.
+fn open_cache(dir: &std::path::Path, secrets: &SecretStore) -> (Store, CacheStatus) {
+    let path = dir.join("cache.sqlite3");
+    let reason = match secrets.cache_key() {
+        Ok(Some(key)) => match Store::open_encrypted(&path, &key) {
+            Ok((store, report)) => {
+                let notice = if let Some(aside) = report.unreadable_moved_to {
+                    Some(format!(
+                        "The mail cache could not be decrypted (its key is missing from the keyring), so a new one was created. Mail is downloaded again; accounts must be added again. The old file was kept at {}.",
+                        aside.display()
+                    ))
+                } else if report.migrated {
+                    Some(
+                        "Your mail cache is now encrypted (key stored in the system keyring)."
+                            .into(),
+                    )
+                } else {
+                    None
+                };
+                tracing::info!(migrated = report.migrated, "mail cache: encrypted");
+                return (
+                    store,
+                    CacheStatus {
+                        mode: "encrypted",
+                        notice,
+                    },
+                );
+            }
+            Err(e) => format!("the encrypted cache could not be opened: {e}"),
+        },
+        Ok(None) => "no system keyring is available".to_string(),
+        Err(e) => format!("the cache key could not be read from the keyring: {e}"),
+    };
+    tracing::warn!("mail cache kept in memory only: {reason}");
+    let store = Store::open_in_memory().expect("in-memory SQLite");
+    let notice = Some(format!(
+        "Your mail cache is kept in memory only because {reason}. Nothing is written to disk; accounts and mail must be set up again next time."
+    ));
+    (
+        store,
+        CacheStatus {
+            mode: "memory",
+            notice,
+        },
+    )
 }
 
 /// Origins of the app's own UI. Any other navigation of the webview or of
@@ -54,9 +113,10 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             restrict_dir(&dir);
-            let store = Arc::new(Store::open(&dir.join("cache.sqlite3"))?);
             let secrets = Arc::new(SecretStore::detect());
             tracing::info!(backend = ?secrets.backend(), "secret storage selected");
+            let (store, cache) = open_cache(&dir, &secrets);
+            let store = Arc::new(store);
             let state = AppState {
                 store,
                 secrets,
@@ -64,6 +124,7 @@ pub fn run() {
                 watchers: std::sync::Mutex::new(HashMap::new()),
                 picked: std::sync::Mutex::new(HashMap::new()),
                 contacts: contacts::Contacts::default(),
+                cache,
             };
             let accounts = state.store.accounts()?;
             app.manage(state);

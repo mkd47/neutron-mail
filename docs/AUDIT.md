@@ -48,8 +48,14 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 - `tracing` only. Logs contain account ids, folder names, counts and error texts. They never contain passwords, message bodies or addresses. `tracing-log` is not enabled, so `log` records from async-imap/lettre (protocol traces) are never emitted.
 - New tests assert that IMAP and SMTP authentication errors do not contain the password (`format!("{err} {err:?}")`).
 
-### 2.6 Local data
-- `cache.sqlite3` (+ `-wal`, `-shm`) are mode 0600; the app data dir is set to 0700 at startup.
+### 2.6 Local data — encrypted cache (v0.3)
+- The mail cache (`cache.sqlite3` + `-wal`/`-shm`: account settings, folders, raw RFC 822 messages, FTS index, address history, trusted image senders) is encrypted with **SQLCipher** (rusqlite `bundled-sqlcipher`, AES-256-CBC + HMAC-SHA512 per page, linked against the distribution's libcrypto so OpenSSL security updates apply).
+- **Key:** 256 random bits from the OS RNG (`getrandom`), used as a raw SQLCipher key (`x'…'`, no passphrase KDF needed). Stored in the Secret Service (GNOME Keyring) as `dev.neutronmail.NeutronMail` / `cache-key`, next to the account passwords; read back after creation so data is never encrypted with a key the keyring did not keep. In memory it lives in `Zeroizing` buffers; `Debug` never prints it; it is never logged.
+- **Migration:** at startup a file starting with the plain `SQLite format 3` header is encrypted in place: WAL checkpoint → `sqlcipher_export` into `cache.sqlite3.encrypting` → `PRAGMA integrity_check` with the key → atomic rename → the old file, WAL and SHM are **overwritten with zeros, fsynced and deleted**. Tested (`tests/encrypted_cache.rs`) and in the GUI on the real profile: the account and 26 messages survived; afterwards no file in the data dir contains a known plaintext string or the SQLite header.
+- **No keyring** (or keyring error): the cache is an **in-memory database** for the session, like the password fallback. Nothing is written to disk and existing files are not touched; the UI shows "⚠ cache in memory". (GUI-tested in a D-Bus session without gnome-keyring: 0 cache files created.)
+- **Key lost** (keyring reset) while an encrypted cache exists: the unreadable file is moved aside (`cache.sqlite3.unreadable-<time>`, not deleted) and a fresh cache is created; the user is told that accounts must be added again.
+- Files remain mode 0600 in a 0700 directory.
+- Limits: the key is as safe as the login keyring (unlocked while you're logged in, so malware running as you can read both); overwriting the old plaintext is best effort on SSDs / copy-on-write filesystems (btrfs is Fedora's default), so full-disk encryption is still recommended. WebKit's own storage (localStorage for the theme) is not encrypted and holds no mail.
 
 ### 2.7 Remote images (opt-in, fetched by the core)
 - Blocked by default. "Load remote images" (per message) or "Always load from this sender" (per sender, stored in `image_senders`, revocable with "Stop loading …") makes the **Rust core** fetch them; the webview never touches the network, so the CSP stays `img-src data:`.
@@ -90,7 +96,7 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 | F4 | Low | `APPEND` always set `\Seen`. | **Fixed**: explicit `seen` parameter. |
 | F5 | Low | mail-parser synthesized HTML from text parts, so text mail went through the HTML path unnecessarily. | **Fixed**: only real `text/html` parts are used. |
 | F6 | Low | The app data dir was 0755 (WebKit storage beside the cache). | **Fixed**: 0700 at startup. |
-| O1 | Medium | **Message cache is plaintext at rest** (raw RFC 822 in SQLite, 0600). Anyone with access to the user account or an unencrypted disk can read mail. | Open. Rely on full-disk encryption (the Fedora default with LUKS). Future: SQLCipher with a key in the keyring. |
+| O1 | Medium | Message cache was plaintext at rest (raw RFC 822 in SQLite, 0600). | **Fixed (v0.3)**: SQLCipher with a 256-bit key in GNOME Keyring, automatic migration with scrubbing of the old file, in-memory fallback without a keyring (2.6). Residual risk: old plaintext blocks may survive on SSD/CoW filesystems after migration; keyring is unlocked during the session. |
 | O2 | Low | App CSP allows `style-src 'unsafe-inline'`: the srcdoc iframe inherits the parent CSP, and mail HTML needs inline styles. Script execution is still limited to `'self'`. | Accepted for now. Future: serve message documents from a separate custom protocol with their own CSP. |
 | O3 | Low | Trust stores differ: IMAP uses webpki-roots (Mozilla), while SMTP (lettre) also loads native certs. A corporate CA in `/etc/pki` works for SMTP but not IMAP, unless pasted as a private CA. | Open. Unify on `rustls-platform-verifier`. |
 | O4 | Low | STARTTLS response-injection (data pipelined before the TLS handshake) was **not tested**. async-imap `into_inner()` is expected to drop the buffer, but this is unverified. | Open. Add a malicious-server test. |

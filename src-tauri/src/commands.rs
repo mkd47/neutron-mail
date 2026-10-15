@@ -23,6 +23,7 @@ const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 #[derive(Serialize)]
 pub struct AppInfo {
     secret_backend: Backend,
+    cache: crate::CacheStatus,
     version: &'static str,
 }
 
@@ -54,6 +55,7 @@ pub struct SendResult {
 pub fn app_info(state: State<'_, AppState>) -> AppInfo {
     AppInfo {
         secret_backend: state.secrets.backend(),
+        cache: state.cache.clone(),
         version: env!("CARGO_PKG_VERSION"),
     }
 }

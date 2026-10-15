@@ -147,7 +147,8 @@ fn database_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("cache.sqlite3");
-    let _s = Store::open(&p).unwrap();
+    let key = neutron_core::secrets::CacheKey::random().unwrap();
+    let _s = Store::open_encrypted(&p, &key).unwrap();
     assert_eq!(
         std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
         0o600

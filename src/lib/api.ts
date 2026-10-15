@@ -51,7 +51,11 @@ export interface Outgoing {
   to: string[]; cc: string[]; bcc: string[]; subject: string; body: string;
   in_reply_to: string | null; references: string[]; attachments: AttachmentRef[];
 }
-export interface AppInfo { secret_backend: "keyring" | "memory"; version: string }
+export interface AppInfo {
+  secret_backend: "keyring" | "memory";
+  cache: { mode: "encrypted" | "memory"; notice: string | null };
+  version: string;
+}
 export interface SyncEvent { account_id: number; report?: SyncReport; error?: string }
 
 export const api = {

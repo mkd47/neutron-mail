@@ -9,6 +9,37 @@ use std::sync::Mutex;
 use crate::{Error, Result};
 
 const SERVICE: &str = "dev.neutronmail.NeutronMail";
+const CACHE_KEY_USER: &str = "cache-key";
+
+/// Raw 256-bit SQLCipher key, kept as hex and wiped from memory on drop.
+pub struct CacheKey(zeroize::Zeroizing<String>);
+
+impl CacheKey {
+    pub fn random() -> Result<Self> {
+        let mut b = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut b[..]).map_err(|e| Error::Secret(format!("random: {e}")))?;
+        Ok(Self(zeroize::Zeroizing::new(
+            b.iter().map(|x| format!("{x:02x}")).collect(),
+        )))
+    }
+    pub fn from_hex(s: &str) -> Option<Self> {
+        (s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+            .then(|| Self(zeroize::Zeroizing::new(s.to_ascii_lowercase())))
+    }
+    pub fn hex(&self) -> &zeroize::Zeroizing<String> {
+        &self.0
+    }
+    /// SQLCipher raw-key literal: x'<64 hex>' (no KDF needed for a random key).
+    pub(crate) fn pragma_value(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(format!("\"x'{}'\"", self.0.as_str()))
+    }
+}
+
+impl std::fmt::Debug for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheKey(..)")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +130,37 @@ impl SecretStore {
                 self.mem().remove(&Self::key(account_id));
                 Ok(())
             }
+        }
+    }
+
+    /// The 256-bit key of the encrypted mail cache, created on first use.
+    /// Only available with a real keyring: with the memory fallback the key
+    /// would be lost on exit, so callers keep the cache in memory instead.
+    pub fn cache_key(&self) -> Result<Option<CacheKey>> {
+        if self.backend != Backend::Keyring {
+            return Ok(None);
+        }
+        let entry = keyring::Entry::new(SERVICE, CACHE_KEY_USER)
+            .map_err(|e| Error::Secret(e.to_string()))?;
+        match entry.get_password() {
+            Ok(hex) => CacheKey::from_hex(&hex)
+                .map(Some)
+                .ok_or_else(|| Error::Secret("stored cache key is malformed".into())),
+            Err(keyring::Error::NoEntry) => {
+                let key = CacheKey::random()?;
+                entry
+                    .set_password(key.hex())
+                    .map_err(|e| Error::Secret(e.to_string()))?;
+                // Read back: never encrypt data with a key the keyring did not keep.
+                match entry.get_password() {
+                    Ok(h) if h.as_str() == key.hex().as_str() => Ok(Some(key)),
+                    Ok(_) => Err(Error::Secret(
+                        "keyring returned a different cache key".into(),
+                    )),
+                    Err(e) => Err(Error::Secret(e.to_string())),
+                }
+            }
+            Err(e) => Err(Error::Secret(e.to_string())),
         }
     }
 

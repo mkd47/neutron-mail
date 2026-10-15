@@ -72,8 +72,10 @@ cargo tauri dev            # development (hot-reload UI)
 cargo tauri build          # release build + .rpm / .deb bundles in target/release/bundle/
 ```
 
-Passwords are stored in the GNOME Keyring (Secret Service). Without a keyring, the app falls back
-to keeping them **in memory only** for the session and shows a warning. They are never written to disk in plaintext.
+Passwords are stored in the GNOME Keyring (Secret Service). The local mail cache is **encrypted at rest**
+with SQLCipher; its random 256-bit key is kept in the keyring too, and a plaintext cache from an older
+version is encrypted automatically on first start. Without a keyring, passwords **and** the cache are kept
+**in memory only** for the session (nothing is written to disk) and the app shows a warning.
 Set `NEUTRON_LOG=debug` for verbose logs (they never contain passwords or message bodies).
 
 ## Testing

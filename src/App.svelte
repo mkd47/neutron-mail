@@ -121,6 +121,7 @@
     (async () => {
       try {
         info = await api.appInfo();
+        if (info.cache.notice) showToast(info.cache.notice, info.cache.mode !== "encrypted" || info.cache.notice.includes("could not"));
         accounts = await api.listAccounts();
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
         const u1 = await api.onLink(onLinkEvent);
@@ -146,7 +147,7 @@
       onAdded={async (a) => { accounts = [...accounts, a]; showSetup = false; await selectAccount(a); }}
       onCancel={account ? () => (showSetup = false) : undefined} />
     {#if info?.secret_backend === "memory"}
-      <p class="warn">No system keyring found: passwords are kept in memory only for this session.</p>
+      <p class="warn">No system keyring found: passwords and the mail cache are kept in memory only for this session. Nothing is written to disk.</p>
     {/if}
   </main>
 {:else}
@@ -180,6 +181,8 @@
           <span class:spin={syncing}><Icon name="sync" /></span>
         </button>
         {#if info?.secret_backend === "memory"}<span class="muted small" title="No keyring: password kept in memory only">⚠ no keyring</span>{/if}
+        {#if info?.cache.mode === "encrypted"}<span class="muted small cache-ok" title="Mail cache encrypted at rest (SQLCipher, key in the system keyring)"><Icon name="shield" size={13} /> Encrypted</span>
+        {:else if info}<span class="muted small" title="Mail cache kept in memory only (no keyring)">⚠ cache in memory</span>{/if}
       </div>
     </aside>
 

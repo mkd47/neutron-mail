@@ -2571,6 +2571,7 @@ dependencies = [
  "async-imap",
  "chrono",
  "futures",
+ "getrandom 0.3.4",
  "keyring",
  "lettre",
  "mail-builder",
@@ -2589,6 +2590,7 @@ dependencies = [
  "url",
  "webpki-roots",
  "zbus 5.19.0",
+ "zeroize",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ use crate::model::{
     Account, AccountConfig, Folder, MessageDetail, MessageSummary, SearchHit, Security,
 };
 use crate::parse::{self, ParsedMessage};
+use crate::secrets::CacheKey;
 use crate::{Error, Result};
 
 const SCHEMA: &str = r#"
@@ -106,7 +107,47 @@ pub struct NewMessage<'a> {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Open (or create) the encrypted cache at `path` (SQLCipher, AES-256).
+    /// A plaintext cache from an older version is encrypted in place; a cache
+    /// that this key cannot decrypt (key lost from the keyring) is moved aside
+    /// and a fresh one is created, since everything in it can be re-synced
+    /// except the account list.
+    pub fn open_encrypted(path: &Path, key: &CacheKey) -> Result<(Self, OpenReport)> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut report = OpenReport::default();
+        if is_plaintext_sqlite(path) {
+            encrypt_plaintext_db(path, key)?;
+            report.migrated = true;
+        }
+        let conn = match open_keyed(path, key) {
+            Ok(c) => c,
+            Err(Error::Db(e)) if is_not_a_db(&e) => {
+                let aside = path.with_extension(format!(
+                    "sqlite3.unreadable-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                tracing::warn!("cache cannot be decrypted with the stored key; moving it aside");
+                std::fs::rename(path, &aside)?;
+                for ext in ["sqlite3-wal", "sqlite3-shm"] {
+                    let _ = std::fs::remove_file(path.with_extension(ext));
+                }
+                report.unreadable_moved_to = Some(aside);
+                open_keyed(path, key)?
+            }
+            Err(e) => return Err(e),
+        };
+        restrict_permissions(path);
+        Ok((Self::init(conn)?, report))
+    }
+
+    /// Unencrypted on-disk cache. Only used by tests; the app always uses
+    /// [`Store::open_encrypted`] or, without a keyring, [`Store::open_in_memory`].
+    pub fn open_plaintext(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -558,6 +599,125 @@ impl Store {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+}
+
+#[derive(Debug, Default)]
+pub struct OpenReport {
+    /// A plaintext cache was found and encrypted.
+    pub migrated: bool,
+    /// The cache could not be decrypted and was moved to this path.
+    pub unreadable_moved_to: Option<std::path::PathBuf>,
+}
+
+fn is_not_a_db(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::NotADatabase)
+    )
+}
+
+/// True if the file exists and starts with the plain SQLite header.
+/// (An SQLCipher database starts with random salt instead.)
+pub fn is_plaintext_sqlite(path: &Path) -> bool {
+    use std::io::Read;
+    let mut h = [0u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut h))
+        .map(|()| &h == b"SQLite format 3\0")
+        .unwrap_or(false)
+}
+
+fn open_keyed(path: &Path, key: &CacheKey) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    apply_key(&conn, "main", key)?;
+    // Fails with NotADatabase if the key is wrong.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    Ok(conn)
+}
+
+fn apply_key(conn: &Connection, schema: &str, key: &CacheKey) -> Result<()> {
+    // PRAGMA arguments can't be bound as parameters; the value is our own
+    // hex string, never user input.
+    let v = key.pragma_value();
+    conn.execute_batch(&zeroize::Zeroizing::new(format!(
+        "PRAGMA {schema}.key = {};",
+        v.as_str()
+    )))?;
+    Ok(())
+}
+
+/// Encrypt an existing plaintext cache in place:
+/// checkpoint the WAL, export into a new encrypted file, verify it, swap it
+/// in atomically, then overwrite and delete the plaintext copy.
+fn encrypt_plaintext_db(path: &Path, key: &CacheKey) -> Result<()> {
+    let tmp = path.with_extension("sqlite3.encrypting");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let plain = Connection::open(path)?;
+        plain.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        let version: i64 = plain.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let tmp_s = tmp
+            .to_str()
+            .ok_or_else(|| Error::Invalid("non-UTF-8 cache path".into()))?;
+        // SQLCipher treats a key string of the form x'<hex>' as a raw key.
+        let raw = zeroize::Zeroizing::new(format!("x'{}'", key.hex().as_str()));
+        plain.execute("ATTACH DATABASE ?1 AS enc KEY ?2", [tmp_s, raw.as_str()])?;
+        plain.query_row("SELECT sqlcipher_export('enc')", [], |_| Ok(()))?;
+        plain.execute_batch(&format!("PRAGMA enc.user_version = {version};"))?;
+        plain.execute_batch("DETACH DATABASE enc;")?;
+    }
+    restrict_permissions(&tmp);
+    // Verify before replacing anything.
+    let check = open_keyed(&tmp, key)?;
+    let ok: String = check.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    drop(check);
+    if ok != "ok" {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Invalid(format!(
+            "encrypted copy failed integrity check: {ok}"
+        )));
+    }
+    // Keep the plaintext bytes to scrub them after the swap.
+    let old = path.with_extension("sqlite3.plaintext-old");
+    std::fs::rename(path, &old)?;
+    std::fs::rename(&tmp, path)?;
+    for ext in ["sqlite3-wal", "sqlite3-shm"] {
+        let p = path.with_extension(ext);
+        let _ = scrub_and_remove(&p);
+    }
+    scrub_and_remove(&old)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    tracing::info!("plaintext cache encrypted");
+    Ok(())
+}
+
+/// Best effort: overwrite with zeros, fsync, delete. (On SSDs and
+/// copy-on-write filesystems old blocks may survive; see AUDIT.md.)
+fn scrub_and_remove(p: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let len = match std::fs::metadata(p) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(p)?;
+        let zeros = vec![0u8; 64 * 1024];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            f.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        f.sync_all()?;
+    }
+    std::fs::remove_file(p)
 }
 
 #[cfg(unix)]
