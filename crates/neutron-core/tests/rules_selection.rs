@@ -36,22 +36,22 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
         actions: vec![Action::Flag],
         server_side: true,
     };
-    let mut attachment = portable.clone();
-    attachment.name = "attachment".into();
-    attachment.conditions[0] = Condition {
-        field: Field::HasAttachment,
-        op: Op::Is,
-        value: String::new(),
+    let mut body_equals = portable.clone();
+    body_equals.name = "body_equals".into();
+    body_equals.conditions[0] = Condition {
+        field: Field::Body,
+        op: Op::Equals,
+        value: "invoice".into(),
         header: String::new(),
     };
     let mut local = portable.clone();
     local.name = "local".into();
     local.server_side = false;
-    let mut disabled = attachment.clone();
+    let mut disabled = body_equals.clone();
     disabled.name = "disabled".into();
     disabled.enabled = false;
     store
-        .save_rules(&[portable, attachment, local, disabled])
+        .save_rules(&[portable, body_equals, local, disabled])
         .unwrap();
 
     let names = || {
@@ -61,7 +61,7 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
             .map(|r| r.name)
             .collect::<Vec<_>>()
     };
-    assert_eq!(names(), ["portable", "attachment", "local"]);
+    assert_eq!(names(), ["portable", "body_equals", "local"]);
     store
         .set_sieve_settings(
             account,
@@ -71,7 +71,7 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
             },
         )
         .unwrap();
-    assert_eq!(names(), ["attachment", "local"]);
+    assert_eq!(names(), ["body_equals", "local"]);
     store
         .set_sieve_settings(
             account,
@@ -81,5 +81,5 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
             },
         )
         .unwrap();
-    assert_eq!(names(), ["portable", "attachment", "local"]);
+    assert_eq!(names(), ["portable", "body_equals", "local"]);
 }

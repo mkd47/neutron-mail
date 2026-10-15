@@ -19,6 +19,7 @@ The earlier findings in [AUDIT.md](AUDIT.md) remain historical records.
 | Server-rule activation suppressed local-only conditions | A rule rejected by the Sieve exporter could run neither locally nor on the server. | Retain local execution for exporter-rejected rules. Uploaded-script version tracking remains a separate issue below. |
 | Async UI responses crossed message/account boundaries | A late response could display the wrong message, attach a draft to the wrong context, or show an attachment confirmation for an old message. | Capture ownership and request generations for navigation, search, replies, source, attachments, sender trust, and linked notes/tasks. |
 | Repeated shortcuts could submit duplicate mail | Disabled buttons did not protect keyboard entry into `send()`. | Guard send/save/pick handlers while an operation is already in flight. |
+| Pending recipient text was committed after Send | Clicking Send or using Ctrl/Meta+Enter could omit a typed address that was not yet a chip. | Commit synchronously on blur and before the send shortcut bubbles; invalidate stale contact suggestions. |
 | Autosave used mutable selection/DOM state | Changing task or leaving Notes during debounce could discard edits or apply an old response over newer text. | Snapshot edits, serialize saves, flush on selection/teardown, and ignore stale responses. Sanitize dropped note HTML through the paste path. |
 | Repeated UI work | Task initialization loaded twice, independent queries ran serially, and pagination deduplication repeatedly scanned the entire list. | Use one initial reactive load, parallel independent reads, and a `Set` of existing message IDs. |
 
@@ -33,7 +34,7 @@ idempotence, image response budgets, ManageSieve aggregate limits, Unicode filen
 local Sieve fallback, and retention checkpoint behavior. Test certificates and their key
 under `tests/fixtures/imap` are intentionally public, localhost-only test fixtures.
 
-Local checks: frontend handler tests, Svelte compilation using the available 5.56.4 compiler
+Local checks: 23 passing frontend handler regressions, Svelte compilation using the available 5.56.4 compiler
 (the lockfile uses a newer version), standalone Rust formatting, and diff whitespace checks.
 The local environment lacks the complete Cargo dependency cache. Exact locked frontend
 checks/build, Rust compilation/tests/clippy, dependency audits, and the Fedora 44 RPM build
