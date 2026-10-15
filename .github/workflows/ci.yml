@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ubuntu:
+    name: Build, test, audit (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (Tauri v2 + EDS for the live calendar/contact tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev build-essential pkg-config file \
+            evolution-data-server dbus dbus-x11
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: svelte-check
+        run: npm run check
+      - name: Frontend build
+        run: npm run build
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        # The Dovecot/SMTP integration tests need testserver/ (Dovecot 2.4)
+        # and are skipped here (NEUTRON_IT unset); they run locally.
+        run: cargo test --workspace
+      - name: Live evolution-data-server tests (private D-Bus session)
+        run: bash testserver/eds-test.sh
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny
+        run: cargo deny check
+      - name: npm audit
+        run: npm audit
+
+  fedora:
+    name: RPM build (Fedora 44 container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Prerequisites from the README
+        run: |
+          dnf install -y webkit2gtk4.1-devel openssl-devel curl wget file \
+            libappindicator-gtk3-devel librsvg2-devel libxdo-devel nodejs npm \
+            gnome-keyring libsecret evolution-data-server git tar
+          dnf group install -y c-development
+      - uses: actions/checkout@v4
+      - name: Rust and the Tauri CLI
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli@^2
+      - run: npm ci
+      - name: cargo tauri build (RPM)
+        run: cargo tauri build --bundles rpm
+      - name: Inspect and install the RPM
+        run: |
+          rpm -qip target/release/bundle/rpm/*.rpm
+          dnf install -y target/release/bundle/rpm/*.rpm
+          ! ldd /usr/bin/neutron-mail | grep "not found"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neutron-mail-rpm-fedora44
+          path: target/release/bundle/rpm/*.rpm
+          retention-days: 14
