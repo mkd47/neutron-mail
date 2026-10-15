@@ -81,6 +81,35 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
 END;
 "#;
 
+/// Incremental-sync bookkeeping per folder (added in v0.4; older caches
+/// get the columns as NULL, which forces one full resync).
+fn migrate_folder_sync_state(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(folders)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (c, ty) in [
+        ("uidnext", "INTEGER"),
+        ("highestmodseq", "INTEGER"),
+        ("exists_count", "INTEGER"),
+        ("window_days", "INTEGER"),
+    ] {
+        if !cols.iter().any(|x| x == c) {
+            conn.execute_batch(&format!("ALTER TABLE folders ADD COLUMN {c} {ty}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// What the last completed sync of a folder saw on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderSyncState {
+    pub uidnext: u32,
+    pub highestmodseq: Option<u64>,
+    pub exists: u32,
+    pub window_days: u32,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -179,6 +208,7 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        migrate_folder_sync_state(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -430,12 +460,84 @@ impl Store {
         let db = self.db();
         if reset {
             db.execute("DELETE FROM messages WHERE folder_id = ?1", [folder_id])?;
+            db.execute(
+                "UPDATE folders SET uidnext = NULL, highestmodseq = NULL, exists_count = NULL WHERE id = ?1",
+                [folder_id],
+            )?;
         }
         db.execute(
             "UPDATE folders SET uidvalidity = ?2 WHERE id = ?1",
             params![folder_id, v],
         )?;
         Ok(reset)
+    }
+
+    pub fn folder_sync_state(&self, folder_id: i64) -> Result<Option<FolderSyncState>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT uidnext, highestmodseq, exists_count, window_days FROM folders WHERE id = ?1",
+                [folder_id],
+                |r| {
+                    let un: Option<u32> = r.get(0)?;
+                    let ex: Option<u32> = r.get(2)?;
+                    let hm: Option<i64> = r.get(1)?;
+                    let wd: Option<u32> = r.get(3)?;
+                    Ok(match (un, ex) {
+                        (Some(uidnext), Some(exists)) => Some(FolderSyncState {
+                            uidnext,
+                            exists,
+                            highestmodseq: hm.map(|v| v as u64),
+                            window_days: wd.unwrap_or(0),
+                        }),
+                        _ => None,
+                    })
+                },
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// `None` clears the state (next sync is a full one).
+    pub fn set_folder_sync_state(&self, folder_id: i64, st: Option<FolderSyncState>) -> Result<()> {
+        self.db().execute(
+            "UPDATE folders SET uidnext = ?2, highestmodseq = ?3, exists_count = ?4, window_days = ?5 WHERE id = ?1",
+            params![
+                folder_id,
+                st.map(|s| s.uidnext),
+                st.and_then(|s| s.highestmodseq).map(|v| v as i64),
+                st.map(|s| s.exists),
+                st.map(|s| s.window_days)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert many messages in one transaction (fast bulk sync).
+    pub fn insert_messages(&self, folder_id: i64, ms: &[NewMessage<'_>]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        for m in ms {
+            insert_in_tx(&tx, folder_id, m)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply many flag updates in one transaction.
+    pub fn set_flags_bulk(&self, folder_id: i64, flags: &[(u32, bool, bool)]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        {
+            let mut st = tx.prepare_cached(
+                "UPDATE messages SET seen = ?3, flagged = ?4 WHERE folder_id = ?1 AND uid = ?2 AND (seen <> ?3 OR flagged <> ?4)",
+            )?;
+            for (uid, seen, flagged) in flags {
+                st.execute(params![folder_id, uid, seen, flagged])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ---- messages -------------------------------------------------------
@@ -448,62 +550,24 @@ impl Store {
     }
 
     pub fn insert_message(&self, folder_id: i64, m: &NewMessage<'_>) -> Result<i64> {
-        let p: ParsedMessage = parse::parse(m.raw);
-        let body_index = if p.text.trim().is_empty() {
-            p.html_raw
-                .as_deref()
-                .map(parse::strip_tags)
-                .unwrap_or_default()
-        } else {
-            p.text.clone()
-        };
         let mut db = self.db();
         let tx = db.transaction()?;
-        tx.execute(
-            "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(folder_id, uid) DO NOTHING",
-            params![folder_id, m.uid, p.message_id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.date, p.preview,
-                    m.seen, m.flagged, !p.attachments.is_empty(), m.raw],
-        )?;
-        let id: i64 = tx.query_row(
-            "SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2",
-            params![folder_id, m.uid],
-            |r| r.get(0),
-        )?;
-        for (name, email) in &p.addresses {
-            tx.execute(
-                "INSERT INTO addresses (account_id, email, name, uses, last_seen)
-                 SELECT f.account_id, ?2, ?3, 1, ?4 FROM folders f WHERE f.id = ?1
-                 ON CONFLICT(account_id, email) DO UPDATE SET uses = uses + 1,
-                   last_seen = max(last_seen, excluded.last_seen),
-                   name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END",
-                params![folder_id, email, name, p.date],
-            )?;
-        }
-        tx.execute("DELETE FROM messages_fts WHERE rowid = ?1", [id])?;
-        tx.execute(
-            "INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                id,
-                p.subject,
-                format!("{} {}", p.from_name, p.from_addr),
-                body_index
-            ],
-        )?;
+        let id = insert_in_tx(&tx, folder_id, m)?;
         tx.commit()?;
         Ok(id)
     }
 
     pub fn remove_uids(&self, folder_id: i64, uids: &[u32]) -> Result<usize> {
-        let db = self.db();
+        let mut db = self.db();
+        let tx = db.transaction()?;
         let mut n = 0;
         for uid in uids {
-            n += db.execute(
+            n += tx.execute(
                 "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
                 params![folder_id, uid],
             )?;
         }
+        tx.commit()?;
         Ok(n)
     }
 
@@ -698,6 +762,51 @@ pub struct OpenReport {
     pub migrated: bool,
     /// The cache could not be decrypted and was moved to this path.
     pub unreadable_moved_to: Option<std::path::PathBuf>,
+}
+
+fn insert_in_tx(tx: &rusqlite::Transaction<'_>, folder_id: i64, m: &NewMessage<'_>) -> Result<i64> {
+    let p: ParsedMessage = parse::parse(m.raw);
+    let body_index = if p.text.trim().is_empty() {
+        p.html_raw
+            .as_deref()
+            .map(parse::strip_tags)
+            .unwrap_or_default()
+    } else {
+        p.text.clone()
+    };
+    tx.execute(
+            "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(folder_id, uid) DO NOTHING",
+            params![folder_id, m.uid, p.message_id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.date, p.preview,
+                    m.seen, m.flagged, !p.attachments.is_empty(), m.raw],
+        )?;
+    let id: i64 = tx.query_row(
+        "SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2",
+        params![folder_id, m.uid],
+        |r| r.get(0),
+    )?;
+    for (name, email) in &p.addresses {
+        tx.execute(
+            "INSERT INTO addresses (account_id, email, name, uses, last_seen)
+                 SELECT f.account_id, ?2, ?3, 1, ?4 FROM folders f WHERE f.id = ?1
+                 ON CONFLICT(account_id, email) DO UPDATE SET uses = uses + 1,
+                   last_seen = max(last_seen, excluded.last_seen),
+                   name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END",
+            params![folder_id, email, name, p.date],
+        )?;
+    }
+    tx.execute("DELETE FROM messages_fts WHERE rowid = ?1", [id])?;
+    tx.execute(
+        "INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            id,
+            p.subject,
+            format!("{} {}", p.from_name, p.from_addr),
+            body_index
+        ],
+    )?;
+    Ok(id)
 }
 
 fn is_not_a_db(e: &rusqlite::Error) -> bool {

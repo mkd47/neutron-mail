@@ -286,8 +286,9 @@ async fn drafts_saved_resumed_and_replaced() {
 
     // Replacing the draft removes the old version from the server.
     imap::delete_uid(&mut s, "Drafts", d.uid).await.unwrap();
-    let st = imap::select(&mut s, "Drafts").await.unwrap();
-    assert!(!st.uids.contains(&d.uid));
+    let st = imap::select_state(&mut s, "Drafts", false).await.unwrap();
+    let uids = imap::all_uids(&mut s, st.exists).await.unwrap();
+    assert!(!uids.contains(&d.uid));
     drop(s.logout().await);
 
     // A draft may have no recipients; a sendable message may not.

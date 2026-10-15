@@ -175,10 +175,9 @@ async fn sync_window_skips_and_prunes_old_mail() {
     let store = Store::open_in_memory().unwrap();
     let acc = store.add_account(&cfg).unwrap();
     let fid = store.upsert_folder(acc, &folder, None).unwrap();
-    let since = chrono::Utc::now().timestamp() - 30 * 86_400;
 
     // Fresh cache with a 30-day window: the 2020 message is never downloaded.
-    let r = sync::sync_folder_window(&store, fid, &folder, &mut s, Some(since))
+    let r = sync::sync_folder_window(&store, fid, &folder, &mut s, 30)
         .await
         .unwrap();
     assert_eq!(r, (1, 0));
@@ -190,7 +189,7 @@ async fn sync_window_skips_and_prunes_old_mail() {
         (1, 0)
     );
     assert_eq!(store.messages(fid, 0, 50).unwrap().len(), 2);
-    let r = sync::sync_folder_window(&store, fid, &folder, &mut s, Some(since))
+    let r = sync::sync_folder_window(&store, fid, &folder, &mut s, 30)
         .await
         .unwrap();
     assert_eq!(r, (0, 1));
@@ -198,7 +197,10 @@ async fn sync_window_skips_and_prunes_old_mail() {
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].subject, "recent-one");
     assert_eq!(
-        imap::select(&mut s, &folder).await.unwrap().uids.len(),
+        imap::select_state(&mut s, &folder, false)
+            .await
+            .unwrap()
+            .exists,
         2,
         "server untouched"
     );

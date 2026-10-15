@@ -14,7 +14,7 @@ Severity scale: **High** (exploitable by a remote sender/server with real impact
 | `npm audit` | **0 vulnerabilities**. Runtime npm deps: `@tauri-apps/api` and `@tauri-apps/plugin-opener`. The dialog plugin has **no** JS package: dialogs are opened from Rust only (see 2.8). |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean (`unsafe_code = "forbid"` workspace-wide) · `cargo fmt --check` clean |
 | `svelte-check --fail-on-warnings` | 0 errors, 0 warnings · `vite build` OK |
-| Tests | **55 pass** with the live local server (`NEUTRON_IT=1`) and real evolution-data-server (`testserver/eds-test.sh`): 17 unit (attachments, links, remote images, vCard/sexp), 6 IMAP sync, 4 SMTP, 11 sanitizer, 9 store/search/TLS, 6 feature integration tests (remote-image fetch + SSRF, reply-all headers + Bcc envelope, forward attachments byte-for-byte, drafts save/resume/delete, hostile attachment names, address history), 2 EDS (live add + any-field search; graceful failure without a session bus). Without the server/EDS the network tests return early (counted as "passed" but *skipped*). |
+| Tests | **72 pass** (`cargo test --workspace`, v0.4; adds `sync_large` + `imap_timeout`) with the live local server (`NEUTRON_IT=1`) and real evolution-data-server (`testserver/eds-test.sh`): 17 unit (attachments, links, remote images, vCard/sexp), 6 IMAP sync, 4 SMTP, 11 sanitizer, 9 store/search/TLS, 6 feature integration tests (remote-image fetch + SSRF, reply-all headers + Bcc envelope, forward attachments byte-for-byte, drafts save/resume/delete, hostile attachment names, address history), 2 EDS (live add + any-field search; graceful failure without a session bus). Without the server/EDS the network tests return early (counted as "passed" but *skipped*). |
 
 ## 2. Review by area
 
@@ -105,6 +105,24 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 - New commands (`update_account`, `get/set_account_settings`, `list_image_senders`, `new_draft`) are added to the least-privilege capability explicitly.
 - Tests: 5 in `tests/account_settings.rs` (settings round-trip + sanitizing, rejected values/unknown account/oversize, update + cascade, signature placement and `-- ` in the text part, sync window against Dovecot).
 
+### 2.14 Incremental sync (v0.4)
+- Per folder the cache stores UIDVALIDITY, UIDNEXT, EXISTS, HIGHESTMODSEQ and the sync window used. A changed UIDVALIDITY drops the cached folder and its state; a changed sync window, a missing UIDNEXT or a cache from before v0.4 forces one full pass (`UID SEARCH ALL`/`SINCE` diffed with the cache).
+- Incremental: new mail via `UID SEARCH UID <UIDNEXT>:*` (filtered, since `n:*` always matches the highest UID); expunges are detected by arithmetic (`EXISTS == old EXISTS + new UIDs` ⇒ none), otherwise one `UID SEARCH ALL` finds the vanished UIDs. Flags: with CONDSTORE (`SELECT … (CONDSTORE)`) only `FETCH 1:* (FLAGS) (CHANGEDSINCE m)`, nothing if HIGHESTMODSEQ is unchanged; without CONDSTORE all flags are refetched (fallback, tested by forcing it off). The new state is written only after the folder sync succeeded, so an interrupted sync is repeated from the old state.
+- The 500-new-messages cap is gone: new mail is downloaded newest first in pages of 500 (FETCH chunks of 50), each page committed in one SQLite transaction. The message list pages too (200 rows per scroll page), and the count line shows the folder total.
+- **Every IMAP command now has a 60 s timeout** (`imap::cmd`, including streaming the response; IDLE keeps its own wait), connect/login keep their 20 s limit. Fixes O13.
+- Tests: `tests/sync_large.rs` (5,000 messages; sizes via `NM_LARGE_N`) and `tests/imap_timeout.rs` (a TLS server that accepts LOGIN and then never answers: `SELECT` fails with `Timeout` after the 2 s test timeout). Debug build, local Dovecot 2.4, this box:
+
+  | Step | 5,000 msgs | 10,000 msgs |
+  |---|---|---|
+  | First full sync (download + parse + FTS index, encrypted-store code path but plaintext test DB) | 1.25–1.31 s | 3.05 s |
+  | No-change incremental sync | 9–12 ms | 17 ms |
+  | 10 new + 3 flag changes (CHANGEDSINCE returns 13 rows, not n) | 16 ms | 27 ms |
+  | 5 expunges (one UID SEARCH ALL) | 22 ms | – |
+  | Full sync without CONDSTORE | 0.95 s | – |
+  | Incremental without CONDSTORE (all n flags refetched) | 119 ms | – |
+- GUI: a 3,000-message folder synced completely (the old code would have stopped at 500); 200 expunged and 10 marked read by another client were reflected after one refresh (unread 1000 → 930, matching the server), and scrolling loads past the first page ([screenshot](screenshots/sync-large-folder.png)).
+- Not done: QRESYNC/VANISHED (expunges still need one UID SEARCH ALL when they happen), and folders are still synced one after another on one connection.
+
 ## 3. Findings
 
 | # | Severity | Finding | Status |
@@ -132,7 +150,7 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 | F10 | Low | (v0.3, GUI testing) Typing in the new editor reset the caret on every keystroke (text appeared reversed). | **Fixed** before release; initial content is set once. |
 | F11 | Info | (v0.3, GUI testing) A contact suggestion request still in flight re-opened the dropdown after Enter had already added the chip. | **Fixed**: pending lookups are cancelled when a chip is added. |
 | F12 | Low | (v0.3, GUI testing) The text/plain part lost the trailing space of the `-- ` signature delimiter (lines were right-trimmed), so clients would not recognise the signature. | **Fixed**: delimiter preserved; regression test. |
-| O13 | Info | (v0.3, test development) async-imap waits forever if a server answers `APPEND` with a tagged `BAD` (seen with an unquoted internal date in a test). The app never passes an internal date, but a hostile server could stall that request. | Open: add a timeout around IMAP commands (planned with the sync rework). |
+| O13 | Info | (v0.3, test development) async-imap waits forever if a server answers `APPEND` with a tagged `BAD` (seen with an unquoted internal date in a test). The app never passes an internal date, but a hostile server could stall that request. | **Fixed (v0.4)**: every IMAP command has a 60 s timeout; tested against a stalled server (2.14). |
 | O12 | Info | (v0.2) `lnkd.in` and other opaque short links can't be unwrapped without contacting the shortener; they are shown as-is with their real host. | Accepted. |
 
 ## 4. Not covered / limits of this audit

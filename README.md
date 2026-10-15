@@ -32,6 +32,9 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   (all mail / 30 / 90 days / 1 / 2 years: older mail is neither downloaded nor kept in the local cache, and is
   never deleted on the server), the **trusted remote-image senders** list with Remove, and **Remove account**
   (deletes its keyring password and cached mail, with an in-app confirmation).
+- **Fast incremental sync:** UIDNEXT/EXISTS bookkeeping and CONDSTORE (`CHANGEDSINCE`) where the server has it,
+  with a full-diff fallback; expunges handled; no cap on the number of messages (paged download and list);
+  every IMAP command has a timeout. 5,000 messages: first sync ≈1.3 s, a no-change resync ≈10 ms (local Dovecot, debug build).
 - **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
 
 GNOME Calendar integration is still a stub.

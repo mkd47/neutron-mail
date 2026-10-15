@@ -67,16 +67,43 @@
     if (folder) folder = folders.find((f) => f.id === folder!.id) ?? null;
     if (!folder) folder = folders.find((f) => f.role === "inbox") ?? folders[0] ?? null;
   }
+  const PAGE = 200;
+  let loadingMore = false;
   async function refreshMessages() {
-    messages = folder ? await api.listMessages(folder.id) : [];
+    if (!folder) { messages = []; return; }
+    // Keep as many rows as were already loaded (paged by the backend's 500 cap).
+    const want = Math.max(PAGE, messages.length), id = folder.id;
+    const out: MessageSummary[] = [];
+    while (out.length < want) {
+      const n = Math.min(500, want - out.length);
+      const page = await api.listMessages(id, out.length, n);
+      out.push(...page);
+      if (page.length < n) break;
+    }
+    if (folder?.id === id) messages = out;
+  }
+  async function loadMore() {
+    if (!folder || hits || loadingMore) return;
+    const total = folders.find((f) => f.id === folder!.id)?.total ?? 0;
+    if (messages.length >= total) return;
+    loadingMore = true;
+    try {
+      const id = folder.id;
+      const page = await api.listMessages(id, messages.length, PAGE);
+      if (folder?.id === id) messages = [...messages, ...page.filter((m) => !messages.some((x) => x.id === m.id))];
+    } finally { loadingMore = false; }
+  }
+  function onListScroll(e: Event) {
+    const el = e.currentTarget as HTMLElement;
+    if (el.scrollTop + el.clientHeight > el.scrollHeight - 600) void loadMore();
   }
   async function selectAccount(a: Account) {
-    account = a; folder = null; detail = null; selectedId = null; hits = null; query = "";
+    account = a; folder = null; messages = []; detail = null; selectedId = null; hits = null; query = "";
     await refreshFolders(); await refreshMessages();
     void sync();
   }
   async function selectFolder(f: Folder) {
-    folder = f; hits = null; query = ""; detail = null; selectedId = null;
+    folder = f; hits = null; query = ""; detail = null; selectedId = null; messages = [];
     await refreshMessages();
   }
   async function open(m: MessageSummary) {
@@ -215,10 +242,10 @@
         <input placeholder="Search messages…" bind:value={query} oninput={onSearch} aria-label="Search messages" />
       </div>
       <div class="meta muted">
-        {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${messages.length} messages`}
+        {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length).toLocaleString()} messages`}
         <span class="status" title={status}>{status}</span>
       </div>
-      <ul>
+      <ul onscroll={onListScroll}>
         {#each list as m (m.id)}
           <li>
             <button class="item" class:selected={selectedId === m.id} class:unread={!m.seen} onclick={() => open(m)}>
