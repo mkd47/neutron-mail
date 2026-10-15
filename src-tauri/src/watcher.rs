@@ -17,12 +17,12 @@ const POLL_EVERY: Duration = Duration::from_secs(5 * 60);
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize)]
-struct SyncEvent {
-    account_id: i64,
+pub(crate) struct SyncEvent {
+    pub(crate) account_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    report: Option<SyncReport>,
+    pub(crate) report: Option<SyncReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 pub fn start(app: &AppHandle, account_id: i64) {
@@ -50,7 +50,7 @@ pub fn stop(state: &AppState, account_id: i64) {
     };
 }
 
-fn emit(app: &AppHandle, ev: SyncEvent) {
+pub(crate) fn emit(app: &AppHandle, ev: SyncEvent) {
     if let Err(e) = app.emit("mail://synced", ev) {
         tracing::warn!("emit failed: {e}");
     }

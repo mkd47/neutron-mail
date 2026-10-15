@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS account_settings (
   signature_html TEXT NOT NULL DEFAULT '',
   sync_days INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS rules (
+  id INTEGER PRIMARY KEY,
+  position INTEGER NOT NULL,
+  def TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_runs (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  message_key TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, message_key)
+);
+CREATE TABLE IF NOT EXISTS rule_forwards (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS messages_folder_date ON messages(folder_id, date DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   subject, sender, body, tokenize = 'unicode61 remove_diacritics 2'
@@ -99,6 +114,9 @@ fn migrate_folder_sync_state(conn: &Connection) -> Result<()> {
         ("highestmodseq", "INTEGER"),
         ("exists_count", "INTEGER"),
         ("window_days", "INTEGER"),
+        ("display", "TEXT"),
+        ("delimiter", "TEXT"),
+        ("subscribed", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !cols.iter().any(|x| x == c) {
             conn.execute_batch(&format!("ALTER TABLE folders ADD COLUMN {c} {ty}"))?;
@@ -221,6 +239,17 @@ impl Store {
         if !has_auth {
             conn.execute_batch(
                 "ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'",
+            )?;
+        }
+        let has_sieve = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'sieve_port'",
+            )?
+            .exists([])?;
+        if !has_sieve {
+            conn.execute_batch(
+                "ALTER TABLE account_settings ADD COLUMN sieve_port INTEGER NOT NULL DEFAULT 4190;
+                 ALTER TABLE account_settings ADD COLUMN sieve_active INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
         let store = Self {
@@ -438,7 +467,8 @@ impl Store {
         let mut st = db.prepare(
             "SELECT f.id, f.account_id, f.name, f.role,
                     (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id AND m.seen = 0),
-                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id)
+                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id),
+                    COALESCE(f.display, f.name), f.delimiter, f.subscribed
              FROM folders f WHERE f.account_id = ?1
              ORDER BY CASE f.role WHEN 'inbox' THEN 0 WHEN 'drafts' THEN 1 WHEN 'sent' THEN 2
                                   WHEN 'archive' THEN 3 WHEN 'junk' THEN 4 WHEN 'trash' THEN 5 ELSE 6 END, f.name",
@@ -451,6 +481,9 @@ impl Store {
                 role: r.get(3)?,
                 unread: r.get(4)?,
                 total: r.get(5)?,
+                display: r.get(6)?,
+                delimiter: r.get(7)?,
+                subscribed: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -993,3 +1026,286 @@ fn restrict_permissions(path: &Path) {
 }
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
+
+// ---- folder management, rules ----------------------------------------------
+
+/// Sieve settings of an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SieveSettings {
+    pub port: u16,
+    /// Our script is uploaded and active on the server.
+    pub active: bool,
+}
+
+impl Store {
+    /// Insert/update a folder from the server's LIST.
+    pub fn upsert_remote_folder(
+        &self,
+        account_id: i64,
+        f: &crate::imap::RemoteFolder,
+    ) -> Result<i64> {
+        let db = self.db();
+        db.execute(
+            "INSERT INTO folders (account_id, name, role, display, delimiter, subscribed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, name) DO UPDATE SET role = excluded.role, display = excluded.display,
+               delimiter = excluded.delimiter, subscribed = excluded.subscribed",
+            params![account_id, f.name, f.role, f.display, f.delimiter, f.subscribed],
+        )?;
+        Ok(db.query_row(
+            "SELECT id FROM folders WHERE account_id = ?1 AND name = ?2",
+            params![account_id, f.name],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn folder(&self, folder_id: i64) -> Result<Folder> {
+        let account_id: i64 = self
+            .db()
+            .query_row(
+                "SELECT account_id FROM folders WHERE id = ?1",
+                [folder_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("folder {folder_id}")))?;
+        self.folders(account_id)?
+            .into_iter()
+            .find(|f| f.id == folder_id)
+            .ok_or_else(|| Error::NotFound(format!("folder {folder_id}")))
+    }
+
+    /// Rename a folder and its subfolders in the cache (keeps cached mail;
+    /// the next sync checks UIDVALIDITY as usual).
+    pub fn rename_folder_local(
+        &self,
+        account_id: i64,
+        old_wire: &str,
+        new_wire: &str,
+        delimiter: Option<&str>,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut st = tx.prepare("SELECT id, name FROM folders WHERE account_id = ?1")?;
+            let v = st
+                .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            v
+        };
+        for (id, name) in rows {
+            let renamed = if name == old_wire {
+                Some(new_wire.to_string())
+            } else {
+                delimiter.filter(|d| !d.is_empty()).and_then(|d| {
+                    name.strip_prefix(&format!("{old_wire}{d}"))
+                        .map(|rest| format!("{new_wire}{d}{rest}"))
+                })
+            };
+            if let Some(n) = renamed {
+                tx.execute(
+                    "UPDATE folders SET name = ?2, display = ?3 WHERE id = ?1",
+                    params![id, n, crate::mutf7::decode(&n)],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_folder_local(&self, folder_id: i64) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM folders WHERE id = ?1", [folder_id])?;
+        Ok(())
+    }
+
+    pub fn set_folder_subscribed(&self, folder_id: i64, on: bool) -> Result<()> {
+        self.db().execute(
+            "UPDATE folders SET subscribed = ?2 WHERE id = ?1",
+            params![folder_id, on],
+        )?;
+        Ok(())
+    }
+
+    /// (folder id, uid, Message-ID) of cached messages, all in one account.
+    pub fn message_refs(&self, ids: &[i64]) -> Result<Vec<(i64, i64, u32, String)>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT f.account_id, m.folder_id, m.uid, m.message_id FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+        )?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(r) = st
+                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional()?
+            {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ids of all cached messages in a folder (for "Run rules now").
+    pub fn message_ids(&self, folder_id: i64) -> Result<Vec<i64>> {
+        let db = self.db();
+        let mut st = db.prepare("SELECT id FROM messages WHERE folder_id = ?1 ORDER BY uid")?;
+        let rows = st.query_map([folder_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Cached message ids for UIDs of a folder.
+    pub fn ids_for_uids(&self, folder_id: i64, uids: &[u32]) -> Result<Vec<i64>> {
+        let db = self.db();
+        let mut st = db.prepare("SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2")?;
+        let mut out = Vec::new();
+        for u in uids {
+            if let Some(id) = st
+                .query_row(params![folder_id, u], |r| r.get(0))
+                .optional()?
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_flagged_local(&self, folder_id: i64, uid: u32) -> Result<()> {
+        self.db().execute(
+            "UPDATE messages SET flagged = 1 WHERE folder_id = ?1 AND uid = ?2",
+            params![folder_id, uid],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_seen_uid_local(&self, folder_id: i64, uid: u32) -> Result<()> {
+        self.db().execute(
+            "UPDATE messages SET seen = 1 WHERE folder_id = ?1 AND uid = ?2",
+            params![folder_id, uid],
+        )?;
+        Ok(())
+    }
+
+    // ---- rules ----
+
+    pub fn rules(&self) -> Result<Vec<crate::rules::Rule>> {
+        let db = self.db();
+        let mut st = db.prepare("SELECT id, def FROM rules ORDER BY position, id")?;
+        let rows: Vec<(i64, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(id, def)| {
+                let mut r: crate::rules::Rule = serde_json::from_str(&def)
+                    .map_err(|e| Error::Invalid(format!("stored rule {id} is unreadable: {e}")))?;
+                r.id = id;
+                Ok(r)
+            })
+            .collect()
+    }
+
+    /// Replace all rules (ordered). Rules keep their id when it is given
+    /// and exists; new rules get one. Returns the stored rules.
+    pub fn save_rules(&self, rules: &[crate::rules::Rule]) -> Result<Vec<crate::rules::Rule>> {
+        crate::rules::validate_all(rules)?;
+        {
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            let keep: Vec<i64> = rules.iter().map(|r| r.id).filter(|id| *id > 0).collect();
+            let existing: Vec<i64> = {
+                let mut st = tx.prepare("SELECT id FROM rules")?;
+                let v = st
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                v
+            };
+            for id in existing.iter().filter(|id| !keep.contains(id)) {
+                tx.execute("DELETE FROM rules WHERE id = ?1", [id])?;
+            }
+            for (pos, r) in rules.iter().enumerate() {
+                let mut stored = r.clone();
+                stored.id = 0;
+                let def =
+                    serde_json::to_string(&stored).map_err(|e| Error::Invalid(e.to_string()))?;
+                if r.id > 0 && existing.contains(&r.id) {
+                    tx.execute(
+                        "UPDATE rules SET position = ?2, def = ?3 WHERE id = ?1",
+                        params![r.id, pos as i64, def],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO rules (position, def) VALUES (?1, ?2)",
+                        params![pos as i64, def],
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
+        self.rules()
+    }
+
+    /// Record that rules ran on a message; false if they already had
+    /// (loop guard against re-processing, e.g. after a UIDVALIDITY reset or
+    /// a message filed back into the INBOX).
+    pub fn claim_rule_run(&self, account_id: i64, message_key: &str) -> Result<bool> {
+        if message_key.is_empty() {
+            return Ok(true);
+        }
+        let n = self.db().execute(
+            "INSERT OR IGNORE INTO rule_runs (account_id, message_key, at) VALUES (?1, ?2, ?3)",
+            params![account_id, message_key, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Count a forward against the hourly budget; false = over the limit.
+    pub fn take_forward_budget(&self, account_id: i64, limit: i64) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let db = self.db();
+        db.execute("DELETE FROM rule_forwards WHERE at < ?1", [now - 3600])?;
+        let used: i64 = db.query_row(
+            "SELECT COUNT(*) FROM rule_forwards WHERE account_id = ?1",
+            [account_id],
+            |r| r.get(0),
+        )?;
+        if used >= limit {
+            return Ok(false);
+        }
+        db.execute(
+            "INSERT INTO rule_forwards (account_id, at) VALUES (?1, ?2)",
+            params![account_id, now],
+        )?;
+        Ok(true)
+    }
+
+    pub fn sieve_settings(&self, account_id: i64) -> Result<SieveSettings> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT sieve_port, sieve_active FROM account_settings WHERE account_id = ?1",
+                [account_id],
+                |r| {
+                    Ok(SieveSettings {
+                        port: r.get(0)?,
+                        active: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or(SieveSettings {
+                port: crate::managesieve::DEFAULT_PORT,
+                active: false,
+            }))
+    }
+
+    pub fn set_sieve_settings(&self, account_id: i64, s: SieveSettings) -> Result<()> {
+        if s.port == 0 {
+            return Err(Error::Invalid("bad ManageSieve port".into()));
+        }
+        self.account(account_id)?;
+        self.db().execute(
+            "INSERT INTO account_settings (account_id, sieve_port, sieve_active) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET sieve_port = excluded.sieve_port, sieve_active = excluded.sieve_active",
+            params![account_id, s.port, s.active],
+        )?;
+        Ok(())
+    }
+}

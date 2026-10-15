@@ -35,8 +35,10 @@ pub enum SyncMode {
     Incremental,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderSyncStats {
+    /// UIDs downloaded in this pass (for rules on new mail).
+    pub new_uids: Vec<u32>,
     pub mode: SyncMode,
     pub new: usize,
     pub removed: usize,
@@ -68,13 +70,22 @@ pub async fn sync_account(
     let mut report = SyncReport::default();
     let days = store.account_settings(account_id)?.sync_days;
 
+    let mut inbox_new: Option<(i64, Vec<u32>)> = None;
     for f in remote.iter().filter(|f| f.selectable) {
-        let folder_id = store.upsert_folder(account_id, &f.name, f.role)?;
+        let folder_id = store.upsert_remote_folder(account_id, f)?;
         match sync_folder_detailed(store, folder_id, &f.name, &mut session, days, condstore).await {
             Ok(st) => {
                 report.folders += 1;
                 report.new_messages += st.new;
                 report.removed_messages += st.removed;
+                // Rules run on new INBOX mail, not on the first download
+                // of an existing mailbox.
+                if f.role == Some("inbox")
+                    && st.mode == SyncMode::Incremental
+                    && !st.new_uids.is_empty()
+                {
+                    inbox_new = Some((folder_id, st.new_uids.clone()));
+                }
             }
             Err(e) => {
                 tracing::warn!(folder = %f.name, "folder sync failed: {e}");
@@ -85,8 +96,48 @@ pub async fn sync_account(
             }
         }
     }
+    if let Some((fid, uids)) = inbox_new {
+        match run_rules_on_new(store, &mut session, cfg, password, account_id, fid, &uids).await {
+            Ok(rep) => {
+                report.rules_matched = rep.matched;
+                for name in &rep.touched {
+                    if let Some(f) = store
+                        .folders(account_id)?
+                        .into_iter()
+                        .find(|f| &f.name == name)
+                    {
+                        let _ =
+                            sync_folder_detailed(store, f.id, name, &mut session, days, condstore)
+                                .await;
+                    }
+                }
+                report.rule_errors = rep.errors;
+            }
+            Err(e) => report.rule_errors.push(e.to_string()),
+        }
+    }
     let _ = session.logout().await;
     Ok(report)
+}
+
+async fn run_rules_on_new(
+    store: &Store,
+    session: &mut Session,
+    cfg: &AccountConfig,
+    password: &str,
+    account_id: i64,
+    folder_id: i64,
+    uids: &[u32],
+) -> Result<crate::rules_exec::RunReport> {
+    let rules = crate::rules_exec::local_rules(store, account_id)?;
+    if rules.is_empty() {
+        return Ok(Default::default());
+    }
+    let ids = store.ids_for_uids(folder_id, uids)?;
+    crate::rules_exec::run(
+        store, session, cfg, password, account_id, folder_id, &ids, &rules, true,
+    )
+    .await
 }
 
 pub async fn sync_folder(
@@ -135,6 +186,7 @@ pub async fn sync_folder_detailed(
             .filter(|p| p.window_days == days && state.uidnext.is_some())
     };
     let mut stats = FolderSyncStats {
+        new_uids: Vec::new(),
         mode: if prev.is_some() {
             SyncMode::Incremental
         } else {
@@ -226,6 +278,7 @@ pub async fn sync_folder_detailed(
             .collect();
         store.insert_messages(folder_id, &batch)?;
         stats.new += batch.len();
+        stats.new_uids.extend(batch.iter().map(|m| m.uid));
     }
 
     // Only record state after everything above succeeded, so an interrupted

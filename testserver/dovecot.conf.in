@@ -7,7 +7,7 @@ instance_name = nmtest
 default_internal_user = @USER@
 default_internal_group = @GROUP@
 default_login_user = @USER@
-protocols = imap
+protocols = imap lmtp sieve
 log_path = @BASE@/dovecot.log
 auth_mechanisms = plain login
 auth_allow_cleartext = yes
@@ -52,4 +52,36 @@ namespace inbox {
     special_use = \Trash
     auto = subscribe
   }
+  mailbox Junk {
+    special_use = \Junk
+    auto = subscribe
+  }
+  mailbox Archive {
+    special_use = \Archive
+    auto = subscribe
+  }
+}
+
+# Server-side filtering: Pigeonhole Sieve on LMTP delivery, ManageSieve
+# (RFC 5804) for uploading scripts. Test-only ports, loopback only.
+protocol lmtp {
+  mail_plugins {
+    sieve = yes
+  }
+}
+service lmtp {
+  inet_listener lmtp {
+    port = 10024
+  }
+}
+service managesieve-login {
+  chroot =
+  inet_listener sieve {
+    port = 10419
+  }
+}
+sieve_script personal {
+  driver = file
+  path = ~/sieve
+  active_path = ~/.dovecot.sieve
 }

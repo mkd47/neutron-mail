@@ -50,6 +50,13 @@ async fn stalled_server_times_out() {
         w.write_all(format!("{tag} OK logged in\r\n").as_bytes())
             .await
             .unwrap();
+        // connect() asks for capabilities (UTF8=ACCEPT probe); answer that.
+        line.clear();
+        r.read_line(&mut line).await.unwrap();
+        let tag = line.split(' ').next().unwrap().to_string();
+        w.write_all(format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n").as_bytes())
+            .await
+            .unwrap();
         // Read and ignore everything else, never respond.
         loop {
             line.clear();

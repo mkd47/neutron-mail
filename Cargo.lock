@@ -2588,6 +2588,7 @@ dependencies = [
  "lettre",
  "mail-builder",
  "mail-parser",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",

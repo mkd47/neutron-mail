@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Start a throwaway local mail server for Neutron Mail development/tests.
 #   IMAP  : Dovecot 2.4, 127.0.0.1:10993 (TLS) and :10143 (STARTTLS)
+#   Sieve : ManageSieve 127.0.0.1:10419 (STARTTLS), LMTP 127.0.0.1:10024 (delivery runs Sieve)
 #   SMTP  : Python aiosmtpd, 127.0.0.1:10587 (STARTTLS required, AUTH)
 #   User  : kaan@localhost / testpass
 #   HTTP  : python3 http.server, 127.0.0.1:10880 (remote-image fixtures)
 #   CA    : $NM_TEST_BASE/certs/ca.pem (private test CA; leaf SAN localhost,127.0.0.1)
-# Requires: dovecot-imapd (2.4), python3-aiosmtpd, openssl. Runs as your user.
+# Requires: dovecot-imapd, dovecot-sieve, dovecot-managesieved, dovecot-lmtpd (2.4), python3-aiosmtpd, openssl. Runs as your user.
 set -euo pipefail
 BASE="${NM_TEST_BASE:-/workspace/testmail}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -41,4 +42,4 @@ python3 "$HERE/make_images.py" "$BASE/www"
 pkill -f "http.server 10880" 2>/dev/null || true
 nohup python3 -m http.server 10880 --bind 127.0.0.1 --directory "$BASE/www" > "$BASE/http.log" 2>&1 &
 sleep 2
-echo "IMAP 127.0.0.1:10993/10143, SMTP 127.0.0.1:10587, HTTP 127.0.0.1:10880, CA $BASE/certs/ca.pem"
+echo "IMAP 127.0.0.1:10993/10143, ManageSieve :10419, LMTP :10024, SMTP 127.0.0.1:10587, HTTP 127.0.0.1:10880, CA $BASE/certs/ca.pem"

@@ -400,3 +400,57 @@ fn rand_hex() -> String {
     let _ = getrandom::fill(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+/// A rule forward: the original attached as `message/rfc822`, marked
+/// `Auto-Submitted: auto-forwarded` (RFC 3834) so other automata (and our
+/// own rules) don't forward it again.
+pub fn build_auto_forward(
+    cfg: &AccountConfig,
+    to: &str,
+    subject: &str,
+    original: &[u8],
+) -> Result<Built> {
+    let to = mailbox(to)?;
+    let from: Mailbox = Mailbox::new(
+        Some(cfg.display_name.clone()).filter(|n| !n.is_empty()),
+        cfg.email
+            .parse()
+            .map_err(|e| Error::Invalid(format!("bad sender address: {e}")))?,
+    );
+    let subject: String = subject
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect();
+    let domain = from.email.domain().to_string();
+    let message_id = new_message_id(&domain);
+    let b = MessageBuilder::new()
+        .from(to_addr(&from))
+        .to(to_addr(&to))
+        .subject(format!("Fwd: {subject}"))
+        .message_id(message_id.clone())
+        .date(chrono::Utc::now().timestamp())
+        .header("User-Agent", Text::new("Neutron Mail"))
+        .header("Auto-Submitted", Text::new("auto-forwarded"))
+        .header("X-Neutron-Rule", Text::new("forward"))
+        .body(MimePart::new(
+            "multipart/mixed",
+            vec![
+                MimePart::new(
+                    utf8("text/plain"),
+                    "Forwarded automatically by a Neutron Mail rule.\n".to_string(),
+                ),
+                MimePart::new("message/rfc822", original.to_vec()).attachment("forwarded.eml"),
+            ],
+        ));
+    let raw = b
+        .write_to_vec()
+        .map_err(|e| Error::Invalid(format!("cannot build message: {e}")))?;
+    let envelope = Envelope::new(Some(from.email.clone()), vec![to.email.clone()])
+        .map_err(|e| Error::Invalid(format!("envelope: {e}")))?;
+    Ok(Built {
+        raw,
+        envelope,
+        message_id,
+    })
+}

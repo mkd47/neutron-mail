@@ -49,6 +49,24 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   **Accept / Maybe / Decline**: sends an iMIP `REPLY` to the organizer (copy saved to Sent) and, optionally, adds or
   updates the event in your Personal calendar.
 
+- **Folders:** create, rename and delete folders (delete asks first and moves the messages to Trash or
+  deletes them), nested subfolders using the server's hierarchy delimiter, drag a folder onto another to
+  reparent it (or onto "top level"), subscribe/unsubscribe with a "show unsubscribed" toggle. Special-use folders
+  (RFC 6154: Inbox, Sent, Drafts, Trash, Junk, Archive) are protected. Names in any script work (modified UTF-7,
+  or `UTF8=ACCEPT` where the server offers it). Right-click a folder for the menu.
+- **Moving and copying mail:** drag one or many messages onto a folder (the target is highlighted; hold **Ctrl**
+  to copy), Ctrl/Shift-click for multi-select, **Move to… / Copy to…** pickers (**V** / **Shift+V**), and **Undo**
+  (toast button or **Ctrl+Z**). Uses IMAP `MOVE`, falling back to `COPY` + `\Deleted` + `UID EXPUNGE`; the local cache is
+  updated at once.
+- **Rules** (filter icon in the sidebar): ordered rules with conditions on From/To/Cc/Subject/Body/any header/size/
+  attachments/account (contains, equals, starts with, regex; all or any) and actions move, copy, mark read, star,
+  label (IMAP keyword), delete, forward (confirmed in the UI) and stop. They run on new Inbox mail during sync,
+  or on any folder with **Run now**; **Test against message** shows which conditions match and what would happen.
+  Rules marked **Run on server** are exported as a **Sieve** script (preview shown) and uploaded and activated over
+  **ManageSieve** (RFC 5804), so the server files mail even when the app is closed; anything Sieve can't express stays local.
+  Guards: no forwarding of automated/forwarded mail or your own mail, `Auto-Submitted` on forwards, 20 forwards/hour,
+  each message processed once, linear-time regex with size limits. Rules are stored in the encrypted cache.
+
 - 🔐 [Security audit](docs/AUDIT.md): findings, severities, fixes and known gaps
 - 📄 [Research report](docs/research-report.md): architecture, crates, GNOME integration, licensing
 - 🎨 [UI concepts](concepts/README.md) · 📸 [Prototype screenshots](docs/screenshots/)
@@ -81,11 +99,25 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 |---|---|---|
 | ![](docs/screenshots/provider-tile-alimail.png) | ![](docs/screenshots/provider-autoconfig-fastmail.png) | ![](docs/screenshots/provider-other-filled.png) |
 
+| New folder (any script) | Nested folders | Drag & drop with drop-target highlight |
+|---|---|---|
+| ![](docs/screenshots/folder-create.png) | ![](docs/screenshots/folders-nested.png) | ![](docs/screenshots/drag-drop-target.png) |
+
+| Multi-select (Shift-click) | Ctrl+drag copies | Moved, with Undo |
+|---|---|---|
+| ![](docs/screenshots/multi-select.png) | ![](docs/screenshots/drag-copy-ctrl.png) | ![](docs/screenshots/move-undo.png) |
+
+| Rules editor + test against a message | Sieve preview | Server rule applied to incoming mail (starred, filed by Sieve) |
+|---|---|---|
+| ![](docs/screenshots/rules-editor-test.png) | ![](docs/screenshots/rules-sieve-preview.png) | ![](docs/screenshots/rule-applied-incoming.png) |
+
 | Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
 |---|---|---|
 | ![](docs/screenshots/settings-account.png) | ![](docs/screenshots/settings-signature-images-sync.png) | ![](docs/screenshots/settings-signature-reply.png) |
 
-More: [remove account confirmation](docs/screenshots/settings-remove-confirm.png), [inline reply](docs/screenshots/inline-reply.png), [inline reply all](docs/screenshots/inline-reply-all.png),
+More: [delete folder confirmation](docs/screenshots/folder-delete-confirm.png), [folder reparented by drag](docs/screenshots/folder-reparent.png),
+[Copy to… picker](docs/screenshots/copy-to-picker.png), [forward confirmation](docs/screenshots/rules-forward-confirm.png),
+[Sieve script active](docs/screenshots/rules-sieve-active.png), [remove account confirmation](docs/screenshots/settings-remove-confirm.png), [inline reply](docs/screenshots/inline-reply.png), [inline reply all](docs/screenshots/inline-reply-all.png),
 [compose autocomplete](docs/screenshots/autocomplete-compose.png), [attachment picker](docs/screenshots/attachment-picker.png),
 [save](docs/screenshots/attachment-save.png) / [open](docs/screenshots/attachment-open.png) an attachment,
 [link opened in the browser](docs/screenshots/linkedin-link-open.png), [redirect unwrapped](docs/screenshots/linkedin-redirect-unwrapped.png),
@@ -188,9 +220,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 npm run check && npm run build                  # svelte-check (warnings fail) + Vite build
 
 # Integration tests against a local mail server (all bound to 127.0.0.1)
-sudo dnf install -y dovecot python3-aiosmtpd openssl   # Debian: dovecot-imapd python3-aiosmtpd
+sudo dnf install -y dovecot dovecot-pigeonhole python3-aiosmtpd openssl
+# Debian/Ubuntu: dovecot-imapd dovecot-lmtpd dovecot-sieve dovecot-managesieved python3-aiosmtpd
 export NM_TEST_BASE=/tmp/neutron-testmail
-testserver/start.sh       # private CA + leaf cert, Dovecot on 10993 (TLS)/10143 (STARTTLS), SMTP on 10587
+testserver/start.sh       # private CA + leaf cert, Dovecot on 10993 (TLS)/10143 (STARTTLS), ManageSieve on 10419,
+                          # LMTP on 10024 (runs Sieve), SMTP on 10587 (delivers through LMTP)
 python3 testserver/seed.py   # HTML/CSS newsletter, LinkedIn-style links, reply-all thread, attachments, phishing fixtures
 NEUTRON_IT=1 cargo test --workspace
 testserver/eds-test.sh    # live evolution-data-server contact tests in a private D-Bus session

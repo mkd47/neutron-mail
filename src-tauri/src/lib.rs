@@ -6,6 +6,7 @@ mod attachments;
 mod calendar;
 mod commands;
 mod contacts;
+mod organize;
 mod providers;
 mod watcher;
 
@@ -176,6 +177,19 @@ pub fn run() {
             commands::set_unread_badge,
             calendar::get_invite,
             calendar::respond_invite,
+            organize::create_folder,
+            organize::rename_folder,
+            organize::delete_folder,
+            organize::set_folder_subscribed,
+            organize::move_messages,
+            organize::undo_transfer,
+            organize::list_rules,
+            organize::save_rules,
+            organize::test_rule,
+            organize::run_rules_now,
+            organize::sieve_status,
+            organize::sieve_upload,
+            organize::sieve_disable,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");

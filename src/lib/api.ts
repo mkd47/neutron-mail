@@ -32,7 +32,14 @@ export interface Discovered {
   smtp_host: string; smtp_port: number; smtp_security: Security;
   username: string; source: string; oauth2: boolean;
 }
-export interface Folder { id: number; account_id: number; name: string; role: string | null; unread: number; total: number }
+export interface Folder {
+  id: number; account_id: number;
+  /** Server (wire) name, e.g. "Projects.2026" or modified UTF-7. */
+  name: string;
+  /** Decoded full path for display (same delimiter). */
+  display: string; delimiter: string | null; subscribed: boolean;
+  role: string | null; unread: number; total: number;
+}
 export interface MessageSummary {
   id: number; folder_id: number; uid: number; subject: string; from_name: string; from_addr: string;
   date: number; preview: string; seen: boolean; flagged: boolean; has_attachments: boolean;
@@ -63,7 +70,7 @@ export interface LinkInfo {
 export interface ContactSuggestion { name: string; email: string; source: "contacts" | "history" }
 export interface ContactsStatus { eds_connected: boolean; books: number; error: string | null }
 export interface SearchHit extends MessageSummary { snippet: string }
-export interface SyncReport { folders: number; new_messages: number; removed_messages: number; failed_folders: string[] }
+export interface SyncReport { folders: number; new_messages: number; removed_messages: number; failed_folders: string[]; rules_matched: number; rule_errors: string[] }
 export interface Outgoing {
   to: string[]; cc: string[]; bcc: string[]; subject: string; body: string;
   /** Rich body; sent as multipart/alternative. The backend sanitizes it again. */
@@ -125,6 +132,16 @@ export const api = {
   sanitizeComposeHtml: (html: string) => invoke<string>("sanitize_compose_html", { html }),
   setUnreadBadge: (count: number) => invoke<void>("set_unread_badge", { count }),
   contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
+  createFolder: (accountId: number, parentId: number | null, name: string) =>
+    invoke<Folder>("create_folder", { accountId, parentId, name }),
+  renameFolder: (folderId: number, name: string | null, newParentId: number | null, toRoot = false) =>
+    invoke<Folder>("rename_folder", { folderId, name, newParentId, toRoot }),
+  deleteFolder: (folderId: number, mode: DeleteMode) => invoke<number>("delete_folder", { folderId, mode }),
+  setFolderSubscribed: (folderId: number, subscribed: boolean) =>
+    invoke<void>("set_folder_subscribed", { folderId, subscribed }),
+  moveMessages: (messageIds: number[], targetFolderId: number, copy: boolean) =>
+    invoke<Transfer>("move_messages", { messageIds, targetFolderId, copy }),
+  undoTransfer: (transfer: Transfer) => invoke<number>("undo_transfer", { transfer }),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>
     listen<LinkInfo | { error: string; original: string }>("mail://link", (e) => cb(e.payload)),
@@ -158,3 +175,31 @@ export function errorText(e: unknown): string {
 
 export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" };
 export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [] });
+
+export type DeleteMode = "move_to_trash" | "delete_messages";
+export interface Transfer { account_id: number; target_folder_id: number; copy: boolean; items: [number, string][]; untracked: number; count: number }
+
+export type RuleField = "from" | "to" | "cc" | "subject" | "body" | "header" | "size" | "has_attachment" | "account";
+export type RuleOp = "contains" | "equals" | "regex" | "starts_with" | "greater" | "less" | "is" | "is_not";
+export interface Condition { field: RuleField; op: RuleOp; value: string; header: string }
+export type Action =
+  | { type: "move"; folder: string } | { type: "copy"; folder: string } | { type: "mark_read" } | { type: "flag" }
+  | { type: "label"; keyword: string } | { type: "delete" } | { type: "forward"; to: string } | { type: "stop" };
+export interface Rule { id: number; name: string; enabled: boolean; match_all: boolean; conditions: Condition[]; actions: Action[]; server_side: boolean }
+export interface Plan {
+  rule_ids: number[]; mark_read: boolean; flag: boolean; keywords: string[]; copies: string[];
+  move_to: string | null; delete: boolean; forwards: string[]; skipped: string[];
+}
+export interface RuleTest { matched: boolean; conditions: boolean[]; plan: Plan }
+export interface RunReport { examined: number; matched: number; moved: number; copied: number; flagged: number; forwarded: number; skipped: string[]; errors: string[] }
+export interface SieveExport { script: string; exported: number[]; local_only: [number, string][] }
+export interface SieveStatus { settings: { port: number; active: boolean }; preview: SieveExport; oauth: boolean }
+export const rulesApi = {
+  list: () => invoke<Rule[]>("list_rules"),
+  save: (rules: Rule[]) => invoke<Rule[]>("save_rules", { rules }),
+  test: (rule: Rule, messageId: number) => invoke<RuleTest>("test_rule", { rule, messageId }),
+  runNow: (folderId: number) => invoke<RunReport>("run_rules_now", { folderId }),
+  sieveStatus: (accountId: number) => invoke<SieveStatus>("sieve_status", { accountId }),
+  sieveUpload: (accountId: number, port: number) => invoke<SieveExport>("sieve_upload", { accountId, port }),
+  sieveDisable: (accountId: number) => invoke<void>("sieve_disable", { accountId }),
+};

@@ -116,6 +116,11 @@ pub struct Folder {
     pub role: Option<String>,
     pub unread: i64,
     pub total: i64,
+    /// Decoded (Unicode) full name for display; `name` is the wire name.
+    pub display: String,
+    /// IMAP hierarchy delimiter, e.g. "." or "/".
+    pub delimiter: Option<String>,
+    pub subscribed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -260,4 +265,7 @@ pub struct SyncReport {
     pub removed_messages: usize,
     /// Folders that could not be synced this round (retried next time).
     pub failed_folders: Vec<String>,
+    /// New INBOX messages that matched a local rule.
+    pub rules_matched: usize,
+    pub rule_errors: Vec<String>,
 }

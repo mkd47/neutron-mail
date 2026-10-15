@@ -21,6 +21,7 @@
     check: "M5 12l5 5 9-10",
     bell: "M6 16V11a6 6 0 0 1 12 0v5l2 2H4z M10 20a2 2 0 0 0 4 0",
     shield: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z",
+    filter: "M3 5h18l-7 8v6l-4 2v-8z",
     plus: "M12 5v14 M5 12h14",
     reply: "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 6 6v5",
     replyall: "M7 14L2 9l5-5 M12 14L7 9l5-5 M7 9h8a6 6 0 0 1 6 6v5",

@@ -82,7 +82,7 @@ pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Session> {
         if cfg.imap_security == Security::Tls {
             let _greeting = client.read_response().await;
         }
-        if cfg.auth.is_oauth() {
+        let mut session = if cfg.auth.is_oauth() {
             // `password` is the OAuth2 access token (RFC 7628 / XOAUTH2).
             let auth = XOAuth2 {
                 response: crate::oauth::xoauth2_string(&cfg.username, password),
@@ -90,22 +90,34 @@ pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Session> {
             client
                 .authenticate("XOAUTH2", auth)
                 .await
-                .map_err(|(e, _)| Error::from(e))
+                .map_err(|(e, _)| Error::from(e))?
         } else {
             client
                 .login(&cfg.username, password)
                 .await
-                .map_err(|(e, _)| Error::from(e))
-        }
+                .map_err(|(e, _)| Error::from(e))?
+        };
+        // Every session uses the same name encoding (UTF-8 when the server
+        // accepts it, modified UTF-7 otherwise), so stored wire names work
+        // on any connection.
+        enable_utf8(&mut session).await?;
+        Ok(session)
     })
     .await
 }
 
 #[derive(Debug, Clone)]
 pub struct RemoteFolder {
+    /// Name as on the wire (modified UTF-7 unless UTF8=ACCEPT); used for
+    /// every command.
     pub name: String,
+    /// Decoded Unicode name for display.
+    pub display: String,
     pub role: Option<&'static str>,
     pub selectable: bool,
+    /// Hierarchy delimiter (e.g. "." or "/"), None for flat namespaces.
+    pub delimiter: Option<String>,
+    pub subscribed: bool,
 }
 
 fn role_of(name: &str, attrs: &[NameAttribute<'_>]) -> Option<&'static str> {
@@ -139,17 +151,228 @@ pub async fn list_folders(session: &mut Session) -> Result<Vec<RemoteFolder>> {
             .await
     })
     .await?;
+    let subscribed: HashSet<String> = cmd(async {
+        session
+            .lsub(Some(""), Some("*"))
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await?
+    .iter()
+    .map(|n| n.name().to_string())
+    .collect();
     Ok(names
         .iter()
         .map(|n| RemoteFolder {
             name: n.name().to_string(),
+            display: crate::mutf7::decode(n.name()),
             role: role_of(n.name(), n.attributes()),
             selectable: !n
                 .attributes()
                 .iter()
                 .any(|a| matches!(a, NameAttribute::NoSelect)),
+            delimiter: n.delimiter().map(str::to_string),
+            subscribed: subscribed.contains(n.name()) || n.name().eq_ignore_ascii_case("INBOX"),
         })
         .collect())
+}
+
+/// Enable RFC 6855 UTF8=ACCEPT when offered; afterwards mailbox names are
+/// UTF-8 on the wire. Returns whether it is in effect.
+pub async fn enable_utf8(session: &mut Session) -> Result<bool> {
+    if !cmd(session.capabilities()).await?.has_str("UTF8=ACCEPT") {
+        return Ok(false);
+    }
+    cmd(session.run_command_and_check_ok("ENABLE UTF8=ACCEPT")).await?;
+    Ok(true)
+}
+
+/// Wire form of a Unicode mailbox name.
+pub fn wire_name(name: &str, utf8: bool) -> String {
+    if utf8 {
+        name.to_string()
+    } else {
+        crate::mutf7::encode(name)
+    }
+}
+
+/// Reject names the server would misparse or that hide as other folders.
+pub fn validate_folder_name(name: &str, delimiter: Option<&str>) -> Result<()> {
+    let bad = name.trim().is_empty()
+        || name.len() > 512
+        || name.chars().any(|c| c.is_control() || c == '*' || c == '%')
+        || name.eq_ignore_ascii_case("INBOX");
+    let empty_part = delimiter
+        .filter(|d| !d.is_empty())
+        .is_some_and(|d| name.split(d).any(|p| p.trim().is_empty()));
+    if bad || empty_part {
+        return Err(Error::Invalid(format!(
+            "\"{name}\" is not a valid folder name"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn create_folder(session: &mut Session, wire: &str) -> Result<()> {
+    cmd(session.create(wire)).await?;
+    cmd(session.subscribe(wire)).await
+}
+
+/// Rename a folder (with its subfolders) and move the subscriptions of the
+/// folder and its subfolders along (RENAME doesn't on every server).
+pub async fn rename_folder(
+    session: &mut Session,
+    from: &str,
+    to: &str,
+    delim: Option<&str>,
+) -> Result<()> {
+    let mut subs: Vec<String> = Vec::new();
+    if let Some(d) = delim.filter(|d| !d.is_empty()) {
+        let prefix = format!("{from}{d}");
+        subs = cmd(async {
+            session
+                .lsub(Some(""), Some(&format!("{prefix}*")))
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await?
+        .iter()
+        .map(|n| n.name().to_string())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    }
+    cmd(session.rename(from, to)).await?;
+    let _ = cmd(session.unsubscribe(from)).await;
+    cmd(session.subscribe(to)).await?;
+    for old in subs {
+        let new = format!("{to}{}", &old[from.len()..]);
+        let _ = cmd(session.unsubscribe(&old)).await;
+        let _ = cmd(session.subscribe(&new)).await;
+    }
+    Ok(())
+}
+
+pub async fn delete_folder(session: &mut Session, wire: &str) -> Result<()> {
+    // Deleting the selected mailbox makes some servers (Dovecot) drop the
+    // connection: select another one read-only first.
+    cmd(session.examine("INBOX")).await?;
+    let _ = cmd(session.unsubscribe(wire)).await;
+    cmd(session.delete(wire)).await
+}
+
+pub async fn set_subscribed(session: &mut Session, wire: &str, on: bool) -> Result<()> {
+    if on {
+        cmd(session.subscribe(wire)).await
+    } else {
+        cmd(session.unsubscribe(wire)).await
+    }
+}
+
+pub async fn has_capability(session: &mut Session, cap: &str) -> Result<bool> {
+    Ok(cmd(session.capabilities()).await?.has_str(cap))
+}
+
+/// Move UIDs between folders: `UID MOVE` (RFC 6851) when available,
+/// otherwise `UID COPY` + `\Deleted` + `UID EXPUNGE` (UIDPLUS) or EXPUNGE.
+pub async fn move_uids(session: &mut Session, from: &str, uids: &[u32], to: &str) -> Result<()> {
+    let have_move = has_capability(session, "MOVE").await?;
+    move_uids_with(session, from, uids, to, have_move).await
+}
+
+/// [`move_uids`] with the MOVE extension forced on/off (tests use the fallback).
+pub async fn move_uids_with(
+    session: &mut Session,
+    from: &str,
+    uids: &[u32],
+    to: &str,
+    use_move: bool,
+) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    cmd(session.select(from)).await?;
+    for chunk in uids.chunks(200) {
+        let set = uid_set(chunk);
+        if use_move {
+            cmd(session.uid_mv(&set, to)).await?;
+        } else {
+            cmd(session.uid_copy(&set, to)).await?;
+            store_uids(session, chunk, "+FLAGS.SILENT (\\Deleted)").await?;
+            if has_capability(session, "UIDPLUS").await? {
+                cmd(async {
+                    session
+                        .uid_expunge(&set)
+                        .await?
+                        .try_collect::<Vec<_>>()
+                        .await
+                })
+                .await?;
+            } else {
+                cmd(async { session.expunge().await?.try_collect::<Vec<_>>().await }).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn copy_uids(session: &mut Session, from: &str, uids: &[u32], to: &str) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    cmd(session.select(from)).await?;
+    for chunk in uids.chunks(200) {
+        cmd(session.uid_copy(uid_set(chunk), to)).await?;
+    }
+    Ok(())
+}
+
+/// `UID STORE` on the selected folder, e.g. `+FLAGS.SILENT (\Seen)`.
+pub async fn store_uids(session: &mut Session, uids: &[u32], what: &str) -> Result<()> {
+    for chunk in uids.chunks(200) {
+        cmd(async {
+            session
+                .uid_store(uid_set(chunk), what)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// UIDs in `folder` whose Message-ID header equals `message_id`.
+pub async fn uids_by_message_id(
+    session: &mut Session,
+    folder: &str,
+    message_id: &str,
+) -> Result<Vec<u32>> {
+    let mid: String = message_id
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect();
+    if mid.is_empty() {
+        return Ok(Vec::new());
+    }
+    cmd(session.select(folder)).await?;
+    let mut v: Vec<u32> = cmd(session.uid_search(format!("HEADER Message-ID \"{mid}\"")))
+        .await?
+        .into_iter()
+        .collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
+/// IMAP keyword (flag atom) check: RFC 3501 atom chars, no backslash.
+pub fn valid_keyword(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 64
+        && k.bytes().all(|b| {
+            b.is_ascii_graphic()
+                && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')
+        })
 }
 
 pub struct FolderState {
