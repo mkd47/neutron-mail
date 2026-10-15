@@ -11,23 +11,43 @@ A free, open-source desktop mail client inspired by modern privacy-focused webma
 
 ## Status
 
-**Working prototype (v0.1.0).** Verified against a local Dovecot + SMTP test server:
+**Working prototype (v0.1.0 + v0.2 features).** Verified in the real GUI against a local Dovecot + SMTP test server:
 add an account (IMAP/SMTP over TLS or STARTTLS, certificate always verified), folder list,
-message list from a local SQLite cache, a sanitized HTML viewer (sandboxed iframe, remote
-images blocked), plain-text compose and send (with a copy saved to Sent), full-text search,
-and IMAP IDLE push with a polling fallback. GNOME Contacts/Calendar are stub interfaces only.
+message list from a local SQLite cache, full-text search, IMAP IDLE push with a polling fallback, and:
+
+- **Rich HTML mail:** safe CSS kept, inline `cid:` images, remote images blocked by default with
+  "Load remote images" per message or "Always load from this sender" (fetched by the Rust core with an SSRF guard), and **View source**.
+- **Links that work, safely:** clicks in the sandboxed message are intercepted; a dialog shows the real host and
+  the cleaned URL (LinkedIn/redirect tracking removed) before opening it in your browser. Hovering shows the real target. `mailto:` opens the composer.
+- **Reply / Reply all / Forward inline** in the reading pane (original stays visible), plus a standalone Compose window:
+  To/Cc/Bcc chips, correct `In-Reply-To`/`References`, quoted text, forwarded attachments, **drafts** (save, resume, send), and a visible warning if the copy to Sent fails.
+- **Attachments:** attach via the native file picker; save (native save dialog) or open received files with the default app;
+  hostile names neutralized, executables/scripts need confirmation, 25 MB limits.
+- **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
+
+GNOME Calendar integration is still a stub.
 
 - 🔐 [Security audit](docs/AUDIT.md): findings, severities, fixes and known gaps
 - 📄 [Research report](docs/research-report.md): architecture, crates, GNOME integration, licensing
 - 🎨 [UI concepts](concepts/README.md) · 📸 [Prototype screenshots](docs/screenshots/)
 
-| Inbox + HTML viewer (light) | Remote image blocked (dark) | Compose |
+| Inline reply all + contact autocomplete | Forward with attachments | Link confirmation (LinkedIn tracking removed) |
 |---|---|---|
-| ![](docs/screenshots/02-viewer-html-light.png) | ![](docs/screenshots/03-viewer-html-dark.png) | ![](docs/screenshots/06-compose-dark.png) |
+| ![](docs/screenshots/autocomplete-inline.png) | ![](docs/screenshots/inline-forward-attachment.png) | ![](docs/screenshots/linkedin-link-confirm.png) |
+
+| HTML + remote images loaded | View source | Dangerous attachment warning |
+|---|---|---|
+| ![](docs/screenshots/html-rendering-images.png) | ![](docs/screenshots/view-source.png) | ![](docs/screenshots/attachment-risky-warning.png) |
+
+More: [inline reply](docs/screenshots/inline-reply.png), [inline reply all](docs/screenshots/inline-reply-all.png),
+[compose autocomplete](docs/screenshots/autocomplete-compose.png), [attachment picker](docs/screenshots/attachment-picker.png),
+[save](docs/screenshots/attachment-save.png) / [open](docs/screenshots/attachment-open.png) an attachment,
+[link opened in the browser](docs/screenshots/linkedin-link-open.png), [redirect unwrapped](docs/screenshots/linkedin-redirect-unwrapped.png),
+[remote images blocked](docs/screenshots/html-rendering-blocked.png), [Sent-copy failure notice](docs/screenshots/sent-copy-failure.png).
 
 ### Why Svelte (not React)
-Svelte compiles to plain DOM code with no runtime: a 66 KB JS bundle (25 KB gzipped) and a single
-runtime npm dependency (`@tauri-apps/api`). That keeps the WebView small and the supply-chain
+Svelte compiles to plain DOM code with no runtime: an 82 KB JS bundle (30 KB gzipped) and two
+runtime npm dependencies (`@tauri-apps/api`, `@tauri-apps/plugin-opener`). That keeps the WebView small and the supply-chain
 audit surface minimal, which matters for an app that handles mail.
 
 ## Build & run on Fedora 44
@@ -39,7 +59,7 @@ audit surface minimal, which matters for an app that handles mail.
 # 1. System dependencies
 sudo dnf install -y webkit2gtk4.1-devel openssl-devel curl wget file \
   libappindicator-gtk3-devel librsvg2-devel libxdo-devel nodejs npm \
-  gnome-keyring libsecret
+  gnome-keyring libsecret evolution-data-server
 sudo dnf group install -y c-development
 
 # 2. Rust (>= 1.85) via rustup, plus the Tauri CLI
@@ -67,10 +87,17 @@ npm run check && npm run build                  # svelte-check (warnings fail) +
 sudo dnf install -y dovecot python3-aiosmtpd openssl   # Debian: dovecot-imapd python3-aiosmtpd
 export NM_TEST_BASE=/tmp/neutron-testmail
 testserver/start.sh       # private CA + leaf cert, Dovecot on 10993 (TLS)/10143 (STARTTLS), SMTP on 10587
-python3 testserver/seed.py   # HTML, tracker, attachments and phishing fixtures
+python3 testserver/seed.py   # HTML/CSS newsletter, LinkedIn-style links, reply-all thread, attachments, phishing fixtures
 NEUTRON_IT=1 cargo test --workspace
+testserver/eds-test.sh    # live evolution-data-server contact tests in a private D-Bus session
 testserver/stop.sh
 ```
+
+`start.sh` also serves test images on `http://127.0.0.1:10880`. Remote-image loading refuses
+private/loopback hosts, so to see them in a **debug** build run the app with
+`NEUTRON_ALLOW_PRIVATE_IMAGE_HOSTS=1` (ignored in release builds). To get test contacts into
+your address book: `cargo run -p neutron-core --example eds_seed -- testserver/contacts.vcf`
+(adds four example.test contacts to the local "Personal" book).
 
 The test login is `kaan@localhost` / `testpass`. To use the test server from the GUI, paste
 `$NM_TEST_BASE/certs/ca.pem` under **Advanced: trust a private CA**.
