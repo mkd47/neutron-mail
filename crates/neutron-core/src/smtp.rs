@@ -210,6 +210,71 @@ pub async fn send(
     Ok(built.raw)
 }
 
+/// An iMIP message (RFC 6047): multipart/alternative with a human-readable
+/// text part and the iTIP object as `text/calendar; method=…`.
+pub fn build_imip(
+    cfg: &AccountConfig,
+    to: &str,
+    subject: &str,
+    text: &str,
+    ics: &str,
+    method: &str,
+    in_reply_to: Option<&str>,
+) -> Result<Built> {
+    let to = mailbox(to)?;
+    if subject.contains(['\r', '\n']) || !method.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(Error::Invalid("bad iMIP subject or method".into()));
+    }
+    let from: Mailbox = Mailbox::new(
+        Some(cfg.display_name.clone()).filter(|n| !n.is_empty()),
+        cfg.email
+            .parse()
+            .map_err(|e| Error::Invalid(format!("bad sender address: {e}")))?,
+    );
+    let domain = from.email.domain().to_string();
+    let message_id = new_message_id(&domain);
+    let mut b = MessageBuilder::new()
+        .from(to_addr(&from))
+        .to(to_addr(&to))
+        .subject(subject.to_string())
+        .message_id(message_id.clone())
+        .date(chrono::Utc::now().timestamp())
+        .header("User-Agent", Text::new("Neutron Mail"));
+    if let Some(p) = in_reply_to.filter(|s| !s.trim().is_empty()) {
+        if let Ok(id) = clean_id(p) {
+            b = b.in_reply_to(id);
+        }
+    }
+    let cal_ct = ContentType::new("text/calendar")
+        .attribute("method", method.to_ascii_uppercase())
+        .attribute("charset", "utf-8");
+    b = b.body(MimePart::new(
+        "multipart/alternative",
+        vec![
+            MimePart::new(utf8("text/plain"), text.replace("\r\n", "\n")),
+            MimePart::new(cal_ct, ics.to_string()),
+        ],
+    ));
+    let raw = b
+        .write_to_vec()
+        .map_err(|e| Error::Invalid(format!("cannot build message: {e}")))?;
+    let envelope = Envelope::new(Some(from.email.clone()), vec![to.email.clone()])
+        .map_err(|e| Error::Invalid(format!("envelope: {e}")))?;
+    Ok(Built {
+        raw,
+        envelope,
+        message_id,
+    })
+}
+
+/// Send an already built message.
+pub async fn send_built(cfg: &AccountConfig, password: &str, built: &Built) -> Result<()> {
+    transport(cfg, password)?
+        .send_raw(&built.envelope, &built.raw)
+        .await?;
+    Ok(())
+}
+
 fn utf8(ct: &'static str) -> ContentType<'static> {
     ContentType::new(ct).attribute("charset", "utf-8")
 }

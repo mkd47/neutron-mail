@@ -110,6 +110,27 @@ export const api = {
   onHover: (cb: (url: string | null) => void): Promise<UnlistenFn> => listen<string | null>("mail://hover", (e) => cb(e.payload)),
 };
 
+export interface CalendarEvent {
+  uid: string; summary: string; location: string; start: number; end: number; all_day: boolean; calendar: string; color: string;
+}
+export interface Agenda { available: boolean; error: string | null; events: CalendarEvent[] }
+export type PartStat = "ACCEPTED" | "TENTATIVE" | "DECLINED";
+export interface Attendee { email: string; name: string; partstat: string }
+export interface InviteEvent {
+  uid: string; summary: string; location: string; description: string; start: number; end: number; all_day: boolean;
+  organizer_email: string; organizer_name: string; attendees: Attendee[]; sequence: number; status: string; rrule: string | null;
+}
+export interface InviteView {
+  method: string; event: InviteEvent; my_partstat: string; responded: boolean; in_calendar: boolean; can_respond: boolean;
+}
+export interface InviteResult { invite: InviteView; sent_copy: "saved" | "no_sent_folder" | "failed"; calendar_error: string | null }
+export const calendarApi = {
+  upcoming: (days: number) => invoke<Agenda>("upcoming_events", { days }),
+  getInvite: (messageId: number) => invoke<InviteView | null>("get_invite", { messageId }),
+  respond: (messageId: number, partstat: PartStat, addToCalendar: boolean) =>
+    invoke<InviteResult>("respond_invite", { messageId, partstat, addToCalendar }),
+};
+
 export function errorText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
 }

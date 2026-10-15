@@ -37,7 +37,10 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   every IMAP command has a timeout. 5,000 messages: first sync ≈1.3 s, a no-change resync ≈10 ms (local Dovecot, debug build).
 - **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
 
-GNOME Calendar integration is still a stub.
+- **GNOME Calendar** (evolution-data-server over D-Bus): a read-only **agenda strip** with the next 7 days from all
+  enabled calendars (recurring events expanded), and an **invitation card** for `text/calendar` invites with
+  **Accept / Maybe / Decline**: sends an iMIP `REPLY` to the organizer (copy saved to Sent) and, optionally, adds or
+  updates the event in your Personal calendar.
 
 - 🔐 [Security audit](docs/AUDIT.md): findings, severities, fixes and known gaps
 - 📄 [Research report](docs/research-report.md): architecture, crates, GNOME integration, licensing
@@ -54,6 +57,10 @@ GNOME Calendar integration is still a stub.
 | HTML + remote images loaded | View source | Dangerous attachment warning |
 |---|---|---|
 | ![](docs/screenshots/html-rendering-images.png) | ![](docs/screenshots/view-source.png) | ![](docs/screenshots/attachment-risky-warning.png) |
+
+| Invitation card (iMIP) | Accepted: reply sent, added to GNOME Calendar | Agenda strip (EDS) |
+|---|---|---|
+| ![](docs/screenshots/invite-card.png) | ![](docs/screenshots/invite-accepted.png) | ![](docs/screenshots/agenda-strip.png) |
 
 | Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
 |---|---|---|

@@ -1,12 +1,14 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import Composer from "./Composer.svelte";
+  import InviteCard from "./InviteCard.svelte";
   import { initials, shortDate, size } from "./format";
   import { api, errorText, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MessageView } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone }: {
+  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {} }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
-    onReload: (loadRemote: boolean) => void; onStatus: (s: string) => void; onComposerDone: (r: ComposerResult) => void;
+    onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
+    onCalendarChanged?: () => void;
   } = $props();
 
   let reply = $state<{ mode: ComposeMode; draft: ComposeDraft; key: number } | null>(null);
@@ -83,6 +85,7 @@
         <!-- Raw RFC 822 source as escaped text (Svelte text node, never HTML). -->
         <pre class="source" aria-label="Message source">{source}</pre>
       {:else}
+        <InviteCard messageId={message.id} {onStatus} onResponded={onCalendarChanged} />
         {#if message.remote_images_blocked > 0 || message.remote_images_loaded > 0}
           <div class="notice" role="status">
             <Icon name="shield" size={16} />
@@ -145,7 +148,7 @@
 {/if}
 
 <style>
-  .viewer { display: flex; flex-direction: column; height: 100%; overflow: hidden; position: relative; }
+  .viewer { display: flex; flex-direction: column; height: auto; flex: 1; min-height: 0; overflow: hidden; position: relative; }
   .message { display: flex; flex-direction: column; gap: 10px; padding: 12px 28px 16px; flex: 1; min-height: 0; overflow: auto; position: relative; }
   .composing .message { flex: 1 1 45%; }
   .inline-composer { flex: 1 1 55%; min-height: 300px; padding: 0 16px 14px; display: flex; flex-direction: column; }
@@ -179,7 +182,7 @@
   .small { font-size: 12px; }
   .hover { position: sticky; bottom: 0; align-self: flex-start; max-width: 100%; background: var(--panel-2); border: 1px solid var(--border);
     border-radius: 6px; padding: 3px 8px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .empty { height: 100%; display: grid; place-items: center; }
+  .empty { height: auto; flex: 1; min-height: 0; display: grid; place-items: center; }
   .backdrop { position: fixed; inset: 0; background: #0008; display: grid; place-items: center; z-index: 40; }
   .dialog { width: min(480px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
   .dialog h3 { margin: 0 0 8px; }

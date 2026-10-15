@@ -10,7 +10,11 @@
 //! has a timeout; if EDS is missing, the caller falls back to the address
 //! history in the mail cache.
 //!
-//! **Calendar (stub):** the interface the app codes against; no-op for now.
+//! **Calendar (real, v0.4):** the same registry lists `[Calendar]` sources;
+//! each is opened through the calendar factory (`…Calendar8`) and queried
+//! with `(occur-in-time-range? …)`. Read-only, except that an accepted
+//! invitation can be added to the local "Personal" calendar with
+//! `CreateObjects`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -311,33 +315,257 @@ fn unescape(s: &str) -> String {
         .replace("\\\\", "\\")
 }
 
+const CAL_FACTORY_BUS: &str = "org.gnome.evolution.dataserver.Calendar8";
+const CAL_FACTORY_PATH: &str = "/org/gnome/evolution/dataserver/CalendarFactory";
+const CAL_FACTORY_IFACE: &str = "org.gnome.evolution.dataserver.CalendarFactory";
+const CAL_IFACE: &str = "org.gnome.evolution.dataserver.Calendar";
+/// UID of the local "Personal" calendar.
+pub const SYSTEM_CALENDAR: &str = "system-calendar";
+
+/// One occurrence of an event, for the agenda.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CalendarEvent {
     pub uid: String,
     pub summary: String,
+    pub location: String,
     pub start: i64,
     pub end: i64,
+    pub all_day: bool,
+    /// Calendar display name.
     pub calendar: String,
+    pub color: String,
 }
 
-/// Calendar access (future: EDS `ECalClient`, `occur-in-time-range?`).
-pub trait CalendarProvider: Send + Sync {
-    fn events_in_range(&self, start: i64, end: i64) -> crate::Result<Vec<CalendarEvent>>;
-    fn create_event_ics(&self, ics: &str) -> crate::Result<String>;
+async fn registry_sources(
+    conn: &zbus::Connection,
+    section: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let reply = timed(conn.call_method(
+        Some(SOURCES_BUS),
+        SOURCES_PATH,
+        Some("org.freedesktop.DBus.ObjectManager"),
+        "GetManagedObjects",
+        &(),
+    ))
+    .await?;
+    type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+    let objects: Objects = reply.body().deserialize().map_err(dbus_err)?;
+    let header = format!("[{section}]");
+    let mut out: Vec<(String, String, String)> = objects
+        .values()
+        .filter_map(|ifaces| {
+            let props = ifaces.get(SOURCE_IFACE)?;
+            let uid = String::try_from(props.get("UID")?.try_clone().ok()?).ok()?;
+            let data = String::try_from(props.get("Data")?.try_clone().ok()?).ok()?;
+            let has = data.lines().any(|l| l.trim() == header);
+            let enabled = keyfile_value(&data, "Data Source", "Enabled") != Some("false")
+                && keyfile_value(&data, section, "Selected") != Some("false");
+            let name = keyfile_value(&data, "Data Source", "DisplayName")
+                .unwrap_or(&uid)
+                .to_string();
+            let color = keyfile_value(&data, section, "Color")
+                .filter(|c| {
+                    c.len() <= 9
+                        && c.starts_with('#')
+                        && c[1..].chars().all(|x| x.is_ascii_hexdigit())
+                })
+                .unwrap_or("")
+                .to_string();
+            (has && enabled).then_some((uid, name, color))
+        })
+        .collect();
+    out.sort_by_key(|(uid, name, _)| (uid != SYSTEM_CALENDAR, name.clone()));
+    Ok(out)
 }
 
-/// No-op calendar used until EDS calendar integration lands.
-#[derive(Debug, Default)]
-pub struct Unavailable;
+struct Cal {
+    uid: String,
+    name: String,
+    color: String,
+    bus: String,
+    path: OwnedObjectPath,
+}
 
-impl CalendarProvider for Unavailable {
-    fn events_in_range(&self, _start: i64, _end: i64) -> crate::Result<Vec<CalendarEvent>> {
-        Ok(Vec::new())
+/// Open connection to the user's EDS calendars.
+pub struct EdsCalendar {
+    conn: zbus::Connection,
+    cals: Vec<Cal>,
+}
+
+fn make_time(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .unwrap_or_default()
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string()
+}
+
+impl EdsCalendar {
+    pub async fn connect() -> Result<Self> {
+        let conn = timed(zbus::Connection::session()).await?;
+        let sources = registry_sources(&conn, "Calendar").await?;
+        let mut cals = Vec::new();
+        let mut problems = Vec::new();
+        for (uid, name, color) in sources {
+            match Self::open(&conn, &uid).await {
+                Ok((path, bus)) => cals.push(Cal {
+                    uid,
+                    name,
+                    color,
+                    bus,
+                    path,
+                }),
+                Err(e) => {
+                    tracing::info!(calendar = %uid, "calendar not available: {e}");
+                    problems.push(format!("{uid}: {e}"));
+                }
+            }
+        }
+        if cals.is_empty() {
+            return Err(Error::Invalid(format!(
+                "calendar (EDS): no calendar could be opened ({})",
+                problems.join("; ")
+            )));
+        }
+        Ok(Self { conn, cals })
     }
-    fn create_event_ics(&self, _ics: &str) -> crate::Result<String> {
-        Err(crate::Error::Invalid(
-            "GNOME Calendar integration is not implemented yet".into(),
+
+    async fn open(conn: &zbus::Connection, uid: &str) -> Result<(OwnedObjectPath, String)> {
+        let reply = timed(conn.call_method(
+            Some(CAL_FACTORY_BUS),
+            CAL_FACTORY_PATH,
+            Some(CAL_FACTORY_IFACE),
+            "OpenCalendar",
+            &(uid,),
         ))
+        .await?;
+        let (path, bus): (String, String) = reply.body().deserialize().map_err(dbus_err)?;
+        let path = OwnedObjectPath::try_from(path).map_err(dbus_err)?;
+        timed(conn.call_method(
+            Some(bus.as_str()),
+            path.as_str(),
+            Some(CAL_IFACE),
+            "Open",
+            &(),
+        ))
+        .await?;
+        Ok((path, bus))
+    }
+
+    pub fn calendar_count(&self) -> usize {
+        self.cals.len()
+    }
+
+    /// Event occurrences overlapping `[from, to)` from all calendars,
+    /// sorted by start time.
+    pub async fn events_in_range(&self, from: i64, to: i64) -> Result<Vec<CalendarEvent>> {
+        let sexp = format!(
+            "(occur-in-time-range? (make-time \"{}\") (make-time \"{}\"))",
+            make_time(from),
+            make_time(to)
+        );
+        let mut out = Vec::new();
+        for c in &self.cals {
+            let reply = match timed(self.conn.call_method(
+                Some(c.bus.as_str()),
+                c.path.as_str(),
+                Some(CAL_IFACE),
+                "GetObjectList",
+                &(sexp.as_str(),),
+            ))
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::info!(calendar = %c.uid, "calendar query failed: {e}");
+                    continue;
+                }
+            };
+            let objects: Vec<String> = reply.body().deserialize().map_err(dbus_err)?;
+            // Detached occurrences (RECURRENCE-ID) replace the series' instance.
+            let mut parsed: Vec<crate::ical::Event> = objects
+                .iter()
+                .filter_map(|o| crate::ical::parse(o).ok())
+                .flat_map(|cal| cal.events)
+                .collect();
+            parsed.sort_by_key(|e| e.recurrence_id.is_some());
+            let overrides: Vec<(String, i64)> = parsed
+                .iter()
+                .filter_map(|e| {
+                    let r = e.recurrence_id.as_ref()?;
+                    Some((e.uid.clone(), crate::ical::parse_time(r, &[])?.0))
+                })
+                .collect();
+            for e in &parsed {
+                if e.status == "CANCELLED" {
+                    continue;
+                }
+                for (s, en) in crate::ical::occurrences(e, from, to) {
+                    if e.recurrence_id.is_none()
+                        && overrides.iter().any(|(u, t)| *u == e.uid && *t == s)
+                    {
+                        continue;
+                    }
+                    out.push(CalendarEvent {
+                        uid: e.uid.clone(),
+                        summary: e.summary.clone(),
+                        location: e.location.clone(),
+                        start: s,
+                        end: en,
+                        all_day: e.all_day,
+                        calendar: c.name.clone(),
+                        color: c.color.clone(),
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|e| (e.start, e.end));
+        Ok(out)
+    }
+
+    /// Add a VEVENT to the local calendar. If an event with the same UID
+    /// exists it is replaced (an updated invitation).
+    pub async fn add_event(&self, vevent: &str) -> Result<String> {
+        let c = self
+            .cals
+            .iter()
+            .find(|c| c.uid == SYSTEM_CALENDAR)
+            .or_else(|| self.cals.first())
+            .ok_or_else(|| Error::Invalid("calendar (EDS): no calendar".into()))?;
+        let uid = crate::ical::parse(vevent)?
+            .events
+            .first()
+            .map(|e| e.uid.clone())
+            .ok_or_else(|| Error::Invalid("calendar (EDS): no event".into()))?;
+        let exists = timed(self.conn.call_method(
+            Some(c.bus.as_str()),
+            c.path.as_str(),
+            Some(CAL_IFACE),
+            "GetObject",
+            &(uid.as_str(), ""),
+        ))
+        .await
+        .is_ok();
+        if exists {
+            timed(self.conn.call_method(
+                Some(c.bus.as_str()),
+                c.path.as_str(),
+                Some(CAL_IFACE),
+                "ModifyObjects",
+                &(vec![vevent], "all", 0u32),
+            ))
+            .await?;
+            return Ok(uid);
+        }
+        let reply = timed(self.conn.call_method(
+            Some(c.bus.as_str()),
+            c.path.as_str(),
+            Some(CAL_IFACE),
+            "CreateObjects",
+            &(vec![vevent], 0u32),
+        ))
+        .await?;
+        let uids: Vec<String> = reply.body().deserialize().map_err(dbus_err)?;
+        Ok(uids.into_iter().next().unwrap_or(uid))
     }
 }
 

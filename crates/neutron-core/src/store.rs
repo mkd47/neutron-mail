@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS addresses (
   last_seen INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(account_id, email)
 );
+CREATE TABLE IF NOT EXISTS invite_responses (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  partstat TEXT NOT NULL,
+  responded_at INTEGER NOT NULL,
+  in_calendar INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS image_senders (
   account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   email TEXT NOT NULL COLLATE NOCASE,
@@ -537,6 +543,33 @@ impl Store {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The user's recorded answer to an invitation: (PARTSTAT, added to calendar).
+    pub fn invite_response(&self, message_id: i64) -> Result<Option<(String, bool)>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT partstat, in_calendar FROM invite_responses WHERE message_id = ?1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_invite_response(
+        &self,
+        message_id: i64,
+        partstat: &str,
+        in_calendar: bool,
+    ) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO invite_responses (message_id, partstat, responded_at, in_calendar) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(message_id) DO UPDATE SET partstat = excluded.partstat,
+               responded_at = excluded.responded_at, in_calendar = excluded.in_calendar",
+            params![message_id, partstat, chrono::Utc::now().timestamp(), in_calendar],
+        )?;
         Ok(())
     }
 

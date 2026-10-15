@@ -170,6 +170,22 @@ fn mime_of(p: &mail_parser::MessagePart<'_>) -> String {
         .unwrap_or_else(|| "application/octet-stream".into())
 }
 
+/// The first `text/calendar` (or `application/ics`) part of a message, as
+/// text, if it is within the size limit.
+pub fn calendar_part(raw: &[u8]) -> Option<String> {
+    let msg = MessageParser::default().parse(raw)?;
+    msg.parts.iter().find_map(|p| {
+        let ct = p.content_type()?;
+        let sub = ct.subtype().unwrap_or("").to_ascii_lowercase();
+        let is_cal = (ct.ctype().eq_ignore_ascii_case("text") && sub == "calendar")
+            || (ct.ctype().eq_ignore_ascii_case("application") && sub == "ics");
+        if !is_cal || p.contents().len() > crate::ical::MAX_ICS_BYTES {
+            return None;
+        }
+        Some(String::from_utf8_lossy(p.contents()).into_owned())
+    })
+}
+
 /// Content of attachment `index` (same numbering as `AttachmentInfo`).
 pub fn attachment_content(raw: &[u8], index: usize) -> Option<OutgoingAttachment> {
     let msg = MessageParser::default().parse(raw)?;

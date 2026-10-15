@@ -8,6 +8,7 @@ pub mod attachments;
 pub mod compose;
 pub mod error;
 pub mod gnome;
+pub mod ical;
 pub mod imap;
 pub mod links;
 pub mod model;

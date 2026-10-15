@@ -36,3 +36,25 @@ export function snippetParts(s: string): { text: string; hit: boolean }[] {
   if (buf) out.push({ text: buf, hit });
   return out;
 }
+
+/** "Tue 20 Oct, 14:00–15:00" (local time); all-day events show the date only. */
+export function eventRange(start: number, end: number, allDay: boolean): string {
+  const s = new Date(start * 1000), e = new Date(end * 1000);
+  const day = (d: Date) => d.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+  const time = (d: Date) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (allDay) {
+    const last = new Date(e.getTime() - 1000);
+    return last.toDateString() === s.toDateString() ? `${day(s)} · all day` : `${day(s)} – ${day(last)}`;
+  }
+  return s.toDateString() === e.toDateString() ? `${day(s)}, ${time(s)}–${time(e)}` : `${day(s)} ${time(s)} – ${day(e)} ${time(e)}`;
+}
+
+/** Agenda label: "Today 14:00", "Tomorrow 09:30", "Thu 10:00". */
+export function agendaWhen(start: number, allDay: boolean): string {
+  const d = new Date(start * 1000), now = new Date();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  const dayName = d.toDateString() === now.toDateString() ? "Today"
+    : d.toDateString() === tomorrow.toDateString() ? "Tomorrow"
+    : d.toLocaleDateString([], { weekday: "short", day: "numeric" });
+  return allDay ? dayName : `${dayName} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}

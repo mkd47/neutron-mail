@@ -31,6 +31,9 @@ fn main() {
             "suggest_contacts",
             "contacts_status",
             "sanitize_compose_html",
+            "upcoming_events",
+            "get_invite",
+            "respond_invite",
         ]),
     ))
     .expect("failed to run tauri-build");

@@ -35,6 +35,9 @@
     "allow-suggest-contacts",
     "allow-sanitize-compose-html",
     "allow-contacts-status",
+    "allow-upcoming-events",
+    "allow-get-invite",
+    "allow-respond-invite",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

@@ -5,6 +5,7 @@
   import Settings from "./lib/Settings.svelte";
   import Compose from "./lib/Compose.svelte";
   import Viewer from "./lib/Viewer.svelte";
+  import Agenda from "./lib/Agenda.svelte";
   import LinkDialog from "./lib/LinkDialog.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
     type LinkInfo, type MessageSummary, type MessageView, type SearchHit } from "./lib/api";
@@ -52,6 +53,7 @@
     else { account = null; folders = []; messages = []; detail = null; showSetup = true; }
   }
   let compose = $state<ComposeDraft | null>(null);
+  let agendaKey = $state(0);
 
   const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", trash: "trash", archive: "archive", junk: "junk", flagged: "star" };
   const roleOrder = ["inbox", "flagged", "drafts", "sent", "archive", "junk", "trash"];
@@ -266,8 +268,10 @@
     </section>
 
     <section class="reader">
+      <Agenda refreshKey={agendaKey} />
       <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
-        onReload={reload} onStatus={(t) => showToast(t)} onComposerDone={composerDone} />
+        onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
+        onCalendarChanged={() => agendaKey++} />
     </section>
   </div>
   {#if compose}
@@ -323,7 +327,8 @@
   .preview { color: var(--muted); }
   mark { background: var(--accent-soft); color: var(--unread); border-radius: 3px; }
   .empty { padding: 24px; text-align: center; }
-  .reader { background: var(--panel); min-width: 0; min-height: 0; }
+  .reader { background: var(--panel); min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .reader > :global(:not(.agenda)) { flex: 1; min-height: 0; }
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 60; display: flex; gap: 8px; align-items: center;
     background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 10px;
     padding: 8px 8px 8px 14px; box-shadow: 0 10px 30px #0005; max-width: 70vw; font-size: 13px; }

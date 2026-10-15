@@ -3,6 +3,7 @@
 //! link interception for the message viewer.
 
 mod attachments;
+mod calendar;
 mod commands;
 mod contacts;
 mod watcher;
@@ -23,6 +24,7 @@ pub struct AppState {
     /// sees tokens, so it cannot make the backend read arbitrary paths.
     pub picked: std::sync::Mutex<HashMap<String, attachments::PickedFile>>,
     pub contacts: contacts::Contacts,
+    pub calendar: calendar::Calendar,
     pub cache: CacheStatus,
 }
 
@@ -124,6 +126,7 @@ pub fn run() {
                 watchers: std::sync::Mutex::new(HashMap::new()),
                 picked: std::sync::Mutex::new(HashMap::new()),
                 contacts: contacts::Contacts::default(),
+                calendar: calendar::Calendar::default(),
                 cache,
             };
             let accounts = state.store.accounts()?;
@@ -163,6 +166,9 @@ pub fn run() {
             contacts::suggest_contacts,
             contacts::contacts_status,
             commands::sanitize_compose_html,
+            calendar::upcoming_events,
+            calendar::get_invite,
+            calendar::respond_invite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");
