@@ -39,6 +39,8 @@ checks the ad-hoc signature and disk image, runs frontend/Rust tests and a
 Keychain roundtrip on a temporary CI keychain, and launches the packaged app.
 It uploads a DMG, ZIP containing the app, installation notes, hashes, source
 manifest and resolved Mac lockfile. No mail credentials are used in CI.
+It also runs when shared source changes, so later Linux development is checked
+for Mac compatibility without changing the Linux workflow.
 
 ## Distribution and limitations
 

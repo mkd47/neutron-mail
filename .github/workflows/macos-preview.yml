@@ -2,10 +2,10 @@ name: macOS preview
 
 on:
   pull_request:
-    paths: ['macos/**', '.github/workflows/macos-preview.yml']
+    paths: ['macos/**', '.github/workflows/macos-preview.yml', 'src/**', 'src-tauri/**', 'crates/**', 'Cargo.*', 'package*.json', 'vite.config.ts']
   push:
     branches: [main]
-    paths: ['macos/**', '.github/workflows/macos-preview.yml']
+    paths: ['macos/**', '.github/workflows/macos-preview.yml', 'src/**', 'src-tauri/**', 'crates/**', 'Cargo.*', 'package*.json', 'vite.config.ts']
   workflow_dispatch:
 
 permissions:
@@ -83,7 +83,7 @@ jobs:
         run: |
           app="$MAC_SOURCE/target/universal-apple-darwin/release/bundle/macos/Neutron Mail.app"
           exe="$app/Contents/MacOS/neutron-mail"
-          lipo -verify_arch arm64 x86_64 "$exe"
+          lipo "$exe" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$app"
           if otool -L "$exe" | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)|/Users/runner'; then
             echo 'Unexpected build-machine runtime dependency'
@@ -96,8 +96,10 @@ jobs:
           cp macos/INSTALL.txt "$RUNNER_TEMP/mac-handoff/INSTALL.txt"
           cp "$MAC_SOURCE/Cargo.lock" "$RUNNER_TEMP/mac-handoff/Cargo.macos.lock"
           cp "$MAC_SOURCE/MACOS-SOURCE-MANIFEST.json" "$RUNNER_TEMP/mac-handoff/"
+          printf 'Source commit: %s\nCI run: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/mac-handoff/BUILD.txt"
           cd "$RUNNER_TEMP/mac-handoff"
           shasum -a 256 ./*.dmg ./*.zip > SHA256SUMS.txt
+          echo 'HANDOFF_READY=1' >> "$GITHUB_ENV"
       - name: Packaged application launch smoke test
         run: |
           app="$MAC_SOURCE/target/universal-apple-darwin/release/bundle/macos/Neutron Mail.app"
@@ -116,6 +118,7 @@ jobs:
       - name: Confirm original checkout untouched
         run: git diff --exit-code
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && env.HANDOFF_READY == '1' }}
         with:
           name: neutron-mail-macOS-universal-preview
           path: ${{ runner.temp }}/mac-handoff/

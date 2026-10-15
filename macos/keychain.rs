@@ -29,4 +29,10 @@ fn apple_keychain_persists_credentials_and_cache_key() {
         key.hex().as_str(),
         second.cache_key().unwrap().unwrap().hex().as_str()
     );
+    // The packaged app is a different signing identity from this test.
+    // Let its launch test create its own item, avoiding a Keychain ACL prompt.
+    keyring::Entry::new("dev.neutronmail.NeutronMail", "cache-key")
+        .unwrap()
+        .delete_credential()
+        .unwrap();
 }
