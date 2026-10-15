@@ -122,4 +122,4 @@ The mockups show the placeholder name "Aurora Mail", which was used before the n
 
 ## License
 
-**To be decided.** No license has been chosen yet, so all rights are reserved for now. (If any GPLv3 code is ever incorporated, the project must be GPL-3.0-or-later. See the report.)
+Neutron Mail is free software, licensed under the **GNU General Public License v3.0 or later** (GPL-3.0-or-later). See [LICENSE](LICENSE).

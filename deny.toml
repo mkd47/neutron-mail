@@ -17,7 +17,7 @@ allow = [
   "CDLA-Permissive-2.0", "0BSD", "OpenSSL",
 ]
 confidence-threshold = 0.9
-# Our own crates are "LicenseRef-TBD" (license undecided) and unpublished.
+# Our own crates are GPL-3.0-or-later and unpublished.
 [licenses.private]
 ignore = true
 
