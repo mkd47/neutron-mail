@@ -120,7 +120,16 @@ pub async fn upcoming_events(state: State<'_, AppState>, days: u32) -> Res<Agend
     replace(destination, "src/App.svelte", '  import Calendar from "./lib/Calendar.svelte";\n', "")
     replace(destination, "src/App.svelte", '"mail" | "calendar" | "notes" | "todo"',
             '"mail" | "notes" | "todo"')
-    replace(destination, "src/App.svelte", '["calendar", "calendar", "Calendar"], ', "")
+    # Support both the original rail and the shared @neutron/ui rail.
+    rail_entries = [
+        '["calendar", "calendar", "Calendar"], ',
+        '{ id: "calendar", icon: "calendar", label: "Calendar" },',
+    ]
+    app_source = (destination / "src/App.svelte").read_text()
+    matches = [entry for entry in rail_entries if app_source.count(entry) == 1]
+    if len(matches) != 1:
+        raise RuntimeError("macOS overlay needs review: expected one Calendar rail entry")
+    replace(destination, "src/App.svelte", matches[0], "")
     replace(destination, "src/App.svelte", '  {:else if appView === "calendar"}\n    <Calendar />\n', "")
     replace(destination, "src/lib/InviteCard.svelte", "let addToCalendar = $state(true);",
             "const addToCalendar = false;")
