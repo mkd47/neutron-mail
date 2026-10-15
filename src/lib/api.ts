@@ -203,3 +203,71 @@ export const rulesApi = {
   sieveUpload: (accountId: number, port: number) => invoke<SieveExport>("sieve_upload", { accountId, port }),
   sieveDisable: (accountId: number) => invoke<void>("sieve_disable", { accountId }),
 };
+
+// ---- Notes and To-do (local, encrypted cache) ----
+export interface EmailLink { account_id: number | null; message_id: string; subject: string; sender: string; date: number }
+export interface NoteFolder { id: number; name: string; count: number }
+export interface Tag { name: string; color: string; count: number }
+export interface NoteSummary { id: number; folder_id: number | null; title: string; snippet: string; modified: number; pinned: boolean; tags: string[]; linked: boolean }
+export interface Note { id: number; uid: string; folder_id: number | null; title: string; html: string; created: number; modified: number; pinned: boolean; tags: string[]; links: EmailLink[] }
+export interface NoteInput { id: number | null; folder_id: number | null; title: string; html: string; tags: string[]; pinned: boolean }
+export interface NoteQuery { folder_id: number | null; tag: string | null; query: string }
+export interface TaskList { id: number; name: string; color: string; open: number }
+/** priority: iCalendar scale, 0 none, 1 high, 5 medium, 9 low. */
+export interface Task {
+  id: number; uid: string; list_id: number | null; parent_id: number | null; title: string; notes: string;
+  due: number | null; due_time: boolean; reminder: number | null; priority: 0 | 1 | 5 | 9; completed: number | null;
+  created: number; modified: number; email: EmailLink | null; subtasks: Task[];
+}
+export interface TaskInput {
+  id: number | null; list_id: number | null; parent_id: number | null; title: string; notes: string;
+  due: number | null; due_time: boolean; reminder: number | null; priority: number; email: EmailLink | null;
+}
+export type TaskView = { kind: "today"; day_end: number } | { kind: "upcoming"; day_end: number } | { kind: "from_email" } | { kind: "completed" } | { kind: "list"; id: number };
+export interface TaskCounts { today: number; upcoming: number; from_email: number; completed: number }
+export const taskInput = (t: Task): TaskInput => ({ id: t.id, list_id: t.list_id, parent_id: t.parent_id, title: t.title, notes: t.notes,
+  due: t.due, due_time: t.due_time, reminder: t.reminder, priority: t.priority, email: null });
+export const pimApi = {
+  noteFolders: () => invoke<NoteFolder[]>("note_folders"),
+  createNoteFolder: (name: string) => invoke<number>("create_note_folder", { name }),
+  renameNoteFolder: (id: number, name: string) => invoke<void>("rename_note_folder", { id, name }),
+  deleteNoteFolder: (id: number) => invoke<void>("delete_note_folder", { id }),
+  tags: () => invoke<Tag[]>("note_tags"),
+  notes: (query: NoteQuery) => invoke<NoteSummary[]>("list_notes", { query }),
+  note: (id: number) => invoke<Note>("get_note", { id }),
+  saveNote: (note: NoteInput) => invoke<Note>("save_note", { note }),
+  deleteNote: (id: number) => invoke<void>("delete_note", { id }),
+  noteFromMessage: (messageId: number, folderId: number | null) => invoke<Note>("note_from_message", { messageId, folderId }),
+  unlinkNoteEmail: (noteId: number, messageId: string) => invoke<Note>("unlink_note_email", { noteId, messageId }),
+  emailLink: (messageId: number) => invoke<EmailLink>("email_link", { messageId }),
+  resolveEmail: (link: EmailLink) => invoke<number | null>("resolve_email_link", { link }),
+  taskLists: () => invoke<TaskList[]>("task_lists"),
+  createTaskList: (name: string, color: string) => invoke<number>("create_task_list", { name, color }),
+  renameTaskList: (id: number, name: string) => invoke<void>("rename_task_list", { id, name }),
+  deleteTaskList: (id: number) => invoke<void>("delete_task_list", { id }),
+  tasks: (view: TaskView) => invoke<Task[]>("list_tasks", { view }),
+  taskCounts: (dayEnd: number) => invoke<TaskCounts>("task_counts", { dayEnd }),
+  saveTask: (task: TaskInput) => invoke<Task>("save_task", { task }),
+  setTaskCompleted: (id: number, done: boolean) => invoke<Task>("set_task_completed", { id, done }),
+  flaggedEmails: () => invoke<MessageSummary[]>("flagged_emails"),
+  deleteTask: (id: number) => invoke<void>("delete_task", { id }),
+  onReminder: (cb: (t: Task) => void): Promise<UnlistenFn> => listen<Task>("pim://reminder", (e) => cb(e.payload)),
+};
+/** Unix seconds at the end of the local day `offset` days from today. */
+export function dayEnd(offset = 0): number {
+  const d = new Date(); d.setHours(24, 0, 0, 0); d.setDate(d.getDate() + offset); return Math.floor(d.getTime() / 1000);
+}
+/** Unix seconds at local noon `offset` days from today (date-only due dates). */
+export function dayAt(offset: number): number {
+  const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() + offset); return Math.floor(d.getTime() / 1000);
+}
+export function dueLabel(due: number | null, withTime = false): string {
+  if (due === null) return "";
+  const d = new Date(due * 1000), t = new Date(); t.setHours(0, 0, 0, 0);
+  const days = Math.round((new Date(d).setHours(0, 0, 0, 0) - t.getTime()) / 86400000);
+  const time = withTime ? " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  if (days === 0) return "Today" + time;
+  if (days === 1) return "Tomorrow" + time;
+  if (days === -1) return "Yesterday" + time;
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + time;
+}

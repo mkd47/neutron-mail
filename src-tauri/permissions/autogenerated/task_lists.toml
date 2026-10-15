@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-lists"
+description = "Enables the task_lists command without any pre-configured scope."
+commands.allow = ["task_lists"]
+
+[[permission]]
+identifier = "deny-task-lists"
+description = "Denies the task_lists command without any pre-configured scope."
+commands.deny = ["task_lists"]

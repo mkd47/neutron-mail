@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-counts"
+description = "Enables the task_counts command without any pre-configured scope."
+commands.allow = ["task_counts"]
+
+[[permission]]
+identifier = "deny-task-counts"
+description = "Denies the task_counts command without any pre-configured scope."
+commands.deny = ["task_counts"]

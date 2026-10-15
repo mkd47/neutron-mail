@@ -3,13 +3,41 @@
   import Composer from "./Composer.svelte";
   import InviteCard from "./InviteCard.svelte";
   import { initials, shortDate, size } from "./format";
-  import { api, errorText, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MessageView } from "./api";
+  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MessageView, type TaskList } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {} }: {
+  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {} }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
     onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
-    onCalendarChanged?: () => void;
+    onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void;
   } = $props();
+
+  // "Add to To-do" popover (prefilled from the subject) and "Save to Notes".
+  let todo = $state<{ title: string; due: string; list: number | null; priority: number } | null>(null);
+  let lists = $state<TaskList[]>([]);
+  let todoBusy = $state(false);
+  async function openTodo() {
+    if (!message) return;
+    if (todo) { todo = null; return; }
+    try { lists = await pimApi.taskLists(); } catch (e) { onStatus(errorText(e), true); return; }
+    todo = { title: message.subject || "(no subject)", due: "1", list: lists[0]?.id ?? null, priority: 0 };
+  }
+  async function addTodo() {
+    if (!message || !todo || !todo.title.trim()) return;
+    todoBusy = true;
+    try {
+      const email = await pimApi.emailLink(message.id);
+      await pimApi.saveTask({ id: null, list_id: todo.list, parent_id: null, title: todo.title, notes: "",
+        due: todo.due === "" ? null : dayAt(Number(todo.due)), due_time: false, reminder: null, priority: todo.priority, email });
+      onStatus(`Added “${todo.title}” to To-do`); todo = null; onPimChanged();
+    } catch (e) { onStatus(errorText(e), true); } finally { todoBusy = false; }
+  }
+  async function saveToNotes() {
+    if (!message) return;
+    try {
+      const n = await pimApi.noteFromMessage(message.id, null);
+      onStatus(`Saved to Notes: “${n.title}”`); onPimChanged(); onOpenNote(n.id);
+    } catch (e) { onStatus(errorText(e), true); }
+  }
 
   let reply = $state<{ mode: ComposeMode; draft: ComposeDraft; key: number } | null>(null);
   let source = $state<string | null>(null);
@@ -18,7 +46,7 @@
   $effect(() => {
     // Switching messages closes source view and any inline composer.
     const id = message?.id ?? -1;
-    if (id !== lastId) { lastId = id; source = null; reply = null; confirmOpen = null; }
+    if (id !== lastId) { lastId = id; source = null; reply = null; confirmOpen = null; todo = null; }
   });
 
   const titles: Record<ComposeMode, string> = { reply: "Reply", reply_all: "Reply all", forward: "Forward", draft: "Edit draft" };
@@ -67,6 +95,25 @@
           <button class="tbtn" onclick={() => startCompose("reply_all")} aria-pressed={reply?.mode === "reply_all"}><Icon name="replyall" size={16} /> Reply all</button>
           <button class="tbtn" onclick={() => startCompose("forward")} aria-pressed={reply?.mode === "forward"}><Icon name="forward" size={16} /> Forward</button>
         {/if}
+        <span class="pim">
+          <button class="tbtn" onclick={openTodo} aria-pressed={todo !== null} aria-haspopup="dialog" title="Create a task from this email"><Icon name="checkcircle" size={16} /> Add to To-do</button>
+          {#if todo}
+            <div class="popover" role="dialog" aria-label="Add to To-do"><form onsubmit={(e) => { e.preventDefault(); void addTodo(); }}>
+              <h3>Add to To-do</h3>
+              <label>Task title <input bind:value={todo.title} maxlength="300" /></label>
+              <label>Due date
+                <select bind:value={todo.due}>
+                  <option value="0">Today</option><option value="1">Tomorrow</option><option value="7">Next week</option><option value="">No date</option>
+                </select></label>
+              <label>List
+                <select bind:value={todo.list}>{#each lists as l (l.id)}<option value={l.id}>{l.name}</option>{/each}<option value={null}>No list</option></select></label>
+              <label>Priority
+                <select bind:value={todo.priority}><option value={0}>None</option><option value={1}>High</option><option value={5}>Medium</option><option value={9}>Low</option></select></label>
+              <button class="tbtn primary wide" disabled={todoBusy || !todo.title.trim()}><Icon name="plus" size={15} /> Add task</button>
+            </form></div>
+          {/if}
+        </span>
+        <button class="tbtn" onclick={saveToNotes} title="Save this email as a note, linked to it"><Icon name="note" size={16} /> Save to Notes</button>
         <span class="spacer"></span>
         <button class="tbtn" onclick={toggleSource} aria-pressed={source !== null} title="View the raw message source">
           <Icon name="code" size={16} /> {source !== null ? "Message" : "View source"}</button>
@@ -152,7 +199,15 @@
   .message { display: flex; flex-direction: column; gap: 10px; padding: 12px 28px 16px; flex: 1; min-height: 0; overflow: auto; position: relative; }
   .composing .message { flex: 1 1 45%; }
   .inline-composer { flex: 1 1 55%; min-height: 300px; padding: 0 16px 14px; display: flex; flex-direction: column; }
-  .toolbar { display: flex; gap: 6px; align-items: center; }
+  .toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .pim { position: relative; }
+  .popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; width: 300px; display: flex; flex-direction: column; gap: 10px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; box-shadow: 0 12px 32px #0006; }
+  .popover form { display: flex; flex-direction: column; gap: 10px; }
+  .popover h3 { margin: 0; font-size: 15px; }
+  .popover label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .popover input, .popover select { font-size: 13px; color: var(--text); }
+  .wide { justify-content: center; padding: 9px; }
   .tbtn { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; padding: 6px 12px; font-size: 13px; }
   .tbtn:hover { background: var(--hover); }
   .tbtn[aria-pressed="true"] { background: var(--selected); border-color: var(--accent); }

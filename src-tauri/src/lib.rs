@@ -7,6 +7,7 @@ mod calendar;
 mod commands;
 mod contacts;
 mod organize;
+mod pim;
 mod providers;
 mod watcher;
 
@@ -138,6 +139,7 @@ pub fn run() {
             for a in accounts {
                 watcher::start(app.handle(), a.id);
             }
+            pim::start_reminders(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -190,6 +192,30 @@ pub fn run() {
             organize::sieve_status,
             organize::sieve_upload,
             organize::sieve_disable,
+            pim::note_folders,
+            pim::create_note_folder,
+            pim::rename_note_folder,
+            pim::delete_note_folder,
+            pim::note_tags,
+            pim::list_notes,
+            pim::get_note,
+            pim::save_note,
+            pim::delete_note,
+            pim::note_from_message,
+            pim::link_note_email,
+            pim::unlink_note_email,
+            pim::email_link,
+            pim::resolve_email_link,
+            pim::task_lists,
+            pim::create_task_list,
+            pim::rename_task_list,
+            pim::delete_task_list,
+            pim::list_tasks,
+            pim::task_counts,
+            pim::save_task,
+            pim::set_task_completed,
+            pim::delete_task,
+            pim::flagged_emails,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");

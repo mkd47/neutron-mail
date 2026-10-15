@@ -17,6 +17,7 @@ pub mod model;
 pub mod mutf7;
 pub mod oauth;
 pub mod parse;
+pub mod pim;
 pub mod providers;
 pub mod remote;
 pub mod rules;

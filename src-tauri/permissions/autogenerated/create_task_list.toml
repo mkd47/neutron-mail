@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-task-list"
+description = "Enables the create_task_list command without any pre-configured scope."
+commands.allow = ["create_task_list"]
+
+[[permission]]
+identifier = "deny-create-task-list"
+description = "Denies the create_task_list command without any pre-configured scope."
+commands.deny = ["create_task_list"]

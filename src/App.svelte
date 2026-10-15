@@ -8,8 +8,12 @@
   import Agenda from "./lib/Agenda.svelte";
   import LinkDialog from "./lib/LinkDialog.svelte";
   import Rules from "./lib/Rules.svelte";
+  import Notes from "./lib/Notes.svelte";
+  import Todo from "./lib/Todo.svelte";
+  import Calendar from "./lib/Calendar.svelte";
+  import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode } from "./lib/api";
+    type LinkInfo, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -41,6 +45,43 @@
   let showSetup = $state(false);
   let showSettings = $state(false);
   let showRules = $state(false);
+  // App rail: Mail, Calendar, Notes, To-do.
+  type AppView = "mail" | "calendar" | "notes" | "todo";
+  let appView = $state<AppView>((localStorage.getItem("appView") as AppView) ?? "mail");
+  $effect(() => localStorage.setItem("appView", appView));
+  let showPanel = $state(localStorage.getItem("todayPanel") !== "0");
+  $effect(() => localStorage.setItem("todayPanel", showPanel ? "1" : "0"));
+  let pimKey = $state(0);
+  let openNoteId = $state<number | null>(null);
+  async function newNoteFromPanel() {
+    try { const n = await pimApi.saveNote({ id: null, folder_id: null, title: "Untitled note", html: "<p></p>", tags: [], pinned: false }); openNoteId = n.id; appView = "notes"; }
+    catch (e) { showToast(errorText(e), true); }
+  }
+  async function openEmailLink(l: EmailLink) {
+    try {
+      const id = await pimApi.resolveEmail(l);
+      if (id === null) { showToast(`“${l.subject}” isn't in the local cache (moved out of the sync window or deleted).`, true); return; }
+      await openMessageById(id);
+    } catch (e) { showToast(errorText(e), true); }
+  }
+  async function openMessageById(id: number) {
+    try {
+      const d = await api.getMessage(id, theme === "dark", false);
+      for (const a of [account!, ...accounts.filter((x) => x.id !== account?.id)]) {
+        const fs = a.id === account?.id ? folders : await api.listFolders(a.id);
+        const f = fs.find((x) => x.id === d.folder_id);
+        if (!f) continue;
+        appView = "mail"; showSettings = false; showRules = false;
+        if (a.id !== account?.id) { account = a; folders = fs; }
+        folder = f; hits = null; query = ""; messages = []; picked = [id];
+        await refreshMessages();
+        selectedId = id; detail = d; loadRemote = false;
+        await refreshFolders();
+        return;
+      }
+      showToast("The message's folder wasn't found", true);
+    } catch (e) { showToast(errorText(e), true); }
+  }
   // Multi-selection in the message list (Ctrl/Shift click).
   let picked = $state<number[]>([]);
   let anchor: number | null = null;
@@ -356,7 +397,8 @@
             await refreshFolders(); await refreshMessages();
           }
         });
-        unlisten = () => { u1(); u2(); u3(); };
+        const u4 = await pimApi.onReminder((t) => { showToast(`⏰ Reminder: ${t.title}`); pimKey++; });
+        unlisten = () => { u1(); u2(); u3(); u4(); };
       } catch (e) { status = errorText(e); }
     })();
     return () => unlisten?.();
@@ -384,9 +426,26 @@
     {/if}
   </main>
 {:else}
-  <div class="shell">
+  <div class="app">
+  <nav class="rail" aria-label="Apps">
+    <span class="logo rl">N</span>
+    {#each [["mail", "mail", "Mail"], ["calendar", "calendar", "Calendar"], ["notes", "note", "Notes"], ["todo", "checkcircle", "To-do"]] as [v, icon, label] (v)}
+      <button class="rbtn" class:active={appView === v} aria-current={appView === v ? "page" : undefined} onclick={() => { appView = v as AppView; if (v !== "notes") openNoteId = null; }}>
+        <Icon name={icon} size={20} /><span>{label}</span>
+      </button>
+    {/each}
+    <span class="spacer"></span>
+    <button class="rbtn" title="Toggle theme" aria-label="Toggle theme" onclick={() => (theme = theme === "dark" ? "light" : "dark")}><Icon name={theme === "dark" ? "sun" : "moon"} size={18} /></button>
+  </nav>
+  {#if appView === "notes"}
+    <Notes openId={openNoteId} onOpenEmail={openEmailLink} onStatus={(t, w) => showToast(t, w)} />
+  {:else if appView === "todo"}
+    <Todo refreshKey={pimKey} onOpenEmail={openEmailLink} onOpenMessage={openMessageById} onStatus={(t, w) => showToast(t, w)} />
+  {:else if appView === "calendar"}
+    <Calendar />
+  {:else}
+  <div class="shell" class:withpanel={showPanel}>
     <aside class="sidebar">
-      <div class="brand"><span class="logo">N</span> Neutron Mail</div>
       <button class="btn primary compose" onclick={newCompose}>
         <Icon name="compose" /> Compose
       </button>
@@ -420,8 +479,8 @@
         <button class="acct add" onclick={() => (showSetup = true)}><Icon name="plus" size={14} /> Add account</button>
       </div>
       <div class="foot">
-        <button class="icon-btn" onclick={() => (theme = theme === "dark" ? "light" : "dark")} aria-label="Toggle theme" title="Toggle theme">
-          <Icon name={theme === "dark" ? "sun" : "moon"} />
+        <button class="icon-btn" onclick={() => (showPanel = !showPanel)} aria-pressed={showPanel} aria-label="Today and notes panel" title="Today / Notes panel">
+          <Icon name="panel" />
         </button>
         <button class="icon-btn" onclick={() => (showSettings = true)} aria-label="Account settings" title="Account settings">
           <Icon name="settings" />
@@ -486,9 +545,16 @@
         </div>
       {/if}
       <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
+        onPimChanged={() => pimKey++} onOpenNote={() => {}}
         onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
         onCalendarChanged={() => agendaKey++} />
     </section>
+    {#if showPanel}
+      <TodayPanel refreshKey={pimKey} onClose={() => (showPanel = false)} onOpenTodo={() => (appView = "todo")}
+        onOpenNote={(id) => { openNoteId = id; appView = "notes"; }} onNewNote={newNoteFromPanel} onStatus={(t, w) => showToast(t, w)} />
+    {/if}
+  </div>
+  {/if}
   </div>
   {#if compose}
     <Compose {account} draft={compose} onClose={(r) => { compose = null; void composerDone(r); }} />
@@ -563,9 +629,17 @@
 <style>
   .setup-wrap { height: 100%; overflow: auto; }
   .warn { text-align: center; color: #f5b14c; }
+  .app { display: grid; grid-template-columns: 76px 1fr; height: 100%; min-height: 0; }
+  .app > :global(*) { min-width: 0; min-height: 0; }
+  .rail { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px 6px; }
+  .rl { margin-bottom: 10px; width: 34px; height: 34px; border-radius: 10px; }
+  .rbtn { width: 62px; border: 0; background: transparent; border-radius: 10px; padding: 8px 2px; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); }
+  .rbtn:hover { background: var(--hover); color: var(--text); }
+  .rbtn.active { background: var(--selected); color: var(--text); }
+  .rbtn.active :global(svg) { color: var(--accent); }
   .shell { display: grid; grid-template-columns: 240px minmax(300px, 380px) 1fr; height: 100%; }
+  .shell.withpanel { grid-template-columns: 220px minmax(280px, 340px) 1fr 290px; }
   .sidebar { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 14px 12px; gap: 6px; min-height: 0; }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; padding: 4px 8px 12px; }
   .logo { width: 26px; height: 26px; border-radius: 8px; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 700; }
   .compose { display: flex; gap: 8px; justify-content: center; align-items: center; padding: 10px; margin-bottom: 8px; }
   nav { display: flex; flex-direction: column; gap: 2px; overflow: auto; }

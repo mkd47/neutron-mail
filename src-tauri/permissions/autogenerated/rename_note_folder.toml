@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rename-note-folder"
+description = "Enables the rename_note_folder command without any pre-configured scope."
+commands.allow = ["rename_note_folder"]
+
+[[permission]]
+identifier = "deny-rename-note-folder"
+description = "Denies the rename_note_folder command without any pre-configured scope."
+commands.deny = ["rename_note_folder"]

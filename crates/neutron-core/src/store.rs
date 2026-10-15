@@ -233,6 +233,7 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
         migrate_folder_sync_state(&conn)?;
+        crate::pim::migrate(&conn)?;
         let has_auth = conn
             .prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'auth'")?
             .exists([])?;
@@ -291,7 +292,7 @@ impl Store {
         Ok(())
     }
 
-    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -687,6 +688,18 @@ impl Store {
             params![folder_id, limit.clamp(1, 500), offset.max(0)],
             summary_from_row,
         )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Starred messages in all accounts (To-do "Flagged emails"), not in Trash/Junk.
+    pub fn flagged_messages(&self, limit: i64) -> Result<Vec<MessageSummary>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!(
+            "SELECT {SUMMARY_COLS} FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.flagged = 1 AND coalesce(f.role, '') NOT IN ('trash', 'junk')
+             ORDER BY m.date DESC LIMIT ?1"
+        ))?;
+        let rows = st.query_map([limit.clamp(1, 500)], summary_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

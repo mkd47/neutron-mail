@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-link-note-email"
+description = "Enables the link_note_email command without any pre-configured scope."
+commands.allow = ["link_note_email"]
+
+[[permission]]
+identifier = "deny-link-note-email"
+description = "Denies the link_note_email command without any pre-configured scope."
+commands.deny = ["link_note_email"]

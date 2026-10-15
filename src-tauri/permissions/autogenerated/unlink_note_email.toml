@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unlink-note-email"
+description = "Enables the unlink_note_email command without any pre-configured scope."
+commands.allow = ["unlink_note_email"]
+
+[[permission]]
+identifier = "deny-unlink-note-email"
+description = "Denies the unlink_note_email command without any pre-configured scope."
+commands.deny = ["unlink_note_email"]

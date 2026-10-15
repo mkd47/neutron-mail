@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-flagged-emails"
+description = "Enables the flagged_emails command without any pre-configured scope."
+commands.allow = ["flagged_emails"]
+
+[[permission]]
+identifier = "deny-flagged-emails"
+description = "Denies the flagged_emails command without any pre-configured scope."
+commands.deny = ["flagged_emails"]

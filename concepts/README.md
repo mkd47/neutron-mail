@@ -22,3 +22,7 @@ Stack context: Rust + Tauri v2, React or Svelte front-end, own IMAP/SMTP server,
 | `03-compose.png` | Compose: recipient chips, rich text, attachments, signature |
 | `04-search.png` | Full-text search with keyword highlighting |
 | `05-settings.png` | Accounts, IMAP/SMTP, signature, GNOME integration toggles |
+| `06-notes-dark.png` | Notes: folders, tags, rich-text editor with checklist, linked email |
+| `08-mail-to-task-light.png` | Mail view with "Add to To-do" popover and the Today/Notes side panel |
+
+The To-do concept (`07`) was lost; the To-do view was built from its written description instead.

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-email-link"
+description = "Enables the email_link command without any pre-configured scope."
+commands.allow = ["email_link"]
+
+[[permission]]
+identifier = "deny-email-link"
+description = "Denies the email_link command without any pre-configured scope."
+commands.deny = ["email_link"]

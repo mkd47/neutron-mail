@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-task-list"
+description = "Enables the delete_task_list command without any pre-configured scope."
+commands.allow = ["delete_task_list"]
+
+[[permission]]
+identifier = "deny-delete-task-list"
+description = "Denies the delete_task_list command without any pre-configured scope."
+commands.deny = ["delete_task_list"]

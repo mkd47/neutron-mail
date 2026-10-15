@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-note-folder"
+description = "Enables the delete_note_folder command without any pre-configured scope."
+commands.allow = ["delete_note_folder"]
+
+[[permission]]
+identifier = "deny-delete-note-folder"
+description = "Denies the delete_note_folder command without any pre-configured scope."
+commands.deny = ["delete_note_folder"]

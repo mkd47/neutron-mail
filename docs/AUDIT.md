@@ -154,6 +154,14 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 - **Sieve / ManageSieve:** the client requires STARTTLS (RFC 5804) with the same certificate verification as IMAP, discards nothing silently (bytes received before the TLS handshake abort the connection), re-reads capabilities after TLS, authenticates only with SASL PLAIN inside TLS, caps lines (64 KB) and literals (1 MB), and times out after 20 s. Scripts are checked (`CHECKSCRIPT`) before `PUTSCRIPT`/`SETACTIVE`. Generated Sieve escapes `"`/`\` in strings and `*`/`?` in `:matches`, only exports regexes from a portable subset, and keeps a rule local (with the reason shown) when it can't be expressed. While our script is active, server-side rules are not also run locally. Tested against Dovecot Pigeonhole: upload, activation and filing of a message delivered over SMTP→LMTP.
 - New commands `create_folder`, `rename_folder`, `delete_folder`, `set_folder_subscribed`, `move_messages`, `undo_transfer`, `list_rules`, `save_rules`, `test_rule`, `run_rules_now`, `sieve_status`, `sieve_upload`, `sieve_disable`, each granted explicitly in the capability file. `test_rule` never changes or sends anything.
 
+### 2.19 Notes and To-do (v0.7)
+- **Storage:** notes, note folders, tags, task lists, tasks and email links live in the same SQLCipher cache as mail (new tables, migrated at start-up). Every note and task has a random UUID v4 `uid`, `modified` time, `sync_state`, `remote_ref` and `etag` columns, and deletes leave a tombstone, so IMAP-notes or CalDAV VTODO sync can be added later without a schema change. Priorities use iCalendar values (1 high, 5 medium, 9 low, 0 none) and are validated in the core. No data leaves the machine.
+- **Note HTML:** the editor is a `contenteditable`; pasted content is sanitized in the frontend, and **every save is sanitized again in Rust** with ammonia: an allow-list of formatting tags, `href` only with http/https/mailto, only `data-checklist`/`data-checked` attributes, no images, styles, classes, event handlers or scripts (unit-tested with `<script>`, `onclick`, `<img>`, `style` and `javascript:` payloads). Clicks on links in notes are subject to the same Rust-side navigation guard as the rest of the app.
+- **Email links** store the Message-ID, subject, sender and date, not the message body. "Open email" resolves the Message-ID against the local cache for that account only; if the message is no longer cached, a notice says so.
+- **Search** uses parameterized `LIKE` with `%`, `_` and `\` escaped (tested).
+- **Reminders:** a background task checks every 20 s, marks each reminder as fired *before* notifying (no repeats after a crash), and shows a desktop notification plus an in-app toast. Verified in the GUI.
+- 24 new commands (`list_notes`, `save_note`, `note_from_message`, `list_tasks`, `save_task`, `set_task_completed`, …), each granted explicitly in the capability file. Subtasks are one level deep; completing a parent completes its subtasks.
+
 ## 3. Findings
 
 | # | Severity | Finding | Status |
@@ -190,6 +198,10 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 | O16 | Low | (v0.6) Undo of a move relies on Message-IDs; messages without one can't be undone, and undo across a server-side expunge by another client is best-effort. | Accepted; the toast shows the count. |
 | O17 | Low | (v0.6) Server-side filtering (ManageSieve) is unavailable for OAuth accounts (no OAUTHBEARER/XOAUTH2 in the ManageSieve client), and was tested only against Dovecot Pigeonhole. No malicious-ManageSieve-server test yet. | Open. |
 | O18 | Info | (v0.6) Local rules only see mail that arrives while the app is syncing (not mail that arrived during the first download, by design); server-side rules cover the "app closed" case. Rules are global with an Account condition, not per-account lists. | Accepted. |
+| F16 | Info | (v0.7, GUI testing) After opening a note from the Today panel, creating a new note re-opened the previous one, so the typed title went into the wrong note. | **Fixed**: the "open this note" request is only acted on when it changes. |
+| F17 | Info | (v0.7, GUI testing) WebKitGTK's `datetime-local` input did not reliably accept typed reminder times, so reminders could silently not be set. | **Fixed**: separate date field and an HH:MM text field, validated with an error message. |
+| O19 | Info | (v0.7) Notes and tasks are local only: no IMAP-notes or CalDAV sync yet (the schema is prepared), so they are not backed up with the mail account. | Open (planned). |
+| O20 | Info | (v0.7) Reminders only fire while Neutron Mail is running (no system scheduler / background service); a reminder missed while the app was closed fires at the next start. | Accepted for now. |
 | O12 | Info | (v0.2) `lnkd.in` and other opaque short links can't be unwrapped without contacting the shortener; they are shown as-is with their real host. | Accepted. |
 
 ## 4. Not covered / limits of this audit

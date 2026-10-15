@@ -67,6 +67,16 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   Guards: no forwarding of automated/forwarded mail or your own mail, `Auto-Submitted` on forwards, 20 forwards/hour,
   each message processed once, linear-time regex with size limits. Rules are stored in the encrypted cache.
 
+- **Notes and To-do** (app rail on the left: Mail · Calendar · Notes · To-do). **Notes**: folders, tags (with colors),
+  search, pinning, and a rich-text editor (headings, bold/italic/underline/strike, lists, **checklists**, quotes, links);
+  everything is sanitized on paste and again in the Rust core. **Save to Notes** turns an email into a note linked to it
+  (**Open email** jumps back). **To-do**: smart lists Today (count badge), Upcoming, Flagged emails (starred mail and tasks
+  created from email) and Completed; your own lists ("+ New list"); quick add with **Ctrl+Enter** (`!high` / `!med` / `!low`);
+  due dates, priority dots, subtasks, notes, and **reminders** as desktop notifications. **Add to To-do** in the reading
+  pane pre-fills the task from the subject and keeps a link to the email. A collapsible **Today / Notes panel** sits beside
+  your mail (panel icon at the bottom of the sidebar). Stored locally in the encrypted cache, with UIDs and sync columns
+  ready for future IMAP-notes / CalDAV VTODO sync (not implemented yet).
+
 - 🔐 [Security audit](docs/AUDIT.md): findings, severities, fixes and known gaps
 - 📄 [Research report](docs/research-report.md): architecture, crates, GNOME integration, licensing
 - 🎨 [UI concepts](concepts/README.md) · 📸 [Prototype screenshots](docs/screenshots/)
@@ -111,6 +121,10 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 |---|---|---|
 | ![](docs/screenshots/rules-editor-test.png) | ![](docs/screenshots/rules-sieve-preview.png) | ![](docs/screenshots/rule-applied-incoming.png) |
 
+| Notes: checklist, tags, linked email | To-do: Today, priorities, linked email | Add to To-do from an email (light) |
+|---|---|---|
+| ![](docs/screenshots/notes.png) | ![](docs/screenshots/todo.png) | ![](docs/screenshots/mail-to-task-light.png) |
+
 | Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
 |---|---|---|
 | ![](docs/screenshots/settings-account.png) | ![](docs/screenshots/settings-signature-images-sync.png) | ![](docs/screenshots/settings-signature-reply.png) |
@@ -121,7 +135,7 @@ More: [delete folder confirmation](docs/screenshots/folder-delete-confirm.png), 
 [compose autocomplete](docs/screenshots/autocomplete-compose.png), [attachment picker](docs/screenshots/attachment-picker.png),
 [save](docs/screenshots/attachment-save.png) / [open](docs/screenshots/attachment-open.png) an attachment,
 [link opened in the browser](docs/screenshots/linkedin-link-open.png), [redirect unwrapped](docs/screenshots/linkedin-redirect-unwrapped.png),
-[remote images blocked](docs/screenshots/html-rendering-blocked.png), [Sent-copy failure notice](docs/screenshots/sent-copy-failure.png).
+[remote images blocked](docs/screenshots/html-rendering-blocked.png), [Sent-copy failure notice](docs/screenshots/sent-copy-failure.png), [Today / Notes panel beside the mail](docs/screenshots/mail-today-panel.png).
 
 ### Why Svelte (not React)
 Svelte compiles to plain DOM code with no runtime: an 82 KB JS bundle (30 KB gzipped) and two
@@ -255,6 +269,10 @@ cargo audit && cargo deny check && npm audit
 | Compose | Search | Settings |
 |---|---|---|
 | ![Compose](concepts/03-compose.png) | ![Search](concepts/04-search.png) | ![Settings](concepts/05-settings.png) |
+
+| Notes (dark) | Mail to task (light) |
+|---|---|
+| ![Notes](concepts/06-notes-dark.png) | ![Mail to task](concepts/08-mail-to-task-light.png) |
 
 The mockups show the placeholder name "Aurora Mail", which was used before the name Neutron Mail was chosen.
 
