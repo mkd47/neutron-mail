@@ -1,7 +1,7 @@
 <script lang="ts">
   // Invitation card (iMIP, RFC 6047). Data comes from the Rust iCalendar
   // parser; everything is rendered as text nodes, never as HTML.
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { eventRange } from "./format";
   import { calendarApi, errorText, type InviteView, type PartStat } from "./api";
 

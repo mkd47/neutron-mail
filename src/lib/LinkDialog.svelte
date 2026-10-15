@@ -3,7 +3,7 @@
   // unwrapped tracking redirects, and lets the user open the cleaned or the
   // original link in the default browser (opener plugin, http/https only).
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { errorText, type LinkInfo } from "./api";
 
   let { link, onClose }: { link: LinkInfo; onClose: (opened: string | null) => void } = $props();

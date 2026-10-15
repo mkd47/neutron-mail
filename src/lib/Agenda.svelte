@@ -1,6 +1,6 @@
 <script lang="ts">
   // Read-only agenda strip: the next events from GNOME Calendar (EDS).
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { agendaWhen, eventRange } from "./format";
   import { calendarApi, type Agenda } from "./api";
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import Icon from "./lib/Icon.svelte";
+  import { AppRail, Icon, type RailItem } from "@neutron/ui";
   import AccountSetup from "./lib/AccountSetup.svelte";
   import Settings from "./lib/Settings.svelte";
   import Compose from "./lib/Compose.svelte";
@@ -51,7 +51,11 @@
   let showSetup = $state(false);
   let showSettings = $state(false);
   let showRules = $state(false);
-  // App rail: Mail, Calendar, Notes, To-do.
+  // App rail (shared @neutron/ui component): Mail, Calendar, Notes, To-do.
+  const railItems: RailItem[] = [
+    { id: "mail", icon: "mail", label: "Mail" }, { id: "calendar", icon: "calendar", label: "Calendar" },
+    { id: "notes", icon: "note", label: "Notes" }, { id: "todo", icon: "checkcircle", label: "To-do" },
+  ];
   type AppView = "mail" | "calendar" | "notes" | "todo";
   let appView = $state<AppView>((localStorage.getItem("appView") as AppView) ?? "mail");
   $effect(() => localStorage.setItem("appView", appView));
@@ -471,16 +475,9 @@
   </main>
 {:else}
   <div class="app">
-  <nav class="rail" aria-label="Apps">
-    <span class="logo rl">N</span>
-    {#each [["mail", "mail", "Mail"], ["calendar", "calendar", "Calendar"], ["notes", "note", "Notes"], ["todo", "checkcircle", "To-do"]] as [v, icon, label] (v)}
-      <button class="rbtn" class:active={appView === v} aria-current={appView === v ? "page" : undefined} onclick={() => { appView = v as AppView; if (v !== "notes") openNoteId = null; }}>
-        <Icon name={icon} size={20} /><span>{label}</span>
-      </button>
-    {/each}
-    <span class="spacer"></span>
-    <button class="rbtn" title="Toggle theme" aria-label="Toggle theme" onclick={() => (theme = theme === "dark" ? "light" : "dark")}><Icon name={theme === "dark" ? "sun" : "moon"} size={18} /></button>
-  </nav>
+  <AppRail items={railItems} active={appView} {theme}
+    onSelect={(v) => { appView = v as AppView; if (v !== "notes") openNoteId = null; }}
+    onToggleTheme={() => (theme = theme === "dark" ? "light" : "dark")} />
   {#if appView === "notes"}
     <Notes openId={openNoteId} onOpenEmail={openEmailLink} onStatus={(t, w) => showToast(t, w)} />
   {:else if appView === "todo"}
@@ -675,16 +672,9 @@
   .warn { text-align: center; color: #f5b14c; }
   .app { display: grid; grid-template-columns: 76px 1fr; height: 100%; min-height: 0; }
   .app > :global(*) { min-width: 0; min-height: 0; }
-  .rail { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px 6px; }
-  .rl { margin-bottom: 10px; width: 34px; height: 34px; border-radius: 10px; }
-  .rbtn { width: 62px; border: 0; background: transparent; border-radius: 10px; padding: 8px 2px; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); }
-  .rbtn:hover { background: var(--hover); color: var(--text); }
-  .rbtn.active { background: var(--selected); color: var(--text); }
-  .rbtn.active :global(svg) { color: var(--accent); }
   .shell { display: grid; grid-template-columns: 240px minmax(300px, 380px) 1fr; height: 100%; }
   .shell.withpanel { grid-template-columns: 220px minmax(280px, 340px) 1fr 290px; }
   .sidebar { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 14px 12px; gap: 6px; min-height: 0; }
-  .logo { width: 26px; height: 26px; border-radius: 8px; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 700; }
   .compose { display: flex; gap: 8px; justify-content: center; align-items: center; padding: 10px; margin-bottom: 8px; }
   nav { display: flex; flex-direction: column; gap: 2px; overflow: auto; }
   .folder { display: flex; gap: 12px; align-items: center; border: 0; background: transparent; padding: 9px 12px; border-radius: 8px; text-align: left; }

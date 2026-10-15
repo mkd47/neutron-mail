@@ -3,7 +3,7 @@
   // checklists, and links to emails. Stored locally (encrypted cache).
   import { onDestroy, onMount, tick } from "svelte";
   import { untrack } from "svelte";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { api, errorText, pimApi, type Note, type NoteInput, type NoteFolder, type NoteSummary, type Tag } from "./api";
 
   let { openId = null, onOpenEmail, onStatus }:

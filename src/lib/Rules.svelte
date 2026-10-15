@@ -3,7 +3,7 @@
   // (Sieve via ManageSieve), a Sieve preview, test against a message and
   // "Run now" on a folder.
   import { onMount } from "svelte";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { errorText, rulesApi, type Account, type Action, type Condition, type Folder, type Rule,
     type RuleField, type RuleOp, type RuleTest, type SieveStatus } from "./api";
 

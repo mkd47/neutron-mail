@@ -1,6 +1,6 @@
 <script lang="ts">
   // Collapsible Today / Notes side panel in the mail view.
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { dayEnd, dueLabel, errorText, pimApi, type NoteSummary, type Task, type TaskList } from "./api";
 
   let { refreshKey = 0, onClose, onOpenTodo, onOpenNote, onNewNote, onStatus }: {

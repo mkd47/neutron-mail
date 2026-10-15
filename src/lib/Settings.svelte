@@ -4,7 +4,7 @@
   import { onMount } from "svelte";
   import AccountSetup from "./AccountSetup.svelte";
   import RichEditor from "./RichEditor.svelte";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { api, errorText, type Account, type AccountSettings } from "./api";
 
   let { account, onClose, onUpdated, onRemoved }:

@@ -2,7 +2,7 @@
   // To-do: smart lists, custom lists, quick add, due dates, reminders,
   // priority, subtasks, task notes and linked emails. Local storage.
   import { onDestroy, untrack } from "svelte";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import { dayAt, dayEnd, dueLabel, errorText, pimApi, taskInput, type EmailLink, type MessageSummary, type Task,
     type TaskCounts, type TaskInput, type TaskList, type TaskView } from "./api";
   import { shortDate } from "./format";

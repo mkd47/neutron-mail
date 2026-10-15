@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import Composer from "./Composer.svelte";
   import InviteCard from "./InviteCard.svelte";
   import { initials, shortDate, size } from "./format";

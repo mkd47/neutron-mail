@@ -1,7 +1,7 @@
 <script lang="ts">
   // Shared message editor: used inline in the preview pane (Reply / Reply all /
   // Forward / Edit draft) and inside the standalone Compose window.
-  import Icon from "./Icon.svelte";
+  import { Icon } from "@neutron/ui";
   import RecipientField from "./RecipientField.svelte";
   import RichEditor from "./RichEditor.svelte";
   import { size } from "./format";
