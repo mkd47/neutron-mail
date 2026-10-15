@@ -166,7 +166,7 @@ async fn watch(app: AppHandle, account_id: i64) {
 
 async fn wait_for_change(state: &AppState, account_id: i64) -> neutron_core::Result<()> {
     let account = state.store.account(account_id)?;
-    let password = state.secrets.get(account_id)?;
+    let password = crate::providers::credential(state, account_id).await?;
     let mut session = imap::connect(&account.config, &password).await?;
     if !imap::supports_idle(&mut session).await? {
         drop(session.logout().await);

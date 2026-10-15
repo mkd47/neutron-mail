@@ -37,6 +37,11 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   every IMAP command has a timeout. 5,000 messages: first sync ≈1.3 s, a no-change resync ≈10 ms (local Dovecot, debug build).
 - **Unread badge** (window title, and the dock icon where the dock supports the Unity LauncherEntry API) and
   **desktop notifications** for new mail in the inbox while the window is in the background.
+- **Provider tiles** for 263.net, Alimail (enterprise and personal), Google (Gmail) and Outlook (Outlook.com /
+  Microsoft 365), plus Other/manual: picking one fills in and locks the server settings (unlock with "Advanced"),
+  asks only for the address and the right kind of password, with provider-specific hints and links. The provider
+  is detected from the address; unknown domains are looked up via Mozilla autoconfig (HTTPS only).
+  **Sign in with Google / Microsoft** (OAuth2 + PKCE, XOAUTH2) when the build has OAuth client IDs (see "OAuth setup").
 - **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
 
 - **GNOME Calendar** (evolution-data-server over D-Bus): a read-only **agenda strip** with the next 7 days from all
@@ -68,6 +73,14 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 |---|---|---|
 | ![](docs/screenshots/dark-invite-agenda.png) | ![](docs/screenshots/dark-large-folder.png) | ![](docs/screenshots/notification-and-badge.png) |
 
+| Provider tiles: 263.net (authorization-code hint) | Gmail detected from the address (app password) | Outlook: OAuth only, consumer SMTP host |
+|---|---|---|
+| ![](docs/screenshots/provider-tile-263.png) | ![](docs/screenshots/provider-detect-gmail.png) | ![](docs/screenshots/provider-detect-hotmail.png) |
+
+| Alimail enterprise | Unknown domain via autoconfig | Other/manual against the local test server |
+|---|---|---|
+| ![](docs/screenshots/provider-tile-alimail.png) | ![](docs/screenshots/provider-autoconfig-fastmail.png) | ![](docs/screenshots/provider-other-filled.png) |
+
 | Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
 |---|---|---|
 | ![](docs/screenshots/settings-account.png) | ![](docs/screenshots/settings-signature-images-sync.png) | ![](docs/screenshots/settings-signature-reply.png) |
@@ -82,6 +95,53 @@ More: [remove account confirmation](docs/screenshots/settings-remove-confirm.png
 Svelte compiles to plain DOM code with no runtime: an 82 KB JS bundle (30 KB gzipped) and two
 runtime npm dependencies (`@tauri-apps/api`, `@tauri-apps/plugin-opener`). That keeps the WebView small and the supply-chain
 audit surface minimal, which matters for an app that handles mail.
+
+## Provider profiles
+
+Built into `crates/neutron-core/src/providers.rs`; every value is from the provider's own documentation.
+
+| Provider | IMAP | SMTP | Login | Sources |
+|---|---|---|---|---|
+| **263.net** (企业邮箱) | `imap.263.net:993` SSL | `smtp.263.net:465` SSL | Mailbox password, or a **client authorization code** (客户端授权码) once the company enables them: webmail → Settings → 账号安全 → 客户端授权码 → 新增授权码 (shown once). Overseas hosts `imapw/smtpw.263.net` exist (use Advanced). | [client settings](https://www.263.net/success/mail/client/20160603/970.html), [webmail manual](https://www.263.net/success/mail/pcweb/20231124/1908.html) |
+| **Alimail enterprise** (阿里邮箱企业版) | `imap.qiye.aliyun.com:993` SSL | `smtp.qiye.aliyun.com:465` SSL | Third-party clients are **off by default** for new purchases; the admin must allow them ([doc](https://help.aliyun.com/zh/document_detail/606337.html)). If the **三方客户端安全密码** is enabled, generate one under Settings → 账户与安全 → 账户安全 ([doc](https://help.aliyun.com/zh/document_detail/444269.html)). HK hosts `imaphk/smtphk.qiye.aliyun.com`. | [server settings](https://help.aliyun.com/zh/document_detail/36576.html) |
+| **Alimail personal** (`@aliyun.com`) | `imap.aliyun.com:993` SSL | `smtp.aliyun.com:465` SSL | Mailbox password | [server settings](https://help.aliyun.com/zh/document_detail/465307.html) |
+| **Google (Gmail)** | `imap.gmail.com:993` SSL | `smtp.gmail.com:465` SSL (587 STARTTLS) | **Sign in with Google** (OAuth2, scope `https://mail.google.com/`), or an [app password](https://myaccount.google.com/apppasswords) (needs 2-Step Verification). The account password is not accepted. | [IMAP/SMTP](https://developers.google.com/workspace/gmail/imap/imap-smtp), [XOAUTH2](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol), [client setup](https://support.google.com/mail/answer/7126229) |
+| **Outlook** (Outlook.com / Microsoft 365) | `outlook.office365.com:993` SSL | `smtp.office365.com:587` STARTTLS (Outlook.com addresses: `smtp-mail.outlook.com:587`) | **OAuth2 only** (no passwords/app passwords). Outlook.com: turn on Settings → Mail → Forwarding and IMAP first. M365 admins may need to allow IMAP / SMTP AUTH. | [Outlook.com](https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-for-outlook-com-d088b986-291d-42b8-9564-9c414e2aa040), [Exchange Online](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/pop3-and-imap4/pop3-and-imap4), [OAuth for IMAP/SMTP](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth) |
+
+Auto-detection by address: `gmail.com`, `googlemail.com` → Google; `outlook.com`, `hotmail.com`, `live.com`, `msn.com`
+(+ `.de`) → Outlook; `aliyun.com` → Alimail personal; `263.net` → 263. Company domains hosted at 263/Alimail/Google/M365
+can't be told apart by name: pick the tile. For other domains, Neutron Mail asks (HTTPS only, 8 s timeout, 64 KB cap)
+`https://autoconfig.<domain>/mail/config-v1.1.xml`, then Mozilla's ISPDB `https://autoconfig.thunderbird.net/v1.1/<domain>`;
+only SSL/TLS or STARTTLS servers are accepted, and the result is shown for review. Try it from the shell:
+`cargo run -p neutron-core --example autoconfig -- you@example.org`.
+
+### OAuth setup
+
+Neutron Mail ships **no** OAuth client IDs. Register your own apps and pass the IDs at build time or run time
+(run-time variables win):
+
+```sh
+export NEUTRON_GOOGLE_CLIENT_ID=1234-abc.apps.googleusercontent.com
+export NEUTRON_GOOGLE_CLIENT_SECRET=GOCSPX-...      # Google "Desktop app" clients issue one; it is not confidential
+export NEUTRON_MICROSOFT_CLIENT_ID=00000000-0000-0000-0000-000000000000
+export NEUTRON_MICROSOFT_TENANT=common              # optional: common | consumers | organizations | <tenant id>
+cargo tauri build      # baked in via option_env!, or set them when launching the app
+```
+
+- **Google:** Google Cloud console → enable the Gmail API → OAuth consent screen (add scope `https://mail.google.com/`,
+  add yourself as a test user while unverified) → Credentials → *OAuth client ID* → **Desktop app**. Loopback
+  redirects (`http://127.0.0.1:<port>/`) are allowed for desktop clients automatically. Publishing to everyone needs
+  Google's restricted-scope verification.
+- **Microsoft:** Entra admin center → App registrations → New → "Accounts in any organizational directory and
+  personal Microsoft accounts" → Authentication → *Mobile and desktop applications* platform with redirect URI
+  `http://127.0.0.1` (the app uses `http://127.0.0.1:<random port>/`; Entra ignores the port for loopback URIs. If
+  the portal rejects it, add it in the app's Manifest under `replyUrlsWithType`) and **Allow public client flows** = Yes. API permissions →
+  Office 365 Exchange Online / delegated: `IMAP.AccessAsUser.All`, `SMTP.Send` (plus `offline_access`). No secret.
+
+Flow: the app opens the system browser with PKCE (S256) and a random `state`, listens once on `127.0.0.1:<random port>`,
+exchanges the code, verifies IMAP with `AUTHENTICATE XOAUTH2`, and stores `{access, refresh, expiry}` as JSON in GNOME
+Keyring in place of a password. Access tokens are refreshed 2 minutes before expiry (SMTP uses lettre's XOAUTH2).
+The flow is unit-tested against a mock token endpoint; it has **not** been run against real Google/Microsoft accounts.
 
 ## Build & run on Fedora 44
 

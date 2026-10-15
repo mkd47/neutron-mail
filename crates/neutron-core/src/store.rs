@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{
-    Account, AccountConfig, Folder, MessageDetail, MessageSummary, SearchHit, Security,
+    Account, AccountConfig, AuthMethod, Folder, MessageDetail, MessageSummary, SearchHit, Security,
 };
 use crate::parse::{self, ParsedMessage};
 use crate::secrets::CacheKey;
@@ -215,6 +215,14 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
         migrate_folder_sync_state(&conn)?;
+        let has_auth = conn
+            .prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'auth'")?
+            .exists([])?;
+        if !has_auth {
+            conn.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'",
+            )?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -264,10 +272,10 @@ impl Store {
         c.validate()?;
         let db = self.db();
         db.execute(
-            "INSERT INTO accounts (email, display_name, username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, extra_ca_pem)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO accounts (email, display_name, username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, extra_ca_pem, auth)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![c.email, c.display_name, c.username, c.imap_host, c.imap_port, c.imap_security.as_str(),
-                    c.smtp_host, c.smtp_port, c.smtp_security.as_str(), c.extra_ca_pem],
+                    c.smtp_host, c.smtp_port, c.smtp_security.as_str(), c.extra_ca_pem, c.auth.as_str()],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -275,7 +283,7 @@ impl Store {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let db = self.db();
         let mut st = db.prepare(
-            "SELECT id, email, display_name, username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, extra_ca_pem FROM accounts ORDER BY id",
+            "SELECT id, email, display_name, username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, extra_ca_pem, auth FROM accounts ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -291,6 +299,7 @@ impl Store {
                     smtp_port: r.get(8)?,
                     smtp_security: Security::Tls,
                     extra_ca_pem: r.get(10)?,
+                    auth: AuthMethod::parse(&r.get::<_, String>(11)?),
                 },
                 r.get::<_, String>(6)?,
                 r.get::<_, String>(9)?,
@@ -318,9 +327,9 @@ impl Store {
         c.validate()?;
         let n = self.db().execute(
             "UPDATE accounts SET email=?2, display_name=?3, username=?4, imap_host=?5, imap_port=?6, imap_security=?7,
-               smtp_host=?8, smtp_port=?9, smtp_security=?10, extra_ca_pem=?11 WHERE id=?1",
+               smtp_host=?8, smtp_port=?9, smtp_security=?10, extra_ca_pem=?11, auth=?12 WHERE id=?1",
             params![id, c.email, c.display_name, c.username, c.imap_host, c.imap_port, c.imap_security.as_str(),
-                    c.smtp_host, c.smtp_port, c.smtp_security.as_str(), c.extra_ca_pem],
+                    c.smtp_host, c.smtp_port, c.smtp_security.as_str(), c.extra_ca_pem, c.auth.as_str()],
         )?;
         if n == 0 {
             return Err(Error::NotFound(format!("account {id}")));

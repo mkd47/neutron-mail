@@ -142,7 +142,7 @@ pub async fn respond_invite(
         return Err(Error::Invalid("this invitation can't be answered".into()));
     }
     let account = state.store.account(account_id)?;
-    let password = state.secrets.get(account_id)?;
+    let password = crate::providers::credential(&state, account_id).await?;
     let cfg = &account.config;
     let now = unix_now();
     let ics = ical::build_reply(&view.event, &cfg.email, &cfg.display_name, ps, now)?;

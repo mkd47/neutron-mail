@@ -125,6 +125,7 @@ fn imip_rejects_bad_input() {
     // No server needed: build only.
     let mut cfg = neutron_core::model::AccountConfig {
         extra_ca_pem: None,
+        auth: Default::default(),
         ..dummy()
     };
     cfg.email = "kaan@localhost".into();
@@ -144,5 +145,6 @@ fn dummy() -> neutron_core::model::AccountConfig {
         smtp_port: 587,
         smtp_security: Security::Starttls,
         extra_ca_pem: None,
+        auth: Default::default(),
     }
 }

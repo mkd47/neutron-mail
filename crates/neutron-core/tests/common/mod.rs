@@ -40,6 +40,7 @@ pub fn config(imap_security: Security) -> AccountConfig {
         smtp_host: "localhost".into(),
         smtp_port: 10587,
         smtp_security: Security::Starttls,
+        auth: Default::default(),
         // Offline tests (no server, e.g. CI) only build configs; they never connect.
         extra_ca_pem: if enabled_quiet() {
             Some(ca_pem())

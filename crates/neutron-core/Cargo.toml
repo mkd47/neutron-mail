@@ -23,6 +23,7 @@ mail-parser = "0.11"
 ammonia = "4"
 rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 getrandom = "0.3"
+sha2 = "0.10"
 zeroize = "1"
 base64 = "0.22"
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }

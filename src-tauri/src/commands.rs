@@ -77,6 +77,9 @@ pub async fn add_account(
     password: String,
 ) -> Res<Account> {
     config.validate()?;
+    if config.auth.is_oauth() {
+        return Err(Error::Invalid("use \"Sign in\" for OAuth accounts".into()));
+    }
     let mut session = imap::connect(&config, &password).await?;
     drop(session.logout().await);
     let id = state.store.add_account(&config)?;
@@ -107,12 +110,17 @@ pub async fn update_account(
     password: String,
 ) -> Res<Account> {
     config.validate()?;
-    state.store.account(account_id)?;
-    let new_password = !password.is_empty();
+    let old = state.store.account(account_id)?;
+    if config.auth != old.config.auth {
+        return Err(Error::Invalid(
+            "changing the sign-in method needs a new sign-in".into(),
+        ));
+    }
+    let new_password = !password.is_empty() && !config.auth.is_oauth();
     let pw = if new_password {
         password
     } else {
-        state.secrets.get(account_id)?
+        crate::providers::credential(&state, account_id).await?
     };
     let mut session = imap::connect(&config, &pw).await?;
     drop(session.logout().await);
@@ -149,7 +157,11 @@ pub fn list_image_senders(state: State<'_, AppState>, account_id: i64) -> Res<Ve
 /// fallback is available).
 #[tauri::command]
 pub fn set_password(state: State<'_, AppState>, account_id: i64, password: String) -> Res<()> {
-    state.store.account(account_id)?;
+    if state.store.account(account_id)?.config.auth.is_oauth() {
+        return Err(Error::Invalid(
+            "OAuth accounts sign in again instead".into(),
+        ));
+    }
     state.secrets.set(account_id, &password)
 }
 
@@ -160,7 +172,7 @@ pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Res<Sy
 
 pub async fn run_sync(state: &AppState, account_id: i64) -> Res<SyncReport> {
     let account = state.store.account(account_id)?;
-    let password = state.secrets.get(account_id)?;
+    let password = crate::providers::credential(state, account_id).await?;
     let _guard = state.sync_lock.lock().await;
     sync::sync_account(&state.store, account_id, &account.config, &password).await
 }
@@ -220,7 +232,7 @@ pub async fn get_message(
         state.store.mark_seen_local(message_id)?;
         let (account_id, folder, uid) = state.store.message_location(message_id)?;
         let account = state.store.account(account_id)?;
-        if let Ok(password) = state.secrets.get(account_id) {
+        if let Ok(password) = crate::providers::credential(&state, account_id).await {
             tauri::async_runtime::spawn(async move {
                 let res = async {
                     let mut s = imap::connect(&account.config, &password).await?;
@@ -365,7 +377,7 @@ pub async fn send_message(
     replace_draft: Option<i64>,
 ) -> Res<SendResult> {
     let account = state.store.account(account_id)?;
-    let password = state.secrets.get(account_id)?;
+    let password = crate::providers::credential(&state, account_id).await?;
     let files = resolve_attachments(&state, account_id, &message.attachments)?;
     let raw = smtp::send(&account.config, &password, &message, &files).await?;
     tracing::info!(
@@ -419,7 +431,7 @@ pub async fn save_draft(
     replace_draft: Option<i64>,
 ) -> Res<()> {
     let account = state.store.account(account_id)?;
-    let password = state.secrets.get(account_id)?;
+    let password = crate::providers::credential(&state, account_id).await?;
     let drafts = state
         .store
         .folder_by_role(account_id, "drafts")?

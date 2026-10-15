@@ -21,6 +21,7 @@ fn cfg() -> AccountConfig {
         smtp_port: 587,
         smtp_security: Security::Starttls,
         extra_ca_pem: None,
+        auth: Default::default(),
     }
 }
 

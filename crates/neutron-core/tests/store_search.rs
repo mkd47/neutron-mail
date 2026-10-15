@@ -14,6 +14,7 @@ fn cfg() -> AccountConfig {
         smtp_port: 587,
         smtp_security: Security::Starttls,
         extra_ca_pem: None,
+        auth: Default::default(),
     }
 }
 
@@ -173,4 +174,27 @@ fn extra_ca_accepts_trimmed_and_crlf_pem_and_errors_concisely() {
         .unwrap_err()
         .to_string();
     assert!(err.len() < 120, "error should be concise: {err}");
+}
+
+#[test]
+fn auth_method_round_trips() {
+    let s = Store::open_in_memory().unwrap();
+    let mut c = cfg();
+    let pw = s.add_account(&c).unwrap();
+    c.auth = neutron_core::model::AuthMethod::OauthMicrosoft;
+    let oa = s.add_account(&c).unwrap();
+    assert_eq!(s.account(pw).unwrap().config.auth, Default::default());
+    assert_eq!(
+        s.account(oa).unwrap().config.auth,
+        neutron_core::model::AuthMethod::OauthMicrosoft
+    );
+    c.auth = neutron_core::model::AuthMethod::OauthGoogle;
+    s.update_account(oa, &c).unwrap();
+    assert!(s.account(oa).unwrap().config.auth.is_oauth());
+    // Older configs without the field still deserialize (password).
+    let json = serde_json::to_value(cfg()).unwrap();
+    let mut obj = json.as_object().unwrap().clone();
+    obj.remove("auth");
+    let back: AccountConfig = serde_json::from_value(obj.into()).unwrap();
+    assert_eq!(back.auth, Default::default());
 }

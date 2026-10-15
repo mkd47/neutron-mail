@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use lettre::address::Envelope;
 use lettre::message::Mailbox;
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_builder::headers::address::Address;
@@ -186,14 +186,16 @@ fn transport(cfg: &AccountConfig, password: &str) -> Result<AsyncSmtpTransport<T
         Security::Tls => Tls::Wrapper(params),
         Security::Starttls => Tls::Required(params),
     };
-    Ok(
-        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(cfg.smtp_host.clone())
-            .port(cfg.smtp_port)
-            .tls(tls)
-            .timeout(Some(Duration::from_secs(60)))
-            .credentials(Credentials::new(cfg.username.clone(), password.to_owned()))
-            .build(),
-    )
+    let mut b = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(cfg.smtp_host.clone())
+        .port(cfg.smtp_port)
+        .tls(tls)
+        .timeout(Some(Duration::from_secs(60)))
+        // For OAuth accounts `password` is the access token.
+        .credentials(Credentials::new(cfg.username.clone(), password.to_owned()));
+    if cfg.auth.is_oauth() {
+        b = b.authentication(vec![Mechanism::Xoauth2]);
+    }
+    Ok(b.build())
 }
 
 /// Build and send; returns the transmitted bytes (for APPEND to Sent).

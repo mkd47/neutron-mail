@@ -15,8 +15,23 @@ export interface AccountConfig {
   smtp_port: number;
   smtp_security: Security;
   extra_ca_pem: string | null;
+  auth?: AuthMethod;
 }
 export interface Account extends AccountConfig { id: number }
+export type AuthMethod = "password" | "oauth_google" | "oauth_microsoft";
+export interface Provider {
+  id: string; name: string; domains: string[];
+  imap_host: string; imap_port: number; imap_security: Security;
+  smtp_host: string; smtp_port: number; smtp_security: Security;
+  consumer_smtp_host: string | null;
+  auth: AuthMethod[]; password_label: string; hint: string; help_url: string; source: string;
+  oauth_ready: boolean;
+}
+export interface Discovered {
+  imap_host: string; imap_port: number; imap_security: Security;
+  smtp_host: string; smtp_port: number; smtp_security: Security;
+  username: string; source: string; oauth2: boolean;
+}
 export interface Folder { id: number; account_id: number; name: string; role: string | null; unread: number; total: number }
 export interface MessageSummary {
   id: number; folder_id: number; uid: number; subject: string; from_name: string; from_addr: string;
@@ -72,6 +87,11 @@ export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   listAccounts: () => invoke<Account[]>("list_accounts"),
   addAccount: (config: AccountConfig, password: string) => invoke<Account>("add_account", { config, password }),
+  listProviders: () => invoke<Provider[]>("list_providers"),
+  detectProvider: (email: string) => invoke<string | null>("detect_provider", { email }),
+  autoconfigLookup: (email: string) => invoke<Discovered>("autoconfig_lookup", { email }),
+  oauthSignIn: (config: AccountConfig, accountId: number | null) =>
+    invoke<Account>("oauth_sign_in", { config, accountId }),
   removeAccount: (accountId: number) => invoke<void>("remove_account", { accountId }),
   updateAccount: (accountId: number, config: AccountConfig, password: string) =>
     invoke<Account>("update_account", { accountId, config, password }),

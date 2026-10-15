@@ -28,6 +28,37 @@ impl Security {
     }
 }
 
+/// How the account logs in. OAuth2 tokens live in the keyring like
+/// passwords; this only selects the SASL mechanism (XOAUTH2 vs LOGIN/PLAIN).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    #[default]
+    Password,
+    OauthGoogle,
+    OauthMicrosoft,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::OauthGoogle => "oauth_google",
+            Self::OauthMicrosoft => "oauth_microsoft",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "oauth_google" => Self::OauthGoogle,
+            "oauth_microsoft" => Self::OauthMicrosoft,
+            _ => Self::Password,
+        }
+    }
+    pub fn is_oauth(self) -> bool {
+        self != Self::Password
+    }
+}
+
 /// Server settings for one account. Contains no password.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountConfig {
@@ -44,6 +75,8 @@ pub struct AccountConfig {
     /// server with a private CA. Certificate validation is never disabled.
     #[serde(default)]
     pub extra_ca_pem: Option<String>,
+    #[serde(default)]
+    pub auth: AuthMethod,
 }
 
 impl AccountConfig {

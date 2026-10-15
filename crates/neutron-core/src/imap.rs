@@ -51,6 +51,19 @@ async fn cmd<T, E: Into<Error>>(
     }
 }
 
+struct XOAuth2 {
+    response: String,
+}
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        // First call sends the token; a server error challenge (JSON) is
+        // answered with an empty line so the server sends the tagged NO.
+        std::mem::take(&mut self.response)
+    }
+}
+
 /// Open an authenticated session.
 pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Session> {
     timed(async {
@@ -69,10 +82,21 @@ pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Session> {
         if cfg.imap_security == Security::Tls {
             let _greeting = client.read_response().await;
         }
-        client
-            .login(&cfg.username, password)
-            .await
-            .map_err(|(e, _)| Error::from(e))
+        if cfg.auth.is_oauth() {
+            // `password` is the OAuth2 access token (RFC 7628 / XOAUTH2).
+            let auth = XOAuth2 {
+                response: crate::oauth::xoauth2_string(&cfg.username, password),
+            };
+            client
+                .authenticate("XOAUTH2", auth)
+                .await
+                .map_err(|(e, _)| Error::from(e))
+        } else {
+            client
+                .login(&cfg.username, password)
+                .await
+                .map_err(|(e, _)| Error::from(e))
+        }
     })
     .await
 }

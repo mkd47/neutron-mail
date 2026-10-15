@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-autoconfig-lookup"
+description = "Enables the autoconfig_lookup command without any pre-configured scope."
+commands.allow = ["autoconfig_lookup"]
+
+[[permission]]
+identifier = "deny-autoconfig-lookup"
+description = "Denies the autoconfig_lookup command without any pre-configured scope."
+commands.deny = ["autoconfig_lookup"]

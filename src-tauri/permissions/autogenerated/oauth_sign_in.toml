@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-oauth-sign-in"
+description = "Enables the oauth_sign_in command without any pre-configured scope."
+commands.allow = ["oauth_sign_in"]
+
+[[permission]]
+identifier = "deny-oauth-sign-in"
+description = "Denies the oauth_sign_in command without any pre-configured scope."
+commands.deny = ["oauth_sign_in"]

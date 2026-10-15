@@ -6,6 +6,7 @@ mod attachments;
 mod calendar;
 mod commands;
 mod contacts;
+mod providers;
 mod watcher;
 
 use std::{collections::HashMap, sync::Arc};
@@ -142,6 +143,11 @@ pub fn run() {
             commands::app_info,
             commands::list_accounts,
             commands::add_account,
+            providers::list_providers,
+            providers::detect_provider,
+            providers::autoconfig_lookup,
+            providers::oauth_sign_in,
+            providers::oauth_configured,
             commands::remove_account,
             commands::set_password,
             commands::sync_account,
