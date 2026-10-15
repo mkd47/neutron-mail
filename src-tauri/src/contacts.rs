@@ -61,6 +61,7 @@ pub async fn suggest_contacts(
     if q.is_empty() {
         return Ok(Vec::new());
     }
+    tracing::debug!(len = q.len(), "contacts: suggest");
     let mut inner = state.contacts.inner.lock().await;
     if let Some((t, hits)) = inner.cache.get(&(account_id, q.clone())) {
         if t.elapsed() < CACHE_TTL {
@@ -74,6 +75,7 @@ pub async fn suggest_contacts(
     if let Some(eds) = inner.eds.as_ref() {
         match eds.search(&q, LIMIT).await {
             Ok(hits) => {
+                tracing::debug!(hits = hits.len(), "contacts: EDS results");
                 for h in hits {
                     if seen.insert(h.email.to_lowercase()) {
                         out.push(ContactSuggestion {

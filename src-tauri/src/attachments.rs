@@ -198,11 +198,7 @@ pub async fn open_attachment(
             )),
         });
     }
-    let base = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| Error::Invalid(format!("cache dir: {e}")))?
-        .join("open-attachments");
+    let base = open_dir(&app)?;
     std::fs::create_dir_all(&base)?;
     crate::restrict_dir(&base);
     let dir = base.join(token());
@@ -243,4 +239,25 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
+}
+
+fn open_dir(app: &AppHandle) -> Res<PathBuf> {
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| Error::Invalid(format!("cache dir: {e}")))?
+        .join("open-attachments"))
+}
+
+/// Remove the private copies made for "Open" in earlier sessions. They are
+/// kept for the whole session because the external viewer may still be
+/// reading them, and deleted on the next start.
+pub fn clear_opened(app: &AppHandle) {
+    if let Ok(dir) = open_dir(app) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::debug!("cleared opened-attachment copies"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("could not clear opened attachments: {e}"),
+        }
+    }
 }

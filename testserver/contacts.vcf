@@ -1,0 +1,26 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Mehmet Kaya
+N:Kaya;Mehmet;;;
+EMAIL;TYPE=WORK:mehmet.kaya@example.test
+ORG:Free Desktop GmbH
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+FN:Defne Aksoy
+N:Aksoy;Defne;;;
+EMAIL;TYPE=HOME:defne@example.test
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+FN:Ayse Yilmaz
+N:Yilmaz;Ayse;;;
+EMAIL;TYPE=WORK:ayse@example.test
+EMAIL;TYPE=HOME:ayse.yilmaz@home.example.test
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+FN:Marta Kowalska
+N:Kowalska;Marta;;;
+EMAIL:marta.k@example.test
+END:VCARD

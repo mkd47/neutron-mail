@@ -67,6 +67,7 @@ pub fn run() {
             };
             let accounts = state.store.accounts()?;
             app.manage(state);
+            attachments::clear_opened(app.handle());
             create_main_window(app.handle())?;
             for a in accounts {
                 watcher::start(app.handle(), a.id);
@@ -114,6 +115,7 @@ fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     let window = tauri::WebviewWindowBuilder::from_config(app, &cfg)?
         .on_navigation(move |url| {
             let s = url.as_str();
+            tracing::debug!(url_len = s.len(), "navigation request");
             if links::is_internal_navigation(s, APP_ORIGINS) {
                 return true;
             }

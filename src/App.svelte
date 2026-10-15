@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import Icon from "./lib/Icon.svelte";
   import AccountSetup from "./lib/AccountSetup.svelte";
   import Compose from "./lib/Compose.svelte";
   import Viewer from "./lib/Viewer.svelte";
-  import { api, errorText, type Account, type AppInfo, type Folder, type MessageDetail, type MessageSummary, type SearchHit } from "./lib/api";
+  import LinkDialog from "./lib/LinkDialog.svelte";
+  import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
+    type LinkInfo, type MessageSummary, type MessageView, type SearchHit } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -19,13 +21,22 @@
   let folder = $state<Folder | null>(null);
   let messages = $state<MessageSummary[]>([]);
   let selectedId = $state<number | null>(null);
-  let detail = $state<(MessageDetail & { document: string | null }) | null>(null);
+  let detail = $state<MessageView | null>(null);
+  let loadRemote = $state(false);
+  let link = $state<LinkInfo | null>(null);
+  let hoverUrl = $state<string | null>(null);
+  let toast = $state<{ text: string; warn: boolean } | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  function showToast(text: string, warn = false) {
+    toast = { text, warn }; clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (toast = null), warn ? 12000 : 5000);
+  }
   let query = $state("");
   let hits = $state<SearchHit[] | null>(null);
   let syncing = $state(false);
   let status = $state("");
   let showSetup = $state(false);
-  let compose = $state<{ to: string; subject: string; body: string } | null>(null);
+  let compose = $state<ComposeDraft | null>(null);
 
   const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", trash: "trash", archive: "archive", junk: "junk", flagged: "star" };
   const roleOrder = ["inbox", "flagged", "drafts", "sent", "archive", "junk", "trash"];
@@ -54,9 +65,9 @@
     await refreshMessages();
   }
   async function open(m: MessageSummary) {
-    selectedId = m.id;
+    selectedId = m.id; loadRemote = false;
     try {
-      detail = await api.getMessage(m.id, theme === "dark");
+      detail = await api.getMessage(m.id, theme === "dark", false);
       if (!m.seen) { m.seen = true; await refreshFolders(); }
     } catch (e) { status = errorText(e); }
   }
@@ -77,14 +88,33 @@
       try { hits = await api.search(account.id, query); } catch (e) { status = errorText(e); }
     }, 200);
   }
-  function reply() {
-    if (!detail) return;
-    const quoted = detail.text.split("\n").map((l) => `> ${l}`).join("\n");
-    compose = { to: detail.from_addr, subject: detail.subject.match(/^re:/i) ? detail.subject : `Re: ${detail.subject}`,
-      body: `\n\nOn ${new Date(detail.date * 1000).toLocaleString()}, ${detail.from_name || detail.from_addr} wrote:\n${quoted}` };
+  async function reload(remote: boolean) {
+    if (selectedId === null) return;
+    loadRemote = remote;
+    try { detail = await api.getMessage(selectedId, theme === "dark", remote); }
+    catch (e) { showToast(errorText(e), true); }
+    if (remote && detail && detail.remote_images_failed > 0)
+      showToast(`${detail.remote_images_failed} remote image(s) could not be loaded (blocked host, not an image, or too large).`, true);
   }
   // Re-render the open message when the theme changes so the iframe document matches.
-  $effect(() => { const dark = theme === "dark"; if (selectedId !== null) api.getMessage(selectedId, dark).then((d) => (detail = d)).catch(() => {}); });
+  // Only the theme is tracked: opening a message or loading remote images
+  // already fetches it, so tracking those too would fetch remote images twice.
+  $effect(() => {
+    const dark = theme === "dark";
+    untrack(() => { if (selectedId !== null) api.getMessage(selectedId, dark, loadRemote).then((d) => (detail = d)).catch(() => {}); });
+  });
+  async function composerDone(r: ComposerResult) {
+    if (r.kind === "sent") { showToast(r.warning ?? "Message sent", r.warning !== null); await sync(); }
+    else if (r.kind === "draft") { showToast("Draft saved to Drafts"); await sync(); }
+  }
+  function onLinkEvent(l: LinkInfo | { error: string; original: string }) {
+    if ("error" in l) { showToast(`Blocked link: ${l.error}`, true); return; }
+    if (l.mailto) {
+      compose = { ...emptyDraft(), to: l.mailto.to, cc: l.mailto.cc, bcc: l.mailto.bcc, subject: l.mailto.subject, body: l.mailto.body };
+      return;
+    }
+    link = l;
+  }
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -93,7 +123,9 @@
         info = await api.appInfo();
         accounts = await api.listAccounts();
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
-        unlisten = await api.onSync(async (e) => {
+        const u1 = await api.onLink(onLinkEvent);
+        const u2 = await api.onHover((u) => (hoverUrl = u));
+        const u3 = await api.onSync(async (e) => {
           if (e.account_id !== account?.id) return;
           if (e.error) { status = `Background sync: ${e.error}`; return; }
           if (e.report && e.report.new_messages + e.report.removed_messages > 0) {
@@ -101,6 +133,7 @@
             await refreshFolders(); await refreshMessages();
           }
         });
+        unlisten = () => { u1(); u2(); u3(); };
       } catch (e) { status = errorText(e); }
     })();
     return () => unlisten?.();
@@ -120,7 +153,7 @@
   <div class="shell">
     <aside class="sidebar">
       <div class="brand"><span class="logo">N</span> Neutron Mail</div>
-      <button class="btn primary compose" onclick={() => (compose = { to: "", subject: "", body: "" })}>
+      <button class="btn primary compose" onclick={() => (compose = emptyDraft())}>
         <Icon name="compose" /> Compose
       </button>
       <nav aria-label="Folders">
@@ -179,11 +212,20 @@
       </ul>
     </section>
 
-    <section class="reader"><Viewer message={detail} onReply={reply} /></section>
+    <section class="reader">
+      <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
+        onReload={reload} onStatus={(t) => showToast(t)} onComposerDone={composerDone} />
+    </section>
   </div>
   {#if compose}
-    <Compose account={account} initialTo={compose.to} initialSubject={compose.subject} initialBody={compose.body}
-      onClose={(sent) => { compose = null; if (sent) { status = "Message sent"; void sync(); } }} />
+    <Compose {account} draft={compose} onClose={(r) => { compose = null; void composerDone(r); }} />
+  {/if}
+  {#if link}
+    <LinkDialog {link} onClose={(u) => { link = null; if (u) showToast(`Opened ${new URL(u).host} in your browser`); }} />
+  {/if}
+  {#if toast}
+    <div class="toast" class:warn={toast.warn} role="status">{toast.text}
+      <button class="icon-btn" aria-label="Dismiss" onclick={() => (toast = null)}><Icon name="close" size={14} /></button></div>
   {/if}
 {/if}
 
@@ -229,4 +271,8 @@
   mark { background: var(--accent-soft); color: var(--unread); border-radius: 3px; }
   .empty { padding: 24px; text-align: center; }
   .reader { background: var(--panel); min-width: 0; min-height: 0; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 60; display: flex; gap: 8px; align-items: center;
+    background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 10px;
+    padding: 8px 8px 8px 14px; box-shadow: 0 10px 30px #0005; max-width: 70vw; font-size: 13px; }
+  .toast.warn { border-left-color: #f5b14c; }
 </style>
