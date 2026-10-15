@@ -573,6 +573,30 @@ impl Store {
         Ok(())
     }
 
+    /// Highest cached UID in a folder (None if empty).
+    pub fn max_uid(&self, folder_id: i64) -> Result<Option<u32>> {
+        Ok(self.db().query_row(
+            "SELECT max(uid) FROM messages WHERE folder_id = ?1",
+            [folder_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Unread messages with a UID above `uid`, newest first.
+    pub fn unseen_after(
+        &self,
+        folder_id: i64,
+        uid: u32,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!(
+            "SELECT {SUMMARY_COLS} FROM messages m WHERE m.folder_id = ?1 AND m.uid > ?2 AND m.seen = 0 ORDER BY m.uid DESC LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![folder_id, uid, limit], summary_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ---- messages -------------------------------------------------------
 
     pub fn uids(&self, folder_id: i64) -> Result<Vec<u32>> {

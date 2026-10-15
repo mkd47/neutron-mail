@@ -54,6 +54,13 @@
   }
   let compose = $state<ComposeDraft | null>(null);
   let agendaKey = $state(0);
+  // Unread badge (window title + dock): unread mail in the inbox.
+  const inboxUnread = $derived(folders.find((f) => f.role === "inbox")?.unread ?? 0);
+  let lastBadge = -1;
+  $effect(() => {
+    const n = inboxUnread;
+    if (n !== lastBadge) { lastBadge = n; api.setUnreadBadge(n).catch(() => {}); }
+  });
 
   const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", trash: "trash", archive: "archive", junk: "junk", flagged: "star" };
   const roleOrder = ["inbox", "flagged", "drafts", "sent", "archive", "junk", "trash"];

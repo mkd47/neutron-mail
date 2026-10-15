@@ -569,6 +569,62 @@ impl EdsCalendar {
     }
 }
 
+/// Escape text for the notification body (GNOME Shell interprets a small
+/// markup subset).
+pub fn notification_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(300)
+        .collect::<String>()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Show a desktop notification via `org.freedesktop.Notifications`
+/// (GNOME Shell). `replaces` lets one bubble be updated instead of stacking.
+pub async fn notify(summary: &str, body: &str, replaces: u32) -> Result<u32> {
+    let conn = timed(zbus::Connection::session()).await?;
+    let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    hints.insert("desktop-entry", zbus::zvariant::Value::from("neutron-mail"));
+    hints.insert("category", zbus::zvariant::Value::from("email.arrived"));
+    let reply = timed(conn.call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &(
+            "Neutron Mail",
+            replaces,
+            "mail-unread",
+            notification_escape(summary),
+            notification_escape(body),
+            Vec::<&str>::new(),
+            hints,
+            -1i32,
+        ),
+    ))
+    .await?;
+    reply.body().deserialize::<u32>().map_err(dbus_err)
+}
+
+/// Unread count on the dock icon via the `com.canonical.Unity.LauncherEntry`
+/// signal (shown by Dash to Dock / Ubuntu Dock; plain GNOME Shell ignores it).
+pub async fn launcher_badge(desktop_file: &str, count: i64) -> Result<()> {
+    let conn = timed(zbus::Connection::session()).await?;
+    let mut props: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    props.insert("count", zbus::zvariant::Value::from(count.max(0)));
+    props.insert("count-visible", zbus::zvariant::Value::from(count > 0));
+    timed(conn.emit_signal(
+        None::<&str>,
+        "/dev/neutronmail/NeutronMail",
+        "com.canonical.Unity.LauncherEntry",
+        "Update",
+        &(format!("application://{desktop_file}"), props),
+    ))
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +640,15 @@ mod tests {
         );
         let n_only = parse_vcard("BEGIN:VCARD\nN:Doe;Jane\nEMAIL:j@d.test\nEND:VCARD");
         assert_eq!(n_only.name, "Jane Doe");
+    }
+
+    #[test]
+    fn notification_text_is_escaped() {
+        assert_eq!(
+            notification_escape("<b>Hi</b> & \u{7}bye"),
+            "&lt;b&gt;Hi&lt;/b&gt; &amp; bye"
+        );
+        assert_eq!(notification_escape(&"x".repeat(500)).len(), 300);
     }
 
     #[test]

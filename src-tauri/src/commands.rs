@@ -443,3 +443,23 @@ pub fn sanitize_compose_html(html: String) -> Res<String> {
     }
     Ok(neutron_core::sanitize::sanitize_compose_html(&html))
 }
+
+/// Unread badge: the window title shows the count, and the dock icon gets
+/// it through the Unity LauncherEntry signal where supported.
+#[tauri::command]
+pub async fn set_unread_badge(app: AppHandle, count: i64) -> Res<()> {
+    use tauri::Manager;
+    let count = count.clamp(0, 1_000_000);
+    if let Some(w) = app.get_webview_window("main") {
+        let title = if count > 0 {
+            format!("Neutron Mail ({count})")
+        } else {
+            "Neutron Mail".to_string()
+        };
+        let _ = w.set_title(&title);
+    }
+    if let Err(e) = neutron_core::gnome::launcher_badge("neutron-mail.desktop", count).await {
+        tracing::debug!("launcher badge not sent: {e}");
+    }
+    Ok(())
+}

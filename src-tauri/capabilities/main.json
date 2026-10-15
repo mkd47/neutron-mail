@@ -36,6 +36,7 @@
     "allow-sanitize-compose-html",
     "allow-contacts-status",
     "allow-upcoming-events",
+    "allow-set-unread-badge",
     "allow-get-invite",
     "allow-respond-invite",
     {

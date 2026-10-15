@@ -103,6 +103,7 @@ export const api = {
     invoke<{ status: "opened" | "needs_confirmation"; reason: string | null }>("open_attachment", { messageId, index, confirmed }),
   suggestContacts: (accountId: number, query: string) => invoke<ContactSuggestion[]>("suggest_contacts", { accountId, query }),
   sanitizeComposeHtml: (html: string) => invoke<string>("sanitize_compose_html", { html }),
+  setUnreadBadge: (count: number) => invoke<void>("set_unread_badge", { count }),
   contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>

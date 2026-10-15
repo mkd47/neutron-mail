@@ -56,19 +56,89 @@ fn emit(app: &AppHandle, ev: SyncEvent) {
     }
 }
 
+/// INBOX folder id and its highest cached UID before a sync.
+fn inbox_mark(state: &AppState, account_id: i64) -> Option<(i64, u32)> {
+    let f = state.store.folder_by_role(account_id, "inbox").ok()??;
+    Some((f.id, state.store.max_uid(f.id).ok()??))
+}
+
+/// Notify about unread mail that arrived in INBOX during this sync. Not
+/// on the very first sync of an account (empty cache), and not while the
+/// window has focus.
+async fn notify_new(
+    app: &AppHandle,
+    state: &AppState,
+    before: Option<(i64, u32)>,
+    last_id: &mut u32,
+) {
+    let Some((folder_id, max_uid)) = before else {
+        return;
+    };
+    let focused = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+    if focused {
+        return;
+    }
+    let Ok(new) = state.store.unseen_after(folder_id, max_uid, 50) else {
+        return;
+    };
+    let Some(first) = new.first() else { return };
+    let from = if first.from_name.is_empty() {
+        &first.from_addr
+    } else {
+        &first.from_name
+    };
+    let (summary, body) = if new.len() == 1 {
+        (from.to_string(), first.subject.clone())
+    } else {
+        (
+            format!("{} new messages", new.len()),
+            new.iter()
+                .take(3)
+                .map(|m| {
+                    format!(
+                        "{}: {}",
+                        if m.from_name.is_empty() {
+                            &m.from_addr
+                        } else {
+                            &m.from_name
+                        },
+                        m.subject
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    match neutron_core::gnome::notify(&summary, &body, *last_id).await {
+        Ok(id) => {
+            *last_id = id;
+            tracing::info!(count = new.len(), "new-mail notification shown");
+        }
+        Err(e) => tracing::info!("desktop notification failed: {e}"),
+    }
+}
+
 async fn watch(app: AppHandle, account_id: i64) {
+    let mut last_notification = 0u32;
     loop {
         let state = app.state::<AppState>();
+        let before = inbox_mark(&state, account_id);
         // 1. Sync, report to the UI.
         match run_sync(&state, account_id).await {
-            Ok(report) => emit(
-                &app,
-                SyncEvent {
-                    account_id,
-                    report: Some(report),
-                    error: None,
-                },
-            ),
+            Ok(report) => {
+                notify_new(&app, &state, before, &mut last_notification).await;
+                emit(
+                    &app,
+                    SyncEvent {
+                        account_id,
+                        report: Some(report),
+                        error: None,
+                    },
+                )
+            }
             Err(e) => {
                 tracing::warn!(account = account_id, "background sync failed: {e}");
                 emit(

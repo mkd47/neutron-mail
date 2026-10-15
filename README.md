@@ -35,6 +35,8 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 - **Fast incremental sync:** UIDNEXT/EXISTS bookkeeping and CONDSTORE (`CHANGEDSINCE`) where the server has it,
   with a full-diff fallback; expunges handled; no cap on the number of messages (paged download and list);
   every IMAP command has a timeout. 5,000 messages: first sync ≈1.3 s, a no-change resync ≈10 ms (local Dovecot, debug build).
+- **Unread badge** (window title, and the dock icon where the dock supports the Unity LauncherEntry API) and
+  **desktop notifications** for new mail in the inbox while the window is in the background.
 - **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
 
 - **GNOME Calendar** (evolution-data-server over D-Bus): a read-only **agenda strip** with the next 7 days from all
@@ -61,6 +63,10 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 | Invitation card (iMIP) | Accepted: reply sent, added to GNOME Calendar | Agenda strip (EDS) |
 |---|---|---|
 | ![](docs/screenshots/invite-card.png) | ![](docs/screenshots/invite-accepted.png) | ![](docs/screenshots/agenda-strip.png) |
+
+| Dark mode: invitation + agenda | Dark mode: 2,800-message folder | New-mail notification + unread count in the title |
+|---|---|---|
+| ![](docs/screenshots/dark-invite-agenda.png) | ![](docs/screenshots/dark-large-folder.png) | ![](docs/screenshots/notification-and-badge.png) |
 
 | Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
 |---|---|---|

@@ -32,6 +32,7 @@ fn main() {
             "contacts_status",
             "sanitize_compose_html",
             "upcoming_events",
+            "set_unread_badge",
             "get_invite",
             "respond_invite",
         ]),

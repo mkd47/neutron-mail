@@ -167,6 +167,7 @@ pub fn run() {
             contacts::contacts_status,
             commands::sanitize_compose_html,
             calendar::upcoming_events,
+            commands::set_unread_badge,
             calendar::get_invite,
             calendar::respond_invite,
         ])
