@@ -85,7 +85,7 @@ jobs:
           exe="$app/Contents/MacOS/neutron-mail"
           lipo "$exe" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$app"
-          if otool -L "$exe" | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)|/Users/runner'; then
+          if otool -L "$exe" | grep '^[[:space:]]' | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)|/Users/runner'; then
             echo 'Unexpected build-machine runtime dependency'
             exit 1
           fi
@@ -117,6 +117,14 @@ jobs:
           grep 'mail cache: encrypted' "$RUNNER_TEMP/mac-handoff/launch.log"
       - name: Confirm original checkout untouched
         run: git diff --exit-code
+      - name: Preserve compiled DMG if a later packaging check fails
+        if: ${{ !cancelled() && env.HANDOFF_READY != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutron-mail-macOS-diagnostic-dmg
+          path: ${{ env.MAC_SOURCE }}/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && env.HANDOFF_READY == '1' }}
         with:
