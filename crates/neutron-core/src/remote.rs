@@ -173,13 +173,18 @@ impl DownloadBudget {
     }
 
     fn charge(&self, bytes: usize) -> bool {
-        let previous = self
-            .remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining.saturating_sub(bytes))
-            })
-            .expect("budget update always succeeds");
-        bytes <= previous
+        let mut previous = self.remaining.load(Ordering::Relaxed);
+        loop {
+            match self.remaining.compare_exchange_weak(
+                previous,
+                previous.saturating_sub(bytes),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return bytes <= previous,
+                Err(current) => previous = current,
+            }
+        }
     }
 }
 
@@ -270,37 +275,48 @@ pub async fn fetch_images(urls: &[String], allow_private: bool) -> Result<FetchR
     }
     let c = client(allow_private)?;
     Ok(fetch_images_with_client(
-        &c,
-        urls,
+        c,
+        urls.to_vec(),
         allow_private,
-        &DownloadBudget::new(MAX_TOTAL_BYTES),
+        Arc::new(DownloadBudget::new(MAX_TOTAL_BYTES)),
     )
     .await)
 }
 
 async fn fetch_images_with_client(
-    c: &reqwest::Client,
-    urls: &[String],
+    c: reqwest::Client,
+    urls: Vec<String>,
     allow_private: bool,
-    budget: &DownloadBudget,
+    budget: Arc<DownloadBudget>,
 ) -> FetchReport {
-    let mut seen = HashSet::new();
-    let urls: Vec<_> = urls.iter().filter(|u| seen.insert(u.as_str())).collect();
+    let urls: Vec<_> = {
+        let mut seen = HashSet::new();
+        urls.into_iter()
+            .filter(|u| seen.insert(u.clone()))
+            .collect()
+    };
     let mut report = FetchReport {
         failed: urls.len().saturating_sub(MAX_IMAGES),
         ..FetchReport::default()
     };
+    // Each future owns its URL/client and shares only an Arc budget.
+    // Borrowed iterator items can make the enclosing future fail Send's
+    // higher-ranked lifetime requirements in Tauri async commands.
     let results = stream::iter(urls.into_iter().take(MAX_IMAGES))
-        .map(|u| async move {
-            let result = fetch_one(c, u, allow_private, budget).await;
-            (u, result)
+        .map(move |url| {
+            let c = c.clone();
+            let budget = Arc::clone(&budget);
+            async move {
+                let result = fetch_one(&c, &url, allow_private, &budget).await;
+                (url, result)
+            }
         })
         .buffer_unordered(6);
     futures::pin_mut!(results);
     while let Some((url, result)) = results.next().await {
         match result {
             Ok(data) => {
-                report.images.insert(url.clone(), data);
+                report.images.insert(url, data);
             }
             Err(e) => {
                 tracing::debug!("remote image skipped: {e}");
@@ -353,6 +369,15 @@ mod tests {
         assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
         assert_eq!(sniff_image(b"<svg xmlns="), None);
         assert_eq!(sniff_image(b"<html>"), None);
+    }
+
+    #[test]
+    fn image_fetch_future_is_send() {
+        // Tauri runs get_message as a Send async command. Keep this bound
+        // checked by the core tests even when the desktop crate is absent.
+        fn assert_send<T: Send>(_: T) {}
+        let urls = vec!["https://example.org/image.png".to_string()];
+        assert_send(fetch_images(&urls, false));
     }
 
     #[test]
@@ -432,7 +457,8 @@ mod tests {
         let mut urls = vec![format!("{base}/first.png"); MAX_IMAGES];
         urls.push(format!("{base}/second.png"));
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
-        let report = fetch_images_with_client(&c, &urls, true, &DownloadBudget::new(1024)).await;
+        let report =
+            fetch_images_with_client(c, urls, true, Arc::new(DownloadBudget::new(1024))).await;
         server.abort();
         assert_eq!(report.images.len(), 2);
         assert_eq!(report.failed, 0);
@@ -445,8 +471,8 @@ mod tests {
         let (base, requests, server) = image_server(png_body(64)).await;
         let urls: Vec<_> = (0..20).map(|i| format!("{base}/{i}.png")).collect();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
-        let budget = DownloadBudget::new(128);
-        let report = fetch_images_with_client(&c, &urls, true, &budget).await;
+        let budget = Arc::new(DownloadBudget::new(128));
+        let report = fetch_images_with_client(c, urls.clone(), true, Arc::clone(&budget)).await;
         server.abort();
         assert!(decoded_bytes(&report) <= 128);
         assert!(report.images.len() <= 2);
