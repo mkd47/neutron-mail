@@ -1,10 +1,10 @@
 <script lang="ts">
   // To-do: smart lists, custom lists, quick add, due dates, reminders,
   // priority, subtasks, task notes and linked emails. Local storage.
-  import { onMount } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import { dayAt, dayEnd, dueLabel, errorText, pimApi, taskInput, type EmailLink, type MessageSummary, type Task,
-    type TaskCounts, type TaskList, type TaskView } from "./api";
+    type TaskCounts, type TaskInput, type TaskList, type TaskView } from "./api";
   import { shortDate } from "./format";
 
   let { onOpenEmail, onOpenMessage, onStatus, refreshKey = 0 }: {
@@ -26,25 +26,45 @@
   const view = (s: Sel): TaskView | null =>
     s === "today" ? { kind: "today", day_end: dayEnd() } : s === "upcoming" ? { kind: "upcoming", day_end: dayEnd() }
     : s === "completed" ? { kind: "completed" } : s === "flagged" ? null : { kind: "list", id: s };
+  let destroyed = false;
+  let loadRequest = 0;
+  let selectionRequest = 0;
+  let editVersion = 0;
+  const pending = new Map<number, { input: TaskInput; version: number }>();
+  const savingTasks = new Set<number>();
+  const versions = new Map<number, number>();
+  let saveQueue: Promise<boolean> = Promise.resolve(true);
   async function load() {
+    const request = ++loadRequest, selected = sel, version = editVersion;
+    const v = view(selected);
     try {
-      [lists, counts] = await Promise.all([pimApi.taskLists(), pimApi.taskCounts(dayEnd())]);
-      const v = view(sel);
-      if (v) {
-        tasks = await pimApi.tasks(v); flagged = [];
-        // Today also shows what was finished today, struck through, at the bottom.
-        if (v.kind === "today") {
-          const start = dayEnd() - 86400;
-          const done = (await pimApi.tasks({ kind: "completed" })).filter((t) => (t.completed ?? 0) >= start);
-          tasks = [...tasks, ...done];
-        }
-      } else { flagged = await pimApi.flaggedEmails(); tasks = await pimApi.tasks({ kind: "from_email" }); }
-      if (current) current = tasks.find((t) => t.id === current!.id) ?? (await pimApi.tasks({ kind: "completed" })).find((t) => t.id === current!.id) ?? null;
-    } catch (e) { onStatus(errorText(e), true); }
+      const [nextLists, nextCounts, nextTasks, nextFlagged, completed] = await Promise.all([
+        pimApi.taskLists(), pimApi.taskCounts(dayEnd()),
+        pimApi.tasks(v ?? { kind: "from_email" }),
+        v ? Promise.resolve([] as MessageSummary[]) : pimApi.flaggedEmails(),
+        v?.kind === "today" ? pimApi.tasks({ kind: "completed" }) : Promise.resolve([] as Task[]),
+      ]);
+      if (destroyed || request !== loadRequest || selected !== sel) return;
+      const start = dayEnd(-1);
+      lists = nextLists; counts = nextCounts; flagged = nextFlagged;
+      tasks = v?.kind === "today" ? [...nextTasks, ...completed.filter((t) => (t.completed ?? 0) >= start)] : nextTasks;
+      // List refreshes must not erase unsaved edits or a save still in flight.
+      if (current && version === editVersion && !pending.has(current.id) && !savingTasks.has(current.id))
+        current = tasks.find((t) => t.id === current!.id) ?? null;
+    } catch (e) { if (!destroyed && request === loadRequest) onStatus(errorText(e), true); }
   }
-  onMount(load);
-  $effect(() => { void refreshKey; void load(); });
-  async function pick(s: Sel) { sel = s; current = null; await load(); }
+  $effect(() => { void refreshKey; untrack(() => { void load(); }); });
+  onDestroy(() => { destroyed = true; loadRequest++; void save(); });
+  async function pick(s: Sel) {
+    const request = ++selectionRequest;
+    if (!await saveAll() || destroyed || request !== selectionRequest) return;
+    sel = s; current = null; await load();
+  }
+  function selectTask(t: Task | null) {
+    selectionRequest++;
+    void save();
+    current = t; confirmDelete = false;
+  }
 
   const title = $derived(sel === "today" ? "Today" : sel === "upcoming" ? "Upcoming" : sel === "flagged" ? "Flagged emails" : sel === "completed" ? "Completed" : lists.find((l) => l.id === sel)?.name ?? "List");
   const listName = (id: number | null) => lists.find((l) => l.id === id)?.name ?? "";
@@ -66,27 +86,59 @@
     } catch (e) { onStatus(errorText(e), true); }
   }
   async function toggle(t: Task) {
+    if (!await saveAll()) return;
     try { const r = await pimApi.setTaskCompleted(t.id, t.completed === null); if (current?.id === t.id) current = r; await load(); }
     catch (e) { onStatus(errorText(e), true); }
   }
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  function edit(delay = 500) { clearTimeout(saveTimer); saveTimer = setTimeout(() => void save(), delay); }
-  async function save() {
-    if (!current || !current.title.trim()) return;
-    try { current = await pimApi.saveTask(taskInput(current)); await load(); } catch (e) { onStatus(errorText(e), true); }
+  function edit(delay = 500) {
+    if (!current) return;
+    const version = ++editVersion;
+    versions.set(current.id, version);
+    // Capture the edited task now, before another task becomes current.
+    pending.set(current.id, { input: { ...taskInput(current) }, version });
+    clearTimeout(saveTimer); saveTimer = setTimeout(() => void save(), delay);
+  }
+  function save(): Promise<boolean> {
+    clearTimeout(saveTimer);
+    const edits = [...pending.entries()].filter(([, value]) => value.input.title.trim());
+    if (!edits.length) return saveQueue;
+    for (const [id] of edits) { pending.delete(id); savingTasks.add(id); }
+    saveQueue = saveQueue.then(async () => {
+      let ok = true;
+      for (const [id, { input, version }] of edits) {
+        try {
+          const result = await pimApi.saveTask(input);
+          if (!destroyed && current?.id === id && versions.get(id) === version) current = result;
+        } catch (e) {
+          if (versions.get(id) === version && !pending.has(id)) pending.set(id, { input, version });
+          onStatus(errorText(e), true); ok = false;
+        } finally { if (versions.get(id) === version) savingTasks.delete(id); }
+      }
+      if (!destroyed) await load();
+      return ok;
+    });
+    return saveQueue;
+  }
+  async function saveAll() {
+    do { if (!await save()) return false; } while ([...pending.values()].some(({ input }) => input.title.trim()));
+    return true;
   }
   async function addSub() {
     if (!current || !subInput.trim()) return;
+    if (!await saveAll() || !current) return;
     try {
       await pimApi.saveTask({ id: null, list_id: current.list_id, parent_id: current.id, title: subInput, notes: "", due: null, due_time: false, reminder: null, priority: 0, email: null });
       subInput = ""; await load();
     } catch (e) { onStatus(errorText(e), true); }
   }
-  async function toggleSub(s: Task) { try { await pimApi.setTaskCompleted(s.id, s.completed === null); await load(); } catch (e) { onStatus(errorText(e), true); } }
-  async function removeSub(s: Task) { try { await pimApi.deleteTask(s.id); await load(); } catch (e) { onStatus(errorText(e), true); } }
+  async function toggleSub(s: Task) { if (!await saveAll()) return; try { await pimApi.setTaskCompleted(s.id, s.completed === null); await load(); } catch (e) { onStatus(errorText(e), true); } }
+  async function removeSub(s: Task) { if (!await saveAll()) return; try { await pimApi.deleteTask(s.id); await load(); } catch (e) { onStatus(errorText(e), true); } }
   async function remove() {
     if (!current) return;
-    try { await pimApi.deleteTask(current.id); current = null; confirmDelete = false; await load(); } catch (e) { onStatus(errorText(e), true); }
+    if (!await saveAll() || !current) return;
+    const id = current.id;
+    try { await pimApi.deleteTask(id); if (current?.id === id) current = null; confirmDelete = false; await load(); } catch (e) { onStatus(errorText(e), true); }
   }
   async function addList() {
     const n = newList?.trim(); newList = null; if (!n) return;
@@ -155,7 +207,7 @@
       {#each tasks as t (t.id)}
         <li>
           <div class="task" class:done={t.completed !== null} class:selected={current?.id === t.id} role="button" tabindex="0"
-            onclick={() => { current = t; confirmDelete = false; }} onkeydown={(e) => { if (e.key === "Enter") current = t; }}>
+            onclick={() => selectTask(t)} onkeydown={(e) => { if (e.key === "Enter") selectTask(t); }}>
             <button class="check" class:on={t.completed !== null} aria-label={t.completed ? "Mark as not done" : "Mark as done"} onclick={(e) => { e.stopPropagation(); void toggle(t); }}>
               {#if t.completed}<Icon name="check" size={13} />{/if}</button>
             {#if t.email}<span class="env" title="Created from email"><Icon name="mail" size={15} /></span>{/if}
@@ -189,7 +241,7 @@
       <div class="phead">
         <button class="check big" class:on={c.completed !== null} aria-label="Toggle done" onclick={() => toggle(c)}>{#if c.completed}<Icon name="check" size={15} />{/if}</button>
         <textarea class="ptitle" bind:value={c.title} oninput={() => edit()} rows="2" maxlength="300" aria-label="Title"></textarea>
-        <button class="icon-btn" aria-label="Close details" onclick={() => (current = null)}><Icon name="close" size={16} /></button>
+        <button class="icon-btn" aria-label="Close details" onclick={() => selectTask(null)}><Icon name="close" size={16} /></button>
       </div>
       {#if c.email}<div class="from"><Icon name="mail" size={14} /> Created from email</div>{/if}
       <label class="field"><span><Icon name="calendar" size={15} /> Due</span>

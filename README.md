@@ -56,7 +56,7 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   or `UTF8=ACCEPT` where the server offers it). Right-click a folder for the menu.
 - **Moving and copying mail:** drag one or many messages onto a folder (the target is highlighted; hold **Ctrl**
   to copy), Ctrl/Shift-click for multi-select, **Move to… / Copy to…** pickers (**V** / **Shift+V**), and **Undo**
-  (toast button or **Ctrl+Z**). Uses IMAP `MOVE`, falling back to `COPY` + `\Deleted` + `UID EXPUNGE`; the local cache is
+  (toast button or **Ctrl+Z**). Uses IMAP `MOVE`, falling back to `COPY` + `\Deleted` + `UID EXPUNGE` (requires UIDPLUS; unsupported servers are rejected safely); the local cache is
   updated at once.
 - **Rules** (filter icon in the sidebar): ordered rules with conditions on From/To/Cc/Subject/Body/any header/size/
   attachments/account (contains, equals, starts with, regex; all or any) and actions move, copy, mark read, star,
@@ -231,6 +231,7 @@ Set `NEUTRON_LOG=debug` for verbose logs (they never contain passwords or messag
 ```bash
 cargo test --workspace                          # unit + offline tests (network tests auto-skip)
 cargo clippy --workspace --all-targets -- -D warnings
+npm test                                      # frontend async/race regressions
 npm run check && npm run build                  # svelte-check (warnings fail) + Vite build
 
 # Integration tests against a local mail server (all bound to 127.0.0.1)

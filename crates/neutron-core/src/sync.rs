@@ -10,7 +10,9 @@
 //!   nothing at all when HIGHESTMODSEQ is unchanged; without CONDSTORE all
 //!   flags are refetched (the old behaviour).
 //! - First sync, a changed sync window or a cache from before v0.4: one
-//!   full pass (UID SEARCH ALL/SINCE, diff with the cache).
+//!   full pass (UID SEARCH ALL/SINCE, diff with the cache). Windowed folders
+//!   also reconcile once per day using the server's INTERNALDATE, never the
+//!   sender's Date header.
 //!
 //! New messages are downloaded newest first in pages, each page inserted
 //! in one transaction, with no upper limit.
@@ -29,22 +31,22 @@ pub const PAGE_SIZE: usize = 500;
 /// How a folder was synced (for tests and logging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
-    /// No usable previous state: full UID diff.
+    /// No usable previous baseline: full UID diff.
     Full,
-    /// Incremental from the stored UIDNEXT/EXISTS.
+    /// Existing baseline; a daily window reconciliation may still be needed.
     Incremental,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderSyncStats {
-    /// UIDs downloaded in this pass (for rules on new mail).
+    /// New-arrival UIDs downloaded in this pass (for rules on new mail).
     pub new_uids: Vec<u32>,
     pub mode: SyncMode,
     pub new: usize,
     pub removed: usize,
     /// Number of flag updates the server sent.
     pub flag_updates: usize,
-    /// Whether a full `UID SEARCH ALL` was needed (first sync or expunge).
+    /// Whether a full mailbox/window UID search was needed.
     pub full_uid_search: bool,
     pub condstore: bool,
 }
@@ -175,7 +177,12 @@ pub async fn sync_folder_detailed(
     days: u32,
     condstore: bool,
 ) -> Result<FolderSyncStats> {
-    let since = (days > 0).then(|| chrono::Utc::now().timestamp() - i64::from(days) * 86_400);
+    // SEARCH SINCE uses calendar dates. Persist the same UTC day that
+    // imap::uids_since formats, so the boundary advances only once per day.
+    let since = (days > 0).then(|| {
+        let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+        cutoff.div_euclid(86_400) * 86_400
+    });
     let state = imap::select_state(session, name, condstore).await?;
     let reset = store.set_uidvalidity(folder_id, state.uidvalidity)?;
     let prev = if reset {
@@ -198,15 +205,11 @@ pub async fn sync_folder_detailed(
         full_uid_search: false,
         condstore: state.highestmodseq.is_some(),
     };
-    if let Some(t) = since {
-        // A day of slack: SEARCH SINCE uses the server's date (no time zone).
-        stats.removed += store.prune_before(folder_id, t - 86_400)?;
-    }
     let local: HashSet<u32> = store.uids(folder_id)?.into_iter().collect();
 
     let (gone, to_fetch, flags_since, max_uid): (Vec<u32>, Vec<u32>, Option<Option<u64>>, u32) =
         match prev {
-            Some(p) => {
+            Some(p) if p.window_cutoff == since => {
                 let unchanged = state.uidnext == Some(p.uidnext) && state.exists == p.exists;
                 let new_all = if unchanged || state.exists == 0 {
                     HashSet::new()
@@ -235,20 +238,21 @@ pub async fn sync_folder_detailed(
                 };
                 (gone, to_fetch, flags, 0)
             }
-            None => {
+            _ => {
                 stats.full_uid_search = true;
-                let all = imap::all_uids(session, state.exists).await?;
-                let gone = local.difference(&all).copied().collect();
                 let wanted = match since {
-                    Some(t) if !all.is_empty() => imap::uids_since(session, t).await?,
-                    _ => all.clone(),
+                    Some(t) if state.exists > 0 => imap::uids_since(session, t).await?,
+                    _ => imap::all_uids(session, state.exists).await?,
                 };
+                // The server's INTERNALDATE decides which messages belong
+                // in the cache. Date headers may be old, absent or forged.
+                let gone = local.difference(&wanted).copied().collect();
                 let to_fetch = wanted.difference(&local).copied().collect();
                 (
                     gone,
                     to_fetch,
                     Some(None),
-                    all.iter().copied().max().unwrap_or(0),
+                    wanted.iter().copied().max().unwrap_or(0),
                 )
             }
         };
@@ -278,7 +282,14 @@ pub async fn sync_folder_detailed(
             .collect();
         store.insert_messages(folder_id, &batch)?;
         stats.new += batch.len();
-        stats.new_uids.extend(batch.iter().map(|m| m.uid));
+        // A daily/legacy window reconciliation can recover older cached
+        // mail. Only genuinely new UIDs should trigger automatic rules.
+        stats.new_uids.extend(
+            batch
+                .iter()
+                .map(|m| m.uid)
+                .filter(|uid| prev.is_none_or(|p| *uid >= p.uidnext)),
+        );
     }
 
     // Only record state after everything above succeeded, so an interrupted
@@ -291,6 +302,7 @@ pub async fn sync_folder_detailed(
             highestmodseq: state.highestmodseq,
             exists: state.exists,
             window_days: days,
+            window_cutoff: since,
         }),
     )?;
     Ok(stats)

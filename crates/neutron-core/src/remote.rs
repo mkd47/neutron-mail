@@ -12,13 +12,20 @@
 //!   the local network (SSRF). Tests can lift this with
 //!   `NEUTRON_ALLOW_PRIVATE_IMAGE_HOSTS=1` (debug builds only).
 //! * Content must be PNG, JPEG, GIF or WebP by magic bytes (never SVG/HTML),
-//!   max 5 MB per image, 25 MB and 40 images per message.
+//!   max 5 MB per image, 25 MB admitted response bodies and 40 distinct
+//!   images per message, including bodies discarded after validation fails.
+//! * Environment HTTP(S)/ALL proxies fail closed for images: a proxy can
+//!   resolve target names itself, bypassing the public-only DNS resolver.
+//!   We never silently route around a configured privacy proxy. VPN tunnel
+//!   routing is unaffected. NO_PROXY exclusions are intentionally not used.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::{stream, StreamExt};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::Url;
@@ -111,6 +118,10 @@ fn url_allowed(u: &Url, allow_private: bool) -> bool {
 
 fn client(allow_private: bool) -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        // The caller refuses configured environment proxies first. Disable
+        // automatic proxy discovery as well so all target DNS goes through
+        // our resolver, including redirects.
+        .no_proxy()
         .dns_resolver(Arc::new(PublicOnlyResolver { allow_private }))
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3 {
@@ -144,7 +155,58 @@ pub fn sniff_image(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-async fn fetch_one(c: &reqwest::Client, url: &str, allow_private: bool) -> Result<String> {
+/// Shared across every in-flight response. Failed/invalid images consume
+/// the budget too, so retrying another URL cannot repeatedly reuse it.
+struct DownloadBudget {
+    remaining: AtomicUsize,
+}
+
+impl DownloadBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(bytes),
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining.load(Ordering::Relaxed) == 0
+    }
+
+    fn charge(&self, bytes: usize) -> bool {
+        let previous = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(bytes))
+            })
+            .expect("budget update always succeeds");
+        bytes <= previous
+    }
+}
+
+const PROXY_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+fn proxy_configured<'a>(settings: impl IntoIterator<Item = (&'a str, &'a str)>) -> bool {
+    settings
+        .into_iter()
+        .any(|(name, value)| PROXY_ENV.contains(&name) && !value.trim().is_empty())
+}
+
+async fn fetch_one(
+    c: &reqwest::Client,
+    url: &str,
+    allow_private: bool,
+    budget: &DownloadBudget,
+) -> Result<String> {
+    if budget.exhausted() {
+        return Err(Error::Invalid("message image budget exhausted".into()));
+    }
     let u = Url::parse(url).map_err(|_| Error::Invalid("bad image URL".into()))?;
     if !url_allowed(&u, allow_private) {
         return Err(Error::Invalid("image host not allowed".into()));
@@ -153,7 +215,7 @@ async fn fetch_one(c: &reqwest::Client, url: &str, allow_private: bool) -> Resul
         .get(u)
         .send()
         .await
-        .map_err(|e| Error::Invalid(format!("image fetch failed: {e}")))?;
+        .map_err(|e| Error::Invalid(format!("image fetch failed: {}", e.without_url())))?;
     if !resp.status().is_success() {
         return Err(Error::Invalid(format!(
             "image fetch: HTTP {}",
@@ -170,53 +232,83 @@ async fn fetch_one(c: &reqwest::Client, url: &str, allow_private: bool) -> Resul
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| Error::Invalid(format!("image read failed: {e}")))?
+        .map_err(|e| Error::Invalid(format!("image read failed: {}", e.without_url())))?
     {
-        data.extend_from_slice(&chunk);
-        if data.len() > MAX_IMAGE_BYTES {
+        // Check before retaining bytes, not after collecting all images.
+        // Transport buffers and one final in-flight chunk can still contain
+        // extra bytes, but they are never appended or base64 encoded.
+        if !budget.charge(chunk.len()) {
+            return Err(Error::Invalid("message image budget exhausted".into()));
+        }
+        if chunk.len() > MAX_IMAGE_BYTES.saturating_sub(data.len()) {
             return Err(Error::Invalid("image too large".into()));
         }
+        data.extend_from_slice(&chunk);
     }
     let mime = sniff_image(&data).ok_or_else(|| Error::Invalid("not a raster image".into()))?;
-    Ok(format!(
-        "data:{mime};base64,{}",
-        crate::parse::base64(&data)
-    ))
+    // Encode directly into the final string instead of retaining a second
+    // full base64 copy while format! builds the data URL.
+    let mut encoded = format!("data:{mime};base64,");
+    base64::engine::general_purpose::STANDARD.encode_string(&data, &mut encoded);
+    Ok(encoded)
 }
 
-/// Fetch the given remote image URLs (deduplicated, at most
-/// [`MAX_IMAGES`]) with up to 6 in parallel.
+/// Fetch distinct remote image URLs, at most [`MAX_IMAGES`], with up to
+/// 6 in parallel and one shared response-body budget. HTTP proxy settings
+/// cause all images to remain blocked; NO_PROXY does not override this.
 pub async fn fetch_images(urls: &[String], allow_private: bool) -> Result<FetchReport> {
+    let settings: Vec<_> = PROXY_ENV
+        .iter()
+        .filter_map(|&name| std::env::var(name).ok().map(|value| (name, value)))
+        .collect();
+    if proxy_configured(settings.iter().map(|(name, value)| (*name, value.as_str()))) {
+        tracing::debug!("remote images blocked: configured HTTP proxy cannot enforce public-only destination DNS");
+        return Ok(FetchReport {
+            images: HashMap::new(),
+            failed: urls.iter().collect::<HashSet<_>>().len(),
+        });
+    }
     let c = client(allow_private)?;
-    let results: Vec<(String, Result<String>)> =
-        stream::iter(urls.iter().take(MAX_IMAGES).cloned())
-            .map(|u| {
-                let c = c.clone();
-                async move {
-                    let r = fetch_one(&c, &u, allow_private).await;
-                    (u, r)
-                }
-            })
-            .buffer_unordered(6)
-            .collect()
-            .await;
-    let mut report = FetchReport::default();
-    let mut total = 0usize;
-    for (u, r) in results {
-        match r {
-            Ok(data) if total + data.len() <= MAX_TOTAL_BYTES * 4 / 3 + 1024 => {
-                total += data.len();
-                report.images.insert(u, data);
+    Ok(fetch_images_with_client(
+        &c,
+        urls,
+        allow_private,
+        &DownloadBudget::new(MAX_TOTAL_BYTES),
+    )
+    .await)
+}
+
+async fn fetch_images_with_client(
+    c: &reqwest::Client,
+    urls: &[String],
+    allow_private: bool,
+    budget: &DownloadBudget,
+) -> FetchReport {
+    let mut seen = HashSet::new();
+    let urls: Vec<_> = urls.iter().filter(|u| seen.insert(u.as_str())).collect();
+    let mut report = FetchReport {
+        failed: urls.len().saturating_sub(MAX_IMAGES),
+        ..FetchReport::default()
+    };
+    let results = stream::iter(urls.into_iter().take(MAX_IMAGES))
+        .map(|u| async move {
+            let result = fetch_one(c, u, allow_private, budget).await;
+            (u, result)
+        })
+        .buffer_unordered(6);
+    futures::pin_mut!(results);
+    while let Some((url, result)) = results.next().await {
+        match result {
+            Ok(data) => {
+                report.images.insert(url.clone(), data);
             }
-            Ok(_) => report.failed += 1,
             Err(e) => {
                 tracing::debug!("remote image skipped: {e}");
                 report.failed += 1;
             }
         }
     }
-    report.failed += urls.len().saturating_sub(MAX_IMAGES);
-    Ok(report)
+    report
 }
 
 #[cfg(test)]
@@ -261,5 +353,135 @@ mod tests {
         assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
         assert_eq!(sniff_image(b"<svg xmlns="), None);
         assert_eq!(sniff_image(b"<html>"), None);
+    }
+
+    #[test]
+    fn environment_proxies_fail_closed_even_with_no_proxy() {
+        for name in PROXY_ENV {
+            assert!(proxy_configured([(*name, "http://proxy.example:8080")]));
+            assert!(!proxy_configured([(*name, "  ")]));
+        }
+        assert!(proxy_configured([
+            ("HTTPS_PROXY", "http://proxy.example:8080"),
+            ("NO_PROXY", "*"),
+        ]));
+        assert!(!proxy_configured([("NO_PROXY", "*"), ("OTHER", "proxy")]));
+    }
+
+    /// Local-only HTTP server with one transfer-encoding chunk per body.
+    /// No external services or process environment mutation are needed.
+    async fn image_server(
+        body: Vec<u8>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                count.fetch_add(1, Ordering::Relaxed);
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                response.extend_from_slice(b"\r\n0\r\n\r\n");
+                let _ = socket.write_all(&response).await;
+            }
+        });
+        (base, requests, server)
+    }
+
+    fn png_body(bytes: usize) -> Vec<u8> {
+        let mut body = b"\x89PNG\r\n\x1a\n".to_vec();
+        body.resize(bytes, 0);
+        body
+    }
+
+    fn decoded_bytes(report: &FetchReport) -> usize {
+        report
+            .images
+            .values()
+            .map(|data| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(data.split_once(',').unwrap().1)
+                    .unwrap()
+                    .len()
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn duplicate_urls_do_not_repeat_requests_or_use_up_the_image_limit() {
+        let (base, requests, server) = image_server(png_body(64)).await;
+        let mut urls = vec![format!("{base}/first.png"); MAX_IMAGES];
+        urls.push(format!("{base}/second.png"));
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let report = fetch_images_with_client(&c, &urls, true, &DownloadBudget::new(1024)).await;
+        server.abort();
+        assert_eq!(report.images.len(), 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(decoded_bytes(&report), 128);
+    }
+
+    #[tokio::test]
+    async fn concurrent_chunked_images_share_one_download_budget() {
+        let (base, requests, server) = image_server(png_body(64)).await;
+        let urls: Vec<_> = (0..20).map(|i| format!("{base}/{i}.png")).collect();
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let budget = DownloadBudget::new(128);
+        let report = fetch_images_with_client(&c, &urls, true, &budget).await;
+        server.abort();
+        assert!(decoded_bytes(&report) <= 128);
+        assert!(report.images.len() <= 2);
+        assert_eq!(report.images.len() + report.failed, urls.len());
+        assert!(budget.exhausted());
+        assert!(requests.load(Ordering::Relaxed) < urls.len());
+    }
+
+    #[tokio::test]
+    async fn invalid_images_consume_the_budget_and_stop_later_requests() {
+        let (base, requests, server) = image_server(vec![b'x'; 64]).await;
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let budget = DownloadBudget::new(64);
+        let invalid = fetch_one(&c, &format!("{base}/invalid.png"), true, &budget).await;
+        assert!(invalid
+            .unwrap_err()
+            .to_string()
+            .contains("not a raster image"));
+        let skipped = fetch_one(&c, &format!("{base}/next.png"), true, &budget).await;
+        server.abort();
+        assert!(skipped
+            .unwrap_err()
+            .to_string()
+            .contains("budget exhausted"));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn over_budget_chunk_is_rejected_without_returning_an_image() {
+        let (base, _, server) = image_server(png_body(64)).await;
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let budget = DownloadBudget::new(63);
+        let result = fetch_one(&c, &format!("{base}/large.png"), true, &budget).await;
+        server.abort();
+        assert!(result.unwrap_err().to_string().contains("budget exhausted"));
+        assert!(budget.exhausted());
     }
 }

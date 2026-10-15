@@ -275,7 +275,9 @@ pub async fn has_capability(session: &mut Session, cap: &str) -> Result<bool> {
 }
 
 /// Move UIDs between folders: `UID MOVE` (RFC 6851) when available,
-/// otherwise `UID COPY` + `\Deleted` + `UID EXPUNGE` (UIDPLUS) or EXPUNGE.
+/// otherwise `UID COPY` + `\Deleted` + `UID EXPUNGE` (UIDPLUS).
+/// Servers with neither extension are rejected before changing any mail:
+/// plain EXPUNGE would also delete unrelated messages marked by other clients.
 pub async fn move_uids(session: &mut Session, from: &str, uids: &[u32], to: &str) -> Result<()> {
     let have_move = has_capability(session, "MOVE").await?;
     move_uids_with(session, from, uids, to, have_move).await
@@ -292,6 +294,11 @@ pub async fn move_uids_with(
     if uids.is_empty() {
         return Ok(());
     }
+    if !use_move && !has_capability(session, "UIDPLUS").await? {
+        return Err(Error::Invalid(
+            "this server needs MOVE or UIDPLUS to move messages safely".into(),
+        ));
+    }
     cmd(session.select(from)).await?;
     for chunk in uids.chunks(200) {
         let set = uid_set(chunk);
@@ -300,18 +307,14 @@ pub async fn move_uids_with(
         } else {
             cmd(session.uid_copy(&set, to)).await?;
             store_uids(session, chunk, "+FLAGS.SILENT (\\Deleted)").await?;
-            if has_capability(session, "UIDPLUS").await? {
-                cmd(async {
-                    session
-                        .uid_expunge(&set)
-                        .await?
-                        .try_collect::<Vec<_>>()
-                        .await
-                })
-                .await?;
-            } else {
-                cmd(async { session.expunge().await?.try_collect::<Vec<_>>().await }).await?;
-            }
+            cmd(async {
+                session
+                    .uid_expunge(&set)
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            })
+            .await?;
         }
     }
     Ok(())
@@ -546,9 +549,15 @@ pub async fn append_with_flags(
 }
 
 /// Permanently remove one message (used to replace a resumed draft).
-/// Uses UID EXPUNGE when the server has UIDPLUS so other messages already
-/// flagged \Deleted by another client are not expunged as a side effect.
+/// Requires UIDPLUS so messages already flagged \Deleted by another client
+/// cannot be expunged as a side effect. Unsupported servers are rejected
+/// before marking anything deleted.
 pub async fn delete_uid(session: &mut Session, folder: &str, uid: u32) -> Result<()> {
+    if !has_capability(session, "UIDPLUS").await? {
+        return Err(Error::Invalid(
+            "this server needs UIDPLUS to delete a single message safely".into(),
+        ));
+    }
     cmd(session.select(folder)).await?;
     cmd(async {
         session
@@ -558,19 +567,14 @@ pub async fn delete_uid(session: &mut Session, folder: &str, uid: u32) -> Result
             .await
     })
     .await?;
-    let uidplus = cmd(session.capabilities()).await?.has_str("UIDPLUS");
-    if uidplus {
-        cmd(async {
-            session
-                .uid_expunge(uid.to_string())
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
-    } else {
-        cmd(async { session.expunge().await?.try_collect::<Vec<_>>().await }).await?;
-    }
+    cmd(async {
+        session
+            .uid_expunge(uid.to_string())
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await?;
     Ok(())
 }
 

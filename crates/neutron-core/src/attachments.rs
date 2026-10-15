@@ -9,6 +9,8 @@ pub const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Max number of attachments per outgoing message.
 pub const MAX_ATTACHMENTS: usize = 50;
 const MAX_NAME_CHARS: usize = 120;
+// Linux filesystems limit each path component by bytes, not Unicode chars.
+const MAX_NAME_BYTES: usize = 255;
 
 /// Turn an attacker-controlled attachment name into a safe single path
 /// component: strips directories (`/`, `\`), `..`, control and bidi
@@ -37,11 +39,19 @@ pub fn safe_filename(name: &str) -> String {
     {
         out.insert(0, '_');
     }
-    if out.chars().count() > MAX_NAME_CHARS {
-        // Truncate the stem but keep the extension visible.
+    if out.chars().count() > MAX_NAME_CHARS || out.len() > MAX_NAME_BYTES {
+        // Keep both display length and the filesystem byte limit bounded,
+        // without splitting UTF-8 or hiding the extension from the user.
         let ext = extension(&out).map(|e| format!(".{e}")).unwrap_or_default();
-        let keep = MAX_NAME_CHARS.saturating_sub(ext.chars().count());
-        out = out.chars().take(keep).collect::<String>() + &ext;
+        let keep_chars = MAX_NAME_CHARS.saturating_sub(ext.chars().count());
+        let keep_bytes = MAX_NAME_BYTES.saturating_sub(ext.len());
+        out = out
+            .char_indices()
+            .take(keep_chars)
+            .take_while(|(offset, c)| offset + c.len_utf8() <= keep_bytes)
+            .map(|(_, c)| c)
+            .collect::<String>()
+            + &ext;
     }
     out
 }
@@ -195,6 +205,30 @@ mod tests {
         let long = "x".repeat(300) + ".pdf";
         let s = safe_filename(&long);
         assert!(s.ends_with(".pdf") && s.chars().count() == 120);
+    }
+
+    #[test]
+    fn unicode_filenames_fit_the_filesystem_and_keep_extensions() {
+        for (name, ext) in [
+            ("报".repeat(90) + ".pdf", ".pdf"),
+            ("😀".repeat(100) + ".png", ".png"),
+            ("资料".repeat(100) + ".desktop", ".desktop"),
+        ] {
+            let safe = safe_filename(&name);
+            assert!(safe.len() <= MAX_NAME_BYTES);
+            assert!(safe.chars().count() <= MAX_NAME_CHARS);
+            assert!(safe.ends_with(ext));
+            // Exercise the real path component limit as well as the string
+            // policy. tempfile is already a dev dependency of this crate.
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(&safe), b"attachment").unwrap();
+        }
+        assert_eq!(safe_filename("账单.pdf"), "账单.pdf");
+        assert!(is_risky(
+            &("报".repeat(120) + ".desktop"),
+            "text/plain",
+            b""
+        ));
     }
 
     #[test]

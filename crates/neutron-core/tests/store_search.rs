@@ -1,6 +1,6 @@
 //! Offline tests (no server needed): cache, FTS search, UIDVALIDITY.
 use neutron_core::model::{AccountConfig, Security};
-use neutron_core::store::{NewMessage, Store};
+use neutron_core::store::{FolderSyncState, NewMessage, Store};
 
 fn cfg() -> AccountConfig {
     AccountConfig {
@@ -109,21 +109,125 @@ fn uidvalidity_change_resets_folder() {
 }
 
 #[test]
+fn legacy_sync_checkpoint_migrates_and_round_trips_window_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let s = Store::open_plaintext(&path).unwrap();
+    let a = s.add_account(&cfg()).unwrap();
+    let f = s.upsert_folder(a, "INBOX", Some("inbox")).unwrap();
+    let legacy = FolderSyncState {
+        uidnext: 8,
+        highestmodseq: Some(20),
+        exists: 7,
+        window_days: 30,
+        window_cutoff: None,
+    };
+    s.set_folder_sync_state(f, Some(legacy)).unwrap();
+    drop(s);
+    // Reproduce the actual pre-migration schema, not just a NULL field.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("ALTER TABLE folders DROP COLUMN window_cutoff")
+        .unwrap();
+    drop(db);
+    let s = Store::open_plaintext(&path).unwrap();
+    assert_eq!(s.folder_sync_state(f).unwrap(), Some(legacy));
+    let current = FolderSyncState {
+        window_cutoff: Some(1_789_430_400),
+        ..legacy
+    };
+    s.set_folder_sync_state(f, Some(current)).unwrap();
+    assert_eq!(s.folder_sync_state(f).unwrap(), Some(current));
+    s.set_folder_sync_state(f, None).unwrap();
+    assert_eq!(s.folder_sync_state(f).unwrap(), None);
+}
+
+#[test]
 fn duplicate_insert_is_idempotent_and_removal_updates_index() {
     let (s, a, f) = setup();
-    s.insert_message(
-        f,
-        &NewMessage {
-            uid: 1,
-            seen: false,
-            flagged: false,
-            raw: &raw("Invoice 4711", "x@y.z", "dup"),
-        },
-    )
-    .unwrap();
+    let original = s.ids_for_uids(f, &[1]).unwrap()[0];
+    let original_raw = s.raw(original).unwrap();
+    let inserted = s
+        .insert_message(
+            f,
+            &NewMessage {
+                uid: 1,
+                seen: false,
+                flagged: false,
+                raw: &raw("Invoice 4711", "x@y.z", "dup"),
+            },
+        )
+        .unwrap();
+    assert_eq!(inserted, original);
+    assert_eq!(s.raw(original).unwrap(), original_raw);
     assert_eq!(s.messages(f, 0, 50).unwrap().len(), 2);
+    assert_eq!(s.search(a, "billing", 10).unwrap().len(), 1);
+    assert_eq!(s.search(a, "pay", 10).unwrap().len(), 1);
+    assert!(s.search(a, "dup", 10).unwrap().is_empty());
+    assert!(s.address_history(a, "x@y.z", 10).unwrap().is_empty());
     assert_eq!(s.remove_uids(f, &[1]).unwrap(), 1);
     assert!(s.search(a, "invoice", 10).unwrap().is_empty());
+}
+
+#[test]
+fn duplicate_batch_does_not_inflate_address_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let s = Store::open_plaintext(&path).unwrap();
+    let a = s.add_account(&cfg()).unwrap();
+    let f = s.upsert_folder(a, "INBOX", Some("inbox")).unwrap();
+    let raw = raw("Hello", "sender@example.test", "Original body");
+    let message = NewMessage {
+        uid: 1,
+        seen: false,
+        flagged: false,
+        raw: &raw,
+    };
+    s.insert_message(f, &message).unwrap();
+    s.insert_messages(f, &[message]).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let uses: i64 = db
+        .query_row(
+            "SELECT uses FROM addresses WHERE account_id = ?1 AND email = ?2",
+            rusqlite::params![a, "sender@example.test"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(uses, 1);
+}
+
+#[test]
+fn rendering_preserves_details_and_substitutes_only_supplied_images() {
+    let (s, _, f) = setup();
+    let raw = b"From: sender@example.test\r\nTo: me@example.test\r\nSubject: HTML mail\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hello</p><img src=\"https://example.test/image.png\"><script>alert(1)</script>";
+    let id = s
+        .insert_message(
+            f,
+            &NewMessage {
+                uid: 3,
+                seen: false,
+                flagged: true,
+                raw,
+            },
+        )
+        .unwrap();
+    let plain = s.message_detail(id).unwrap();
+    let (blocked, urls) = s.render_message(id, &Default::default()).unwrap();
+    assert_eq!(plain, blocked);
+    assert_eq!(urls, vec!["https://example.test/image.png"]);
+    assert_eq!(blocked.remote_images_blocked, 1);
+    let remote = std::collections::HashMap::from([(
+        urls[0].clone(),
+        "data:image/png;base64,iVBORw0KGgo=".to_string(),
+    )]);
+    let (loaded, _) = s.render_message(id, &remote).unwrap();
+    assert_eq!(loaded.summary.id, id);
+    assert_eq!(loaded.to, plain.to);
+    assert_eq!(loaded.text, plain.text);
+    assert_eq!(loaded.remote_images_blocked, 0);
+    assert_eq!(loaded.remote_images_loaded, 1);
+    let html = loaded.html.unwrap();
+    assert!(html.contains("data:image/png;base64,iVBORw0KGgo="));
+    assert!(!html.contains("<script"));
 }
 
 #[test]

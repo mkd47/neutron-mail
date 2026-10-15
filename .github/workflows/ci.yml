@@ -40,6 +40,8 @@ jobs:
       - run: npm ci
       - name: svelte-check
         run: npm run check
+      - name: Frontend race regressions
+        run: npm test
       - name: Frontend build
         run: npm run build
       - name: rustfmt

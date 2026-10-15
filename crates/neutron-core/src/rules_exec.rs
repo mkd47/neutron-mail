@@ -39,14 +39,28 @@ pub fn resolve_folder<'a>(folders: &'a [Folder], name: &str) -> Option<&'a Folde
         })
 }
 
-/// Rules that run locally for this account (server-side ones are left to
-/// the server when our Sieve script is active there).
+/// Rules that run locally for this account. Only rules expressible in
+/// Sieve are left to the server when our script is active there; rules
+/// rejected by the exporter must retain their local fallback.
 pub fn local_rules(store: &Store, account_id: i64) -> Result<Vec<Rule>> {
     let sieve_active = store.sieve_settings(account_id)?.active;
-    Ok(store
-        .rules()?
+    let rules = store.rules()?;
+    let exported: BTreeSet<i64> = if sieve_active {
+        let account = store.account(account_id)?;
+        let trash = store
+            .folder_by_role(account_id, "trash")?
+            .map(|f| f.display)
+            .unwrap_or_else(|| "Trash".into());
+        rules::to_sieve(&rules, &account.config.email, &trash)
+            .exported
+            .into_iter()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    Ok(rules
         .into_iter()
-        .filter(|r| r.enabled && !(sieve_active && r.server_side))
+        .filter(|r| r.enabled && !exported.contains(&r.id))
         .collect())
 }
 
