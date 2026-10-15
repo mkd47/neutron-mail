@@ -1,0 +1,35 @@
+NEUTRON MAIL — MAC PREVIEW 0.1.0
+
+Requirements: macOS 13 Ventura or later, Intel or Apple Silicon.
+
+1. Open the DMG and drag Neutron Mail into Applications.
+2. Eject the DMG, then open Neutron Mail from Applications.
+3. This private preview is ad-hoc signed, not Apple-notarized. If macOS
+   blocks it, follow Apple's per-app instructions in System Settings >
+   Privacy & Security > Open Anyway. Only approve the build you received
+   from the project owner; check its SHA256SUMS.txt first.
+   https://support.apple.com/102445
+4. Add your mail account with its IMAP/SMTP settings and password or
+   provider app password. Google/Microsoft OAuth requires the project
+   owner's provider configuration; the preview does not add OAuth IDs.
+5. Allow Keychain access if prompted. Passwords and the encrypted mail
+   cache key are stored in Apple Keychain. If Keychain is unavailable,
+   the app reports memory-only mode and setup lasts for that session.
+6. Notifications may ask for permission when first used. You can change
+   permission in System Settings > Notifications.
+
+Included: mail, search, folders, drafts, attachments, local notes/tasks,
+mail-history recipient suggestions, native notifications and Dock count.
+
+Excluded: Apple Calendar, Apple Contacts, system calendar writes and
+address-book reads. Calendar controls are omitted. Email invitation
+replies still work; they do not add events to a system calendar.
+Linux's hovered-link status integration is absent; clicked external
+links still require confirmation.
+
+First-build checks cover compilation, tests, both CPU architectures,
+signatures, packaging and a launch smoke test. Real mail-account use,
+Gatekeeper approval on another Mac, and interactive GUI behaviour need
+your colleague's acceptance test. This is an experimental private preview.
+
+Do not share passwords or unredacted mail/logs when reporting a problem.
