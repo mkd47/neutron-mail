@@ -62,11 +62,24 @@ export interface AppInfo {
 }
 export interface SyncEvent { account_id: number; report?: SyncReport; error?: string }
 
+export interface AccountSettings {
+  signature_html: string;
+  /** 0 = all mail */
+  sync_days: number;
+}
+
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   listAccounts: () => invoke<Account[]>("list_accounts"),
   addAccount: (config: AccountConfig, password: string) => invoke<Account>("add_account", { config, password }),
   removeAccount: (accountId: number) => invoke<void>("remove_account", { accountId }),
+  updateAccount: (accountId: number, config: AccountConfig, password: string) =>
+    invoke<Account>("update_account", { accountId, config, password }),
+  getAccountSettings: (accountId: number) => invoke<AccountSettings>("get_account_settings", { accountId }),
+  setAccountSettings: (accountId: number, settings: AccountSettings) =>
+    invoke<AccountSettings>("set_account_settings", { accountId, settings }),
+  newDraft: (accountId: number) => invoke<ComposeDraft>("new_draft", { accountId }),
+  listImageSenders: (accountId: number) => invoke<string[]>("list_image_senders", { accountId }),
   setPassword: (accountId: number, password: string) => invoke<void>("set_password", { accountId, password }),
   syncAccount: (accountId: number) => invoke<SyncReport>("sync_account", { accountId }),
   listFolders: (accountId: number) => invoke<Folder[]>("list_folders", { accountId }),

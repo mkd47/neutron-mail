@@ -7,6 +7,7 @@ export function shortDate(ts: number): string {
   const y = new Date(now); y.setDate(now.getDate() - 1);
   if (d.toDateString() === y.toDateString()) return "Yesterday";
   if (now.getTime() - d.getTime() < 6 * 86400e3) return d.toLocaleDateString([], { weekday: "short" });
+  if (d.getFullYear() !== now.getFullYear()) return d.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 

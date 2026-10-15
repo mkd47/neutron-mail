@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS image_senders (
   email TEXT NOT NULL COLLATE NOCASE,
   PRIMARY KEY(account_id, email)
 );
+CREATE TABLE IF NOT EXISTS account_settings (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  signature_html TEXT NOT NULL DEFAULT '',
+  sync_days INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS messages_folder_date ON messages(folder_id, date DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   subject, sender, body, tokenize = 'unicode61 remove_diacritics 2'
@@ -78,6 +83,18 @@ END;
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Sync windows offered in settings (days; 0 = all mail).
+pub const SYNC_WINDOWS: [u32; 5] = [0, 30, 90, 365, 730];
+const MAX_SIGNATURE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountSettings {
+    /// Signature as compose-sanitized HTML ("" = none).
+    pub signature_html: String,
+    /// Only keep/download mail from the last N days (0 = all).
+    pub sync_days: u32,
 }
 
 const SUMMARY_COLS: &str =
@@ -258,6 +275,80 @@ impl Store {
             .into_iter()
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(format!("account {id}")))
+    }
+
+    /// Replace an account's server settings (the caller verifies the login first).
+    pub fn update_account(&self, id: i64, c: &AccountConfig) -> Result<()> {
+        c.validate()?;
+        let n = self.db().execute(
+            "UPDATE accounts SET email=?2, display_name=?3, username=?4, imap_host=?5, imap_port=?6, imap_security=?7,
+               smtp_host=?8, smtp_port=?9, smtp_security=?10, extra_ca_pem=?11 WHERE id=?1",
+            params![id, c.email, c.display_name, c.username, c.imap_host, c.imap_port, c.imap_security.as_str(),
+                    c.smtp_host, c.smtp_port, c.smtp_security.as_str(), c.extra_ca_pem],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("account {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn account_settings(&self, id: i64) -> Result<AccountSettings> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT signature_html, sync_days FROM account_settings WHERE account_id = ?1",
+                [id],
+                |r| {
+                    Ok(AccountSettings {
+                        signature_html: r.get(0)?,
+                        sync_days: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Store settings; the signature is sanitized with the compose policy.
+    pub fn set_account_settings(&self, id: i64, s: &AccountSettings) -> Result<AccountSettings> {
+        if s.signature_html.len() > MAX_SIGNATURE_BYTES {
+            return Err(Error::Invalid(
+                "the signature is too large (max 256 KB)".into(),
+            ));
+        }
+        if !SYNC_WINDOWS.contains(&s.sync_days) {
+            return Err(Error::Invalid("unsupported sync window".into()));
+        }
+        let clean = AccountSettings {
+            signature_html: crate::sanitize::sanitize_compose_html(&s.signature_html)
+                .trim()
+                .to_string(),
+            sync_days: s.sync_days,
+        };
+        self.account(id)?;
+        self.db().execute(
+            "INSERT INTO account_settings (account_id, signature_html, sync_days) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET signature_html = excluded.signature_html, sync_days = excluded.sync_days",
+            params![id, clean.signature_html, clean.sync_days],
+        )?;
+        Ok(clean)
+    }
+
+    pub fn image_senders(&self, account_id: i64) -> Result<Vec<String>> {
+        let db = self.db();
+        let mut st =
+            db.prepare("SELECT email FROM image_senders WHERE account_id = ?1 ORDER BY email")?;
+        let rows = st.query_map([account_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drop cached messages older than `cutoff` (unix time) from a folder.
+    /// Only the local cache is affected; the server keeps everything.
+    pub fn prune_before(&self, folder_id: i64, cutoff: i64) -> Result<usize> {
+        Ok(self.db().execute(
+            "DELETE FROM messages WHERE folder_id = ?1 AND date < ?2",
+            params![folder_id, cutoff],
+        )?)
     }
 
     pub fn delete_account(&self, id: i64) -> Result<()> {

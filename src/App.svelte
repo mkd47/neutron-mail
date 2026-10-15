@@ -2,6 +2,7 @@
   import { onMount, untrack } from "svelte";
   import Icon from "./lib/Icon.svelte";
   import AccountSetup from "./lib/AccountSetup.svelte";
+  import Settings from "./lib/Settings.svelte";
   import Compose from "./lib/Compose.svelte";
   import Viewer from "./lib/Viewer.svelte";
   import LinkDialog from "./lib/LinkDialog.svelte";
@@ -36,6 +37,20 @@
   let syncing = $state(false);
   let status = $state("");
   let showSetup = $state(false);
+  let showSettings = $state(false);
+
+  async function newCompose() {
+    if (!account) return;
+    try { compose = await api.newDraft(account.id); }
+    catch (e) { compose = emptyDraft(); showToast(`Couldn't load your signature: ${errorText(e)}`, true); }
+  }
+  async function accountRemoved(id: number) {
+    showSettings = false;
+    accounts = accounts.filter((a) => a.id !== id);
+    showToast("Account removed");
+    if (accounts[0]) await selectAccount(accounts[0]);
+    else { account = null; folders = []; messages = []; detail = null; showSetup = true; }
+  }
   let compose = $state<ComposeDraft | null>(null);
 
   const roleIcon: Record<string, string> = { inbox: "inbox", sent: "sent", drafts: "drafts", trash: "trash", archive: "archive", junk: "junk", flagged: "star" };
@@ -141,7 +156,12 @@
   });
 </script>
 
-{#if showSetup || !account}
+{#if showSettings && account}
+  <main class="setup-wrap">
+    <Settings {account} onClose={() => (showSettings = false)} onRemoved={accountRemoved}
+      onUpdated={(a) => { accounts = accounts.map((x) => (x.id === a.id ? a : x)); account = a; }} />
+  </main>
+{:else if showSetup || !account}
   <main class="setup-wrap">
     <AccountSetup
       onAdded={async (a) => { accounts = [...accounts, a]; showSetup = false; await selectAccount(a); }}
@@ -154,7 +174,7 @@
   <div class="shell">
     <aside class="sidebar">
       <div class="brand"><span class="logo">N</span> Neutron Mail</div>
-      <button class="btn primary compose" onclick={() => (compose = emptyDraft())}>
+      <button class="btn primary compose" onclick={newCompose}>
         <Icon name="compose" /> Compose
       </button>
       <nav aria-label="Folders">
@@ -176,6 +196,9 @@
       <div class="foot">
         <button class="icon-btn" onclick={() => (theme = theme === "dark" ? "light" : "dark")} aria-label="Toggle theme" title="Toggle theme">
           <Icon name={theme === "dark" ? "sun" : "moon"} />
+        </button>
+        <button class="icon-btn" onclick={() => (showSettings = true)} aria-label="Account settings" title="Account settings">
+          <Icon name="settings" />
         </button>
         <button class="icon-btn" onclick={sync} disabled={syncing} aria-label="Sync now" title="Sync now">
           <span class:spin={syncing}><Icon name="sync" /></span>

@@ -233,3 +233,29 @@ fn carried(p: &parse::ParsedMessage, message_id: i64) -> Vec<ForwardedAttachment
         })
         .collect()
 }
+
+/// Insert a signature (compose-sanitized HTML) into a fresh draft, below the
+/// empty line the cursor starts on and above any quoted/forwarded text. Uses
+/// the conventional "-- " delimiter (RFC 3676 §4.3) in both parts.
+pub fn with_signature(mut draft: ComposeDraft, signature_html: &str) -> ComposeDraft {
+    let sig = crate::sanitize::sanitize_compose_html(signature_html);
+    let sig_text = crate::sanitize::html_to_text(&sig);
+    if sig.trim().is_empty() || sig_text.trim().is_empty() && !sig.contains("<img") {
+        return draft;
+    }
+    let block = format!("<div>-- </div><div>{}</div>", sig.trim());
+    let html = draft
+        .html
+        .take()
+        .unwrap_or_else(|| crate::sanitize::text_to_html(&draft.body));
+    let rest = html.strip_prefix("<p><br></p>").unwrap_or(&html);
+    let gap = if rest.is_empty() { "" } else { "<p><br></p>" };
+    draft.html = Some(format!("<p><br></p>{block}{gap}{rest}"));
+    let rest = draft.body.trim_start_matches('\n');
+    draft.body = format!(
+        "\n\n-- \n{}\n{}{rest}",
+        sig_text.trim_end(),
+        if rest.is_empty() { "" } else { "\n" }
+    );
+    draft
+}

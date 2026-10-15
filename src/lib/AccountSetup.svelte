@@ -1,16 +1,21 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { api, errorText, type AccountConfig, type Account } from "./api";
 
-  let { onAdded, onCancel }: { onAdded: (a: Account) => void; onCancel?: () => void } = $props();
+  let { onAdded, onCancel, existing }:
+    { onAdded: (a: Account) => void; onCancel?: () => void; existing?: Account } = $props();
 
-  let cfg: AccountConfig = $state({
+  // Editing: a copy of the existing config (password left empty = keep).
+  const start = untrack(() => existing);
+  const init = start ? (({ id: _id, ...c }) => c)(start) : null;
+  let cfg: AccountConfig = $state(init ? { ...init } : {
     email: "", display_name: "", username: "",
     imap_host: "", imap_port: 993, imap_security: "tls",
     smtp_host: "", smtp_port: 587, smtp_security: "starttls",
     extra_ca_pem: null,
   });
   let password = $state("");
-  let caText = $state("");
+  let caText = $state(init?.extra_ca_pem ?? "");
   let busy = $state(false);
   let error = $state("");
 
@@ -26,26 +31,35 @@
     e.preventDefault();
     busy = true; error = "";
     try {
-      const account = await api.addAccount({ ...cfg, extra_ca_pem: caText.trim() || null }, password);
+      const c = { ...cfg, extra_ca_pem: caText.trim() || null };
+      const account = existing ? await api.updateAccount(existing.id, c, password) : await api.addAccount(c, password);
       password = "";
       onAdded(account);
     } catch (err) {
-      error = errorText(err);
+      const t = errorText(err);
+      error = /AUTHENTICATIONFAILED|authentication failed/i.test(t)
+        ? "Login failed: the server rejected this username and password. Nothing was saved." : t;
     } finally {
       busy = false;
     }
   }
 </script>
 
-<form class="setup" onsubmit={submit}>
-  <h2>Add an account</h2>
-  <p class="muted">Connect Neutron Mail to your own IMAP/SMTP server. Connections are always encrypted
-    and certificates are always verified.</p>
+<form class="setup" class:embedded={!!existing} onsubmit={submit}>
+  {#if existing}
+    <h3>Server and login</h3>
+    <p class="muted">Changes are saved only after a successful login with the new settings.</p>
+  {:else}
+    <h2>Add an account</h2>
+    <p class="muted">Connect Neutron Mail to your own IMAP/SMTP server. Connections are always encrypted
+      and certificates are always verified.</p>
+  {/if}
   <div class="grid">
     <label>Email<input type="email" required bind:value={cfg.email} onblur={guessFromEmail} autocomplete="email" /></label>
     <label>Display name<input bind:value={cfg.display_name} autocomplete="name" /></label>
     <label>Username<input required bind:value={cfg.username} autocomplete="username" /></label>
-    <label>Password<input type="password" required bind:value={password} autocomplete="current-password" /></label>
+    <label>Password<input type="password" required={!existing} bind:value={password} autocomplete="current-password"
+      placeholder={existing ? "Leave empty to keep" : ""} /></label>
   </div>
   <fieldset>
     <legend>Incoming (IMAP)</legend>
@@ -74,14 +88,15 @@
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   <div class="actions">
     {#if onCancel}<button type="button" class="btn" onclick={onCancel}>Cancel</button>{/if}
-    <button class="btn primary" disabled={busy}>{busy ? "Connecting…" : "Add account"}</button>
+    <button class="btn primary" disabled={busy}>{busy ? "Connecting…" : existing ? "Verify and save" : "Add account"}</button>
   </div>
 </form>
 
 <style>
   .setup { max-width: 640px; margin: 40px auto; background: var(--panel); border: 1px solid var(--border);
     border-radius: 16px; padding: 28px; display: flex; flex-direction: column; gap: 14px; }
-  h2 { margin: 0; }
+  h2, h3 { margin: 0; }
+  .setup.embedded { margin: 0; max-width: none; padding: 20px; }
   p { margin: 0; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }

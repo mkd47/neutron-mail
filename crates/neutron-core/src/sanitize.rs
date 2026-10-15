@@ -524,7 +524,11 @@ pub fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut blank = 0;
     for (d, l) in &lines {
-        let l = l.trim_end();
+        // Keep the signature delimiter's significant trailing space (RFC 3676 §4.3).
+        let l = match l.trim() {
+            "--" => "-- ",
+            _ => l.trim_end(),
+        };
         if l.is_empty() {
             blank += 1;
             if blank > 1 {

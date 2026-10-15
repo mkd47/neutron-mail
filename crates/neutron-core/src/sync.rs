@@ -34,9 +34,11 @@ pub async fn sync_account(
         .collect();
     store.retain_folders(account_id, &names)?;
     let mut report = SyncReport::default();
+    let days = store.account_settings(account_id)?.sync_days;
+    let since = (days > 0).then(|| chrono::Utc::now().timestamp() - i64::from(days) * 86_400);
     for f in remote.iter().filter(|f| f.selectable) {
         let folder_id = store.upsert_folder(account_id, &f.name, f.role)?;
-        match sync_folder(store, folder_id, &f.name, &mut session).await {
+        match sync_folder_window(store, folder_id, &f.name, &mut session, since).await {
             Ok((new, removed)) => {
                 report.folders += 1;
                 report.new_messages += new;
@@ -60,14 +62,36 @@ pub async fn sync_folder(
     name: &str,
     session: &mut Session,
 ) -> Result<(usize, usize)> {
+    sync_folder_window(store, folder_id, name, session, None).await
+}
+
+/// Sync one folder; with `since` (unix time) only mail from then on is
+/// downloaded and older cached mail is dropped from the cache (the server
+/// is not touched).
+pub async fn sync_folder_window(
+    store: &Store,
+    folder_id: i64,
+    name: &str,
+    session: &mut Session,
+    since: Option<i64>,
+) -> Result<(usize, usize)> {
     let state = imap::select(session, name).await?;
     store.set_uidvalidity(folder_id, state.uidvalidity)?;
     let local: HashSet<u32> = store.uids(folder_id)?.into_iter().collect();
 
     let gone: Vec<u32> = local.difference(&state.uids).copied().collect();
-    let removed = store.remove_uids(folder_id, &gone)?;
+    let mut removed = store.remove_uids(folder_id, &gone)?;
 
-    let mut new: Vec<u32> = state.uids.difference(&local).copied().collect();
+    let wanted: HashSet<u32> = match since {
+        Some(t) if !state.uids.is_empty() => {
+            // A day of slack: SEARCH SINCE uses the server's date (no time zone).
+            removed += store.prune_before(folder_id, t - 86_400)?;
+            imap::uids_since(session, t).await?
+        }
+        _ => state.uids.clone(),
+    };
+    let local: HashSet<u32> = store.uids(folder_id)?.into_iter().collect();
+    let mut new: Vec<u32> = wanted.difference(&local).copied().collect();
     new.sort_unstable_by(|a, b| b.cmp(a));
     new.truncate(MAX_NEW_PER_FOLDER);
     let fetched = imap::fetch_full(session, &new).await?;

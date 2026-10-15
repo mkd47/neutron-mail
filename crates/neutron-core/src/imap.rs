@@ -114,6 +114,15 @@ pub async fn select(session: &mut Session, folder: &str) -> Result<FolderState> 
     Ok(FolderState { uidvalidity, uids })
 }
 
+/// UIDs of messages with an internal date on or after `since` (unix time).
+/// IMAP SEARCH SINCE has day granularity (RFC 3501 §6.4.4).
+pub async fn uids_since(session: &mut Session, since: i64) -> Result<HashSet<u32>> {
+    let day = chrono::DateTime::from_timestamp(since, 0)
+        .unwrap_or_default()
+        .format("%d-%b-%Y");
+    Ok(session.uid_search(format!("SINCE {day}")).await?)
+}
+
 pub struct FetchedMessage {
     pub uid: u32,
     pub seen: bool,

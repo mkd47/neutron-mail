@@ -8,7 +8,9 @@ use neutron_core::{
     },
     remote, sanitize,
     secrets::Backend,
-    smtp, sync, Error,
+    smtp,
+    store::AccountSettings,
+    sync, Error,
 };
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -92,6 +94,55 @@ pub fn remove_account(state: State<'_, AppState>, account_id: i64) -> Res<()> {
     watcher::stop(&state, account_id);
     let _ = state.secrets.delete(account_id);
     state.store.delete_account(account_id)
+}
+
+/// Edit an account. An empty `password` keeps the stored one. The login is
+/// verified against the (possibly new) server before anything is saved.
+#[tauri::command]
+pub async fn update_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    config: AccountConfig,
+    password: String,
+) -> Res<Account> {
+    config.validate()?;
+    state.store.account(account_id)?;
+    let new_password = !password.is_empty();
+    let pw = if new_password {
+        password
+    } else {
+        state.secrets.get(account_id)?
+    };
+    let mut session = imap::connect(&config, &pw).await?;
+    drop(session.logout().await);
+    watcher::stop(&state, account_id);
+    state.store.update_account(account_id, &config)?;
+    if new_password {
+        state.secrets.set(account_id, &pw)?;
+    }
+    tracing::info!(account = account_id, "account updated");
+    watcher::start(&app, account_id);
+    state.store.account(account_id)
+}
+
+#[tauri::command]
+pub fn get_account_settings(state: State<'_, AppState>, account_id: i64) -> Res<AccountSettings> {
+    state.store.account_settings(account_id)
+}
+
+#[tauri::command]
+pub fn set_account_settings(
+    state: State<'_, AppState>,
+    account_id: i64,
+    settings: AccountSettings,
+) -> Res<AccountSettings> {
+    state.store.set_account_settings(account_id, &settings)
+}
+
+#[tauri::command]
+pub fn list_image_senders(state: State<'_, AppState>, account_id: i64) -> Res<Vec<String>> {
+    state.store.image_senders(account_id)
 }
 
 /// Re-enter a password (needed after restart when only the in-memory
@@ -235,12 +286,19 @@ pub fn compose_prefill(
         .store
         .account(state.store.message_account(message_id)?)?;
     let raw = state.store.raw(message_id)?;
-    Ok(compose::prepare(
-        &raw,
-        message_id,
-        mode,
-        &account.config.email,
-    ))
+    let draft = compose::prepare(&raw, message_id, mode, &account.config.email);
+    if matches!(mode, compose::Mode::Draft) {
+        return Ok(draft); // a resumed draft already has whatever signature it had
+    }
+    let sig = state.store.account_settings(account.id)?.signature_html;
+    Ok(compose::with_signature(draft, &sig))
+}
+
+/// An empty draft for new mail, with the account's signature.
+#[tauri::command]
+pub fn new_draft(state: State<'_, AppState>, account_id: i64) -> Res<ComposeDraft> {
+    let sig = state.store.account_settings(account_id)?.signature_html;
+    Ok(compose::with_signature(ComposeDraft::default(), &sig))
 }
 
 #[tauri::command]

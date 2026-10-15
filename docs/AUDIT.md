@@ -96,6 +96,15 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 - Tests: 6 in `tests/compose_html.rs` (sanitizer policy incl. `position:fixed`, hostile paste, multipart structure and cid matching, quoting, text alternative) + the reply-all integration test now checks the delivered `multipart/alternative` with the quote. GUI: reply to the HTML newsletter with bold/list/paste, forward saved as a draft and resumed with formatting, new mail with a link; MIME tree and content verified in the server's Maildir.
 - Limits: `document.execCommand` (deprecated but supported by WebKitGTK) drives the formatting; WebKit may add `style` (e.g. `rgb()` colours, `font-size: medium`) on paste, which the allow-list keeps. Class-based styling of quoted newsletters is dropped (layout may be simpler than the original).
 
+### 2.13 Account settings (v0.3)
+- **Editing an account** (`update_account`) validates the config and **logs in to the (possibly new) IMAP server before saving anything**; a wrong password or a server/TLS error leaves the stored account and keyring entry untouched (GUI-tested: "Login failed … Nothing was saved."). An empty password keeps the keyring entry; the password is never sent back to the UI. The IDLE watcher is stopped and restarted with the new settings. Certificate verification can't be turned off here either (only a private CA can be added).
+- **Signature** is stored per account, sanitized with the compose policy (2.12) on save (no script, handlers, remote images; max 256 KB), and inserted in Rust (`compose::with_signature`) between the cursor and the quote with the RFC 3676 `-- ` delimiter, which is kept in the generated text/plain part. Not re-inserted when a draft is resumed.
+- **Sync window** (allow-listed values: all, 30, 90, 365, 730 days): new mail is fetched only from `UID SEARCH SINCE`, and cached messages older than the window (minus one day of slack for the server's date granularity) are **deleted from the local cache only**; the server is never modified (integration test checks the server still has both messages; GUI-tested with a 2020 message: skipped, downloaded with "All mail", pruned again with 30 days, still in the server Maildir). Unread counts reflect the cached window.
+- **Trusted image senders** are listed per account and can be removed; removal takes effect on the next open (GUI-tested: images blocked again, no new request in the image-server log).
+- **Remove account** needs an in-app confirmation, stops the watcher, deletes the keyring password, and deletes the account row; folders, messages, settings and the trust list go with it (`ON DELETE CASCADE`, test re-adds an account and finds no leftover settings or trusted senders). Mail on the server is not touched.
+- New commands (`update_account`, `get/set_account_settings`, `list_image_senders`, `new_draft`) are added to the least-privilege capability explicitly.
+- Tests: 5 in `tests/account_settings.rs` (settings round-trip + sanitizing, rejected values/unknown account/oversize, update + cascade, signature placement and `-- ` in the text part, sync window against Dovecot).
+
 ## 3. Findings
 
 | # | Severity | Finding | Status |
@@ -122,6 +131,8 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 | O11 | Info | (v0.2) Drafts stored on the IMAP server contain the Bcc header (needed to resume them). | Accepted; it is the user's own mailbox. |
 | F10 | Low | (v0.3, GUI testing) Typing in the new editor reset the caret on every keystroke (text appeared reversed). | **Fixed** before release; initial content is set once. |
 | F11 | Info | (v0.3, GUI testing) A contact suggestion request still in flight re-opened the dropdown after Enter had already added the chip. | **Fixed**: pending lookups are cancelled when a chip is added. |
+| F12 | Low | (v0.3, GUI testing) The text/plain part lost the trailing space of the `-- ` signature delimiter (lines were right-trimmed), so clients would not recognise the signature. | **Fixed**: delimiter preserved; regression test. |
+| O13 | Info | (v0.3, test development) async-imap waits forever if a server answers `APPEND` with a tagged `BAD` (seen with an unquoted internal date in a test). The app never passes an internal date, but a hostile server could stall that request. | Open: add a timeout around IMAP commands (planned with the sync rework). |
 | O12 | Info | (v0.2) `lnkd.in` and other opaque short links can't be unwrapped without contacting the shortener; they are shown as-is with their real host. | Accepted. |
 
 ## 4. Not covered / limits of this audit

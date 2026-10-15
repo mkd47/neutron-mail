@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-image-senders"
+description = "Enables the list_image_senders command without any pre-configured scope."
+commands.allow = ["list_image_senders"]
+
+[[permission]]
+identifier = "deny-list-image-senders"
+description = "Denies the list_image_senders command without any pre-configured scope."
+commands.deny = ["list_image_senders"]

@@ -26,6 +26,12 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   To/Cc/Bcc chips, correct `In-Reply-To`/`References`, quoted text, forwarded attachments, **drafts** (save, resume, send), and a visible warning if the copy to Sent fails.
 - **Attachments:** attach via the native file picker; save (native save dialog) or open received files with the default app;
   hostile names neutralized, executables/scripts need confirmation, 25 MB limits.
+- **Account settings** (gear icon in the sidebar): edit server/login settings (saved only after a successful
+  login; leave the password empty to keep it), a rich-text **signature** (added above the quote in new mail,
+  replies and forwards with the standard `-- ` delimiter, not re-added when resuming a draft), a **sync window**
+  (all mail / 30 / 90 days / 1 / 2 years: older mail is neither downloaded nor kept in the local cache, and is
+  never deleted on the server), the **trusted remote-image senders** list with Remove, and **Remove account**
+  (deletes its keyring password and cached mail, with an in-app confirmation).
 - **Contact autocomplete** in To/Cc/Bcc from your GNOME address books (evolution-data-server over D-Bus), merged with addresses from your mail; works without EDS too.
 
 GNOME Calendar integration is still a stub.
@@ -46,7 +52,11 @@ GNOME Calendar integration is still a stub.
 |---|---|---|
 | ![](docs/screenshots/html-rendering-images.png) | ![](docs/screenshots/view-source.png) | ![](docs/screenshots/attachment-risky-warning.png) |
 
-More: [inline reply](docs/screenshots/inline-reply.png), [inline reply all](docs/screenshots/inline-reply-all.png),
+| Account settings (login re-verified) | Signature, sync window, trusted senders | Signature in a reply |
+|---|---|---|
+| ![](docs/screenshots/settings-account.png) | ![](docs/screenshots/settings-signature-images-sync.png) | ![](docs/screenshots/settings-signature-reply.png) |
+
+More: [remove account confirmation](docs/screenshots/settings-remove-confirm.png), [inline reply](docs/screenshots/inline-reply.png), [inline reply all](docs/screenshots/inline-reply-all.png),
 [compose autocomplete](docs/screenshots/autocomplete-compose.png), [attachment picker](docs/screenshots/attachment-picker.png),
 [save](docs/screenshots/attachment-save.png) / [open](docs/screenshots/attachment-open.png) an attachment,
 [link opened in the browser](docs/screenshots/linkedin-link-open.png), [redirect unwrapped](docs/screenshots/linkedin-redirect-unwrapped.png),

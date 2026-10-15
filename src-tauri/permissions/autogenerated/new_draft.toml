@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-new-draft"
+description = "Enables the new_draft command without any pre-configured scope."
+commands.allow = ["new_draft"]
+
+[[permission]]
+identifier = "deny-new-draft"
+description = "Denies the new_draft command without any pre-configured scope."
+commands.deny = ["new_draft"]
