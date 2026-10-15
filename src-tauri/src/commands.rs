@@ -458,7 +458,7 @@ pub async fn set_unread_badge(app: AppHandle, count: i64) -> Res<()> {
         };
         let _ = w.set_title(&title);
     }
-    if let Err(e) = neutron_core::gnome::launcher_badge("neutron-mail.desktop", count).await {
+    if let Err(e) = neutron_core::gnome::launcher_badge("Neutron Mail.desktop", count).await {
         tracing::debug!("launcher badge not sent: {e}");
     }
     Ok(())

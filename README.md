@@ -85,8 +85,16 @@ audit surface minimal, which matters for an app that handles mail.
 
 ## Build & run on Fedora 44
 
-> The prototype was developed and tested on Debian 13 (the build box). The Fedora commands
-> below follow Tauri v2's documented Fedora prerequisites but were **not run on Fedora**.
+> **Checked in a `fedora:44` container** (podman, 2026-10-15, Fedora 44 x86_64): the commands below
+> ran as written and `cargo tauri build --bundles rpm` produced `Neutron Mail-0.1.0-1.x86_64.rpm`
+> (10.3 MB; requires `libwebkit2gtk-4.1.so.0`, `libgtk-3.so.0`), which installs with `dnf` with no
+> missing libraries (`ldd`). Times on the build box: dnf ≈ 2.5–3 min, rustup + `tauri-cli` ≈ 2.5 min,
+> `npm ci` + release build ≈ 2 min. Findings: the first `tauri build` failed with
+> `invalid category` (`"Email"` is not a Tauri category; fixed: `Productivity` plus a desktop template
+> with `Categories=Network;Email;`); on the build box the Cisco openh264 repo
+> (`ciscobinary.openh264.org`) timed out, so dnf was run with `--disablerepo=fedora-cisco-openh264`
+> (openh264 is only a weak dependency). The GUI was not run on a real Fedora/GNOME desktop.
+> Rust ≥ 1.88 is required (async-imap 0.12).
 
 ```bash
 # 1. System dependencies
@@ -95,14 +103,15 @@ sudo dnf install -y webkit2gtk4.1-devel openssl-devel curl wget file \
   gnome-keyring libsecret evolution-data-server
 sudo dnf group install -y c-development
 
-# 2. Rust (>= 1.85) via rustup, plus the Tauri CLI
+# 2. Rust (>= 1.88) via rustup, plus the Tauri CLI
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install --locked tauri-cli@^2
 
 # 3. Build and run
 npm ci
 cargo tauri dev            # development (hot-reload UI)
-cargo tauri build          # release build + .rpm / .deb bundles in target/release/bundle/
+cargo tauri build --bundles rpm   # release build + .rpm in target/release/bundle/rpm/
+sudo dnf install ./target/release/bundle/rpm/*.rpm
 ```
 
 Passwords are stored in the GNOME Keyring (Secret Service). The local mail cache is **encrypted at rest**

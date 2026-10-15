@@ -586,7 +586,7 @@ pub fn notification_escape(s: &str) -> String {
 pub async fn notify(summary: &str, body: &str, replaces: u32) -> Result<u32> {
     let conn = timed(zbus::Connection::session()).await?;
     let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-    hints.insert("desktop-entry", zbus::zvariant::Value::from("neutron-mail"));
+    hints.insert("desktop-entry", zbus::zvariant::Value::from("Neutron Mail"));
     hints.insert("category", zbus::zvariant::Value::from("email.arrived"));
     let reply = timed(conn.call_method(
         Some("org.freedesktop.Notifications"),

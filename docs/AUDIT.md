@@ -171,7 +171,7 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 ## 4. Not covered / limits of this audit
 - No fuzzing of mail-parser/ammonia, and no third-party penetration test.
 - WebKitGTK sandboxing and the bubblewrap/Flatpak setup were not evaluated.
-- The Fedora 44 build was not run (the box is Debian 13).
+- Fedora 44: build + RPM install checked in a `fedora:44` container (see README); the app itself was not run on a Fedora GNOME desktop.
 - GNOME Calendar was tested against evolution-data-server 3.56 in a private D-Bus session, not against GNOME Calendar's UI or online (Google/CalDAV) calendars.
 - CSS-only phishing tricks (layout spoofing) are not prevented beyond what the CSP blocks (see O10).
 - The opener/xdg-open handoff was tested with Chrome and MuPDF in an isolated XDG session on the box, not on a real GNOME desktop.

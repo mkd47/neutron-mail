@@ -15,6 +15,10 @@ pub fn enabled() -> bool {
     }
 }
 
+pub fn enabled_quiet() -> bool {
+    std::env::var("NEUTRON_IT").as_deref() == Ok("1")
+}
+
 pub fn ca_pem() -> String {
     let base = std::env::var("NM_TEST_BASE").unwrap_or_else(|_| "/workspace/testmail".into());
     std::fs::read_to_string(format!("{base}/certs/ca.pem"))
@@ -36,7 +40,12 @@ pub fn config(imap_security: Security) -> AccountConfig {
         smtp_host: "localhost".into(),
         smtp_port: 10587,
         smtp_security: Security::Starttls,
-        extra_ca_pem: Some(ca_pem()),
+        // Offline tests (no server, e.g. CI) only build configs; they never connect.
+        extra_ca_pem: if enabled_quiet() {
+            Some(ca_pem())
+        } else {
+            None
+        },
     }
 }
 

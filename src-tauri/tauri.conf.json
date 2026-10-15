@@ -45,13 +45,21 @@
       "deb",
       "rpm"
     ],
-    "category": "Email",
+    "category": "Productivity",
     "shortDescription": "Native IMAP/SMTP mail client (prototype)",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.png"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "neutron-mail.desktop"
+      },
+      "rpm": {
+        "desktopTemplate": "neutron-mail.desktop"
+      }
+    }
   }
 }
