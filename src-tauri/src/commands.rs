@@ -166,15 +166,57 @@ pub fn set_password(state: State<'_, AppState>, account_id: i64, password: Strin
 }
 
 #[tauri::command]
-pub async fn sync_account(state: State<'_, AppState>, account_id: i64) -> Res<SyncReport> {
-    run_sync(&state, account_id).await
+pub async fn sync_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> Res<SyncReport> {
+    run_sync(&app, &state, account_id).await
 }
 
-pub async fn run_sync(state: &AppState, account_id: i64) -> Res<SyncReport> {
+pub async fn run_sync(app: &AppHandle, state: &AppState, account_id: i64) -> Res<SyncReport> {
     let account = state.store.account(account_id)?;
     let password = crate::providers::credential(state, account_id).await?;
-    let _guard = state.sync_lock.lock().await;
-    sync::sync_account(&state.store, account_id, &account.config, &password).await
+    use std::time::Duration;
+    use tauri::Emitter;
+    let lock = state.account_sync_lock(account_id);
+    let _guard = tokio::time::timeout(Duration::from_secs(30), lock.lock())
+        .await
+        .map_err(|_| {
+            Error::Invalid(
+                "This account is busy syncing; progress will update automatically".into(),
+            )
+        })?;
+    tokio::time::timeout(
+        Duration::from_secs(15 * 60),
+        sync::sync_account_with_progress(
+            &state.store,
+            account_id,
+            &account.config,
+            &password,
+            |progress| {
+                #[derive(Clone, Serialize)]
+                struct Event {
+                    account_id: i64,
+                    #[serde(flatten)]
+                    progress: sync::SyncProgress,
+                }
+                let _ = app.emit(
+                    "mail://sync-progress",
+                    Event {
+                        account_id,
+                        progress,
+                    },
+                );
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        Error::Invalid(
+            "Sync time limit reached; downloaded mail is saved. Sync again to continue".into(),
+        )
+    })?
 }
 
 #[tauri::command]

@@ -142,40 +142,79 @@ fn role_of(name: &str, attrs: &[NameAttribute<'_>]) -> Option<&'static str> {
     None
 }
 
-pub async fn list_folders(session: &mut Session) -> Result<Vec<RemoteFolder>> {
-    let names: Vec<_> = cmd(async {
-        session
-            .list(Some(""), Some("*"))
+// async-imap 0.12's name stream discards the tagged completion status.
+// Read parsed responses ourselves so NO/BAD/EOF can never masquerade as
+// a complete inventory and cause retain_folders to remove cached folders.
+async fn checked_names(
+    session: &mut Session,
+    command: &str,
+) -> std::result::Result<Vec<RemoteFolder>, async_imap::error::Error> {
+    use async_imap::error::Error as ImapError;
+    use async_imap::imap_proto::{MailboxDatum, Response, Status};
+    let tag = session.run_command(command).await?;
+    let mut folders = Vec::new();
+    loop {
+        let response = session
+            .read_response()
             .await?
-            .try_collect::<Vec<_>>()
-            .await
+            .ok_or(ImapError::ConnectionLost)?;
+        match response.parsed() {
+            Response::Done {
+                tag: got, status, ..
+            } if *got == tag => {
+                return match status {
+                    Status::Ok => Ok(folders),
+                    Status::No => Err(ImapError::No("folder listing rejected".into())),
+                    _ => Err(ImapError::Bad("folder listing rejected".into())),
+                };
+            }
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(ImapError::ConnectionLost),
+            Response::MailboxData(MailboxDatum::List(data)) => {
+                folders.push(RemoteFolder {
+                    name: data.name.to_string(),
+                    display: crate::mutf7::decode(&data.name),
+                    role: role_of(&data.name, &data.name_attributes),
+                    selectable: !data
+                        .name_attributes
+                        .iter()
+                        .any(|a| matches!(a, NameAttribute::NoSelect)),
+                    delimiter: data.delimiter.as_deref().map(str::to_string),
+                    subscribed: false,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+pub async fn list_folders(session: &mut Session) -> Result<Vec<RemoteFolder>> {
+    let mut folders = cmd(checked_names(session, "LIST \"\" \"*\"")).await?;
+    let subscribed: Option<HashSet<String>> = cmd(async {
+        match checked_names(session, "LSUB \"\" \"*\"").await {
+            Ok(names) => Ok(Some(names.into_iter().map(|n| n.name).collect())),
+            Err(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_)) => {
+                tracing::warn!("LSUB rejected; displaying all discovered folders");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     })
     .await?;
-    let subscribed: HashSet<String> = cmd(async {
-        session
-            .lsub(Some(""), Some("*"))
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-    })
-    .await?
-    .iter()
-    .map(|n| n.name().to_string())
-    .collect();
-    Ok(names
-        .iter()
-        .map(|n| RemoteFolder {
-            name: n.name().to_string(),
-            display: crate::mutf7::decode(n.name()),
-            role: role_of(n.name(), n.attributes()),
-            selectable: !n
-                .attributes()
-                .iter()
-                .any(|a| matches!(a, NameAttribute::NoSelect)),
-            delimiter: n.delimiter().map(str::to_string),
-            subscribed: subscribed.contains(n.name()) || n.name().eq_ignore_ascii_case("INBOX"),
-        })
-        .collect())
+    tracing::debug!(folders = folders.len(), "IMAP LIST completed");
+    for f in &mut folders {
+        f.subscribed = subscribed.as_ref().is_none_or(|s| s.contains(&f.name))
+            || f.name.eq_ignore_ascii_case("INBOX");
+        tracing::debug!(mailbox = %f.name, selectable = f.selectable, subscribed = f.subscribed, delimiter = ?f.delimiter, "discovered IMAP folder");
+    }
+    Ok(folders)
+}
+
+/// LOGOUT has the same deadline as every other command.
+pub async fn logout(session: &mut Session) -> Result<()> {
+    cmd(session.logout()).await
 }
 
 /// Enable RFC 6855 UTF8=ACCEPT when offered; afterwards mailbox names are
@@ -472,6 +511,18 @@ pub async fn fetch_full(session: &mut Session, uids: &[u32]) -> Result<Vec<Fetch
                 .await
         })
         .await?;
+        // The upstream fetch stream also drops tagged NO/BAD. A missing
+        // UID/body must not advance the sync checkpoint as if it was saved.
+        let returned: HashSet<u32> = fetches
+            .iter()
+            .filter(|f| f.body().is_some())
+            .filter_map(|f| f.uid)
+            .collect();
+        if chunk.iter().any(|uid| !returned.contains(uid)) {
+            return Err(Error::Imap(
+                "server did not return all requested messages; sync will retry".into(),
+            ));
+        }
         for f in fetches {
             let (Some(uid), Some(body)) = (f.uid, f.body()) else {
                 continue;

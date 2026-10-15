@@ -127,7 +127,7 @@ async fn watch(app: AppHandle, account_id: i64) {
         let state = app.state::<AppState>();
         let before = inbox_mark(&state, account_id);
         // 1. Sync, report to the UI.
-        match run_sync(&state, account_id).await {
+        match run_sync(&app, &state, account_id).await {
             Ok(report) => {
                 notify_new(&app, &state, before, &mut last_notification).await;
                 emit(

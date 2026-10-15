@@ -1,6 +1,7 @@
 //! MIME parsing with mail-parser.
 
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use mail_parser::{Encoding, MessageParser, MimeHeaders, PartType};
+use std::borrow::Cow;
 
 use crate::attachments::{is_risky, safe_filename};
 use crate::model::{AttachmentInfo, OutgoingAttachment};
@@ -45,12 +46,55 @@ fn addr_list(a: Option<&mail_parser::Address<'_>>) -> String {
 }
 
 pub fn parse(raw: &[u8]) -> ParsedMessage {
-    let Some(msg) = MessageParser::default().parse(raw) else {
+    let normalized = legacy_headers(raw);
+    let Some(mut msg) = MessageParser::default().parse(normalized.as_ref()) else {
         return ParsedMessage {
             subject: "(unparseable message)".into(),
             ..Default::default()
         };
     };
+
+    // Missing/UTF-8 labels on legacy Chinese mail: recover only when UTF-8
+    // is actually invalid, strict GB18030 succeeds and produces CJK text.
+    // Other explicit charsets remain authoritative; never touch binary parts.
+    for part in &mut msg.parts {
+        if !matches!(part.body, PartType::Text(_) | PartType::Html(_)) {
+            continue;
+        }
+        let charset = part.content_type().and_then(|ct| ct.attribute("charset"));
+        if charset.is_some_and(|c| {
+            !matches!(
+                c.to_ascii_lowercase().as_str(),
+                "utf-8" | "utf8" | "us-ascii" | "ascii"
+            )
+        }) {
+            continue;
+        }
+        let Some(bytes) = normalized.get(part.offset_body as usize..part.offset_end as usize)
+        else {
+            continue;
+        };
+        let decoded: Cow<'_, [u8]> = match part.encoding {
+            Encoding::None => bytes.into(),
+            Encoding::Base64 => match mail_parser::decoders::base64::base64_decode(bytes) {
+                Some(b) => b.into(),
+                None => continue,
+            },
+            Encoding::QuotedPrintable => {
+                match mail_parser::decoders::quoted_printable::quoted_printable_decode(bytes) {
+                    Some(b) => b.into(),
+                    None => continue,
+                }
+            }
+        };
+        if let Some(text) = legacy_chinese(&decoded) {
+            part.body = if matches!(part.body, PartType::Html(_)) {
+                PartType::Html(text.into())
+            } else {
+                PartType::Text(text.into())
+            };
+        }
+    }
 
     let first_from = msg.from().and_then(|a| a.first());
     // Use real text/html parts only (mail-parser can synthesize HTML from
@@ -150,6 +194,50 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
                     .then(|| (a.name().unwrap_or("").trim().to_string(), e.to_string()))
             })
             .collect(),
+    }
+}
+
+fn legacy_chinese(bytes: &[u8]) -> Option<String> {
+    if std::str::from_utf8(bytes).is_ok() {
+        return None;
+    }
+    let text = encoding_rs::GB18030.decode_without_bom_handling_and_without_replacement(bytes)?;
+    text.chars()
+        .any(|c| matches!(c, '\u{3400}'..='\u{9fff}' | '\u{20000}'..='\u{2ffff}'))
+        .then(|| text.into_owned())
+}
+
+/// Normalize only malformed raw 8-bit *display* headers. The stored raw mail
+/// and MIME body/attachment bytes remain unchanged, including nested messages.
+fn legacy_headers(raw: &[u8]) -> Cow<'_, [u8]> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    let mut display_header = false;
+    let mut changed = false;
+    for line in raw.split_inclusive(|b| *b == b'\n') {
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        if !matches!(line.first(), Some(b' ' | b'\t')) {
+            display_header = line.iter().position(|b| *b == b':').is_some_and(|n| {
+                [b"subject".as_slice(), b"from", b"to", b"cc", b"reply-to"]
+                    .iter()
+                    .any(|h| line[..n].eq_ignore_ascii_case(h))
+            });
+        }
+        if let Some(text) = display_header.then(|| legacy_chinese(line)).flatten() {
+            result.extend_from_slice(text.as_bytes());
+            changed = true;
+        } else {
+            result.extend_from_slice(line);
+        }
+        offset += line.len();
+    }
+    if changed {
+        result.extend_from_slice(&raw[offset..]);
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(raw)
     }
 }
 

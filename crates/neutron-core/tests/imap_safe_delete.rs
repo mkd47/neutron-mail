@@ -28,8 +28,17 @@ async fn mock_server(
 
 async fn mock_server_with(
     capabilities: &'static str,
-    mut response: impl FnMut(&str) -> String + Send + 'static,
+    response: impl FnMut(&str) -> String + Send + 'static,
 ) -> (imap::Session, tokio::task::JoinHandle<Vec<String>>) {
+    let (config, server) = mock_account(capabilities, response).await;
+    let session = imap::connect(&config, "test-only-password").await.unwrap();
+    (session, server)
+}
+
+async fn mock_account(
+    capabilities: &'static str,
+    mut response: impl FnMut(&str) -> String + Send + 'static,
+) -> (AccountConfig, tokio::task::JoinHandle<Vec<String>>) {
     let certs = rustls_pki_types::CertificateDer::pem_file_iter(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/imap/server.pem"
@@ -81,7 +90,20 @@ async fn mock_server_with(
                     .await
                     .unwrap();
             } else {
-                write.write_all(response(command).as_bytes()).await.unwrap();
+                let reply = response(command);
+                if let Some((prefix, reason)) = reply.split_once("TAGGED-NO ") {
+                    write.write_all(prefix.as_bytes()).await.unwrap();
+                    write
+                        .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                if let Some(prefix) = reply.strip_suffix("DISCONNECT") {
+                    write.write_all(prefix.as_bytes()).await.unwrap();
+                    break;
+                }
+                write.write_all(reply.as_bytes()).await.unwrap();
             }
             write
                 .write_all(format!("{tag} OK done\r\n").as_bytes())
@@ -90,10 +112,7 @@ async fn mock_server_with(
         }
         commands
     });
-    let session = imap::connect(&test_config(port), "test-only-password")
-        .await
-        .unwrap();
-    (session, server)
+    (test_config(port), server)
 }
 
 fn test_config(port: u16) -> AccountConfig {
@@ -345,4 +364,112 @@ async fn legacy_window_checkpoint_recovers_mail_without_reapplying_old_rules() {
         .window_cutoff
         .is_some());
     commands_after_drop(session, server).await;
+}
+
+#[tokio::test]
+async fn folder_inventory_is_available_before_first_download() {
+    let (cfg, server) = mock_account("", |command| {
+        if command.starts_with("LIST ") {
+            "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren) \"/\" \"Sales\"\r\n* LIST (\\HasNoChildren) \"/\" {9}\r\n已发送\r\n".into()
+        } else if command.starts_with("LSUB ") {
+            "* LSUB () \"/\" \"INBOX\"\r\n".into()
+        } else if command.starts_with("SELECT ") {
+            "* 0 EXISTS\r\n* OK [UIDVALIDITY 123] valid\r\n* OK [UIDNEXT 1] next\r\n".into()
+        } else { String::new() }
+    }).await;
+    let store = Store::open_in_memory().unwrap();
+    let account = store.add_account(&cfg).unwrap();
+    let listed = std::sync::atomic::AtomicBool::new(false);
+    let report =
+        sync::sync_account_with_progress(&store, account, &cfg, "test-only-password", |p| {
+            if p.stage == "folders" || p.stage == "folder" {
+                let fs = store.folders(account).unwrap();
+                assert_eq!(
+                    fs.len(),
+                    3,
+                    "all folders must exist before any message download"
+                );
+                assert!(fs.iter().any(|f| f.display == "已发送"));
+                listed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .await
+        .unwrap();
+    assert!(listed.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(report.folders, 3);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rejected_subscription_listing_does_not_discard_list_results() {
+    let (mut s, server) = mock_server_with("", |command| {
+        if command.starts_with("LIST ") {
+            "* LIST (\\HasChildren \\NoSelect) \".\" \"Root\"\r\n* LIST (\\HasNoChildren) \".\" \"Root.&XfJT0ZAB-\"\r\n* LIST () NIL \"INBOX\"\r\n".into()
+        } else if command.starts_with("LSUB ") {
+            "TAGGED-NO subscription list unavailable".into()
+        } else { String::new() }
+    }).await;
+    let folders = imap::list_folders(&mut s).await.unwrap();
+    assert_eq!(folders.len(), 3);
+    assert!(!folders[0].selectable);
+    assert_eq!(folders[1].display, "Root.已发送");
+    assert_eq!(folders[1].delimiter.as_deref(), Some("."));
+    assert!(folders.iter().all(|f| f.subscribed));
+    commands_after_drop(s, server).await;
+}
+
+#[tokio::test]
+async fn incomplete_or_rejected_list_never_prunes_cached_folders() {
+    for ending in ["TAGGED-NO listing unavailable", "DISCONNECT"] {
+        let (cfg, server) = mock_account("", move |command| {
+            if command.starts_with("LIST ") {
+                format!("* LIST () \"/\" \"INBOX\"\r\n{ending}")
+            } else {
+                String::new()
+            }
+        })
+        .await;
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account(&cfg).unwrap();
+        let cached = store.upsert_folder(account, "Saved", None).unwrap();
+        let result = sync::sync_account(&store, account, &cfg, "test-only-password").await;
+        assert!(result.is_err(), "{ending} must fail discovery");
+        assert_eq!(store.folders(account).unwrap()[0].id, cached);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rejected_message_fetch_does_not_advance_sync_checkpoint() {
+    let (mut s, server) = mock_server_with("", |command| {
+        if command.starts_with("SELECT ") {
+            "* 2 EXISTS\r\n* OK [UIDVALIDITY 123] valid\r\n* OK [UIDNEXT 10] next\r\n".into()
+        } else if command.starts_with("UID SEARCH ") {
+            "* SEARCH 1 2\r\n".into()
+        } else if command.starts_with("UID FETCH ") {
+            "TAGGED-NO temporarily throttled".into()
+        } else {
+            String::new()
+        }
+    })
+    .await;
+    let store = Store::open_in_memory().unwrap();
+    let account = store.add_account(&test_config(993)).unwrap();
+    let fid = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    assert!(
+        sync::sync_folder_detailed(&store, fid, "INBOX", &mut s, 0, false)
+            .await
+            .is_err()
+    );
+    assert!(store.folder_sync_state(fid).unwrap().is_none());
+    assert!(store.uids(fid).unwrap().is_empty());
+    commands_after_drop(s, server).await;
 }

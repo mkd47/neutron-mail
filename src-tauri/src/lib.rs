@@ -19,9 +19,9 @@ use tauri::{Emitter, Manager};
 pub struct AppState {
     pub store: Arc<Store>,
     pub secrets: Arc<SecretStore>,
-    /// Serializes syncs so the watcher and manual "sync now" never race on
-    /// the same cache.
-    pub sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize operations within each account; a slow provider must not
+    /// block every other account.
+    pub sync_locks: std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     pub watchers: std::sync::Mutex<HashMap<i64, tauri::async_runtime::JoinHandle<()>>>,
     /// Files chosen in the native picker, by opaque token. The UI only ever
     /// sees tokens, so it cannot make the backend read arbitrary paths.
@@ -29,6 +29,17 @@ pub struct AppState {
     pub contacts: contacts::Contacts,
     pub calendar: calendar::Calendar,
     pub cache: CacheStatus,
+}
+
+impl AppState {
+    pub fn account_sync_lock(&self, account_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        self.sync_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(account_id)
+            .or_default()
+            .clone()
+    }
 }
 
 /// How the mail cache is stored, shown in the UI.
@@ -125,7 +136,7 @@ pub fn run() {
             let state = AppState {
                 store,
                 secrets,
-                sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+                sync_locks: std::sync::Mutex::new(HashMap::new()),
                 watchers: std::sync::Mutex::new(HashMap::new()),
                 picked: std::sync::Mutex::new(HashMap::new()),
                 contacts: contacts::Contacts::default(),

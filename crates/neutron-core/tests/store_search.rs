@@ -302,3 +302,69 @@ fn auth_method_round_trips() {
     let back: AccountConfig = serde_json::from_value(obj.into()).unwrap();
     assert_eq!(back.auth, Default::default());
 }
+
+#[test]
+fn decoding_upgrade_repairs_cached_text_and_search_without_redownloading() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-cache.sqlite3");
+    let store = Store::open_plaintext(&path).unwrap();
+    let account = store.add_account(&cfg()).unwrap();
+    let fid = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    let text = "春秋航空采购通知";
+    let (body, _, _) = encoding_rs::GBK.encode(text);
+    let raw = format!("From: =?GBK?B?{}?= <sender@example.test>\r\nSubject: =?GBK?B?{}?=\r\nContent-Type: text/plain; charset=GBK\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",neutron_core::parse::base64(&body),neutron_core::parse::base64(&body),neutron_core::parse::base64(&body)).into_bytes();
+    let id = store
+        .insert_message(
+            fid,
+            &NewMessage {
+                uid: 42,
+                seen: true,
+                flagged: true,
+                raw: &raw,
+            },
+        )
+        .unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("DELETE FROM cache_metadata WHERE key='text-decoder'", [])
+        .unwrap();
+    db.execute(
+        "UPDATE messages SET subject='���', preview='���', from_name='���' WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    db.execute("DELETE FROM messages_fts WHERE rowid=?1", [id])
+        .unwrap();
+    let uses: i64 = db
+        .query_row(
+            "SELECT uses FROM addresses WHERE account_id=?1 AND email='sender@example.test'",
+            [account],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let store = Store::open_plaintext(&path).unwrap();
+    let row = store.messages(fid, 0, 10).unwrap().remove(0);
+    assert_eq!(row.id, id);
+    assert_eq!(row.subject, text);
+    assert_eq!(row.preview, text);
+    assert!(row.seen && row.flagged);
+    assert_eq!(store.raw(id).unwrap(), raw);
+    assert_eq!(store.search(account, text, 10).unwrap().len(), 1);
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let after: i64 = db
+        .query_row(
+            "SELECT uses FROM addresses WHERE account_id=?1 AND email='sender@example.test'",
+            [account],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(uses, after);
+    drop(db);
+    // A second open does not repeat/duplicate the migration.
+    let store = Store::open_plaintext(&path).unwrap();
+    assert_eq!(store.messages(fid, 0, 10).unwrap().len(), 1);
+}

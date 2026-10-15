@@ -26,7 +26,18 @@ use crate::store::{FolderSyncState, NewMessage, Store};
 use crate::Result;
 
 /// Messages downloaded and committed per page.
-pub const PAGE_SIZE: usize = 500;
+pub const PAGE_SIZE: usize = 50;
+
+/// UI progress contains folder names/counts, never message contents.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncProgress {
+    pub stage: &'static str,
+    pub folder: Option<String>,
+    pub completed_folders: usize,
+    pub total_folders: usize,
+    pub downloaded: usize,
+    pub total_messages: usize,
+}
 
 /// How a folder was synced (for tests and logging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,22 +71,96 @@ pub async fn sync_account(
     cfg: &AccountConfig,
     password: &str,
 ) -> Result<SyncReport> {
+    sync_account_with_progress(store, account_id, cfg, password, |_| {}).await
+}
+
+pub async fn sync_account_with_progress(
+    store: &Store,
+    account_id: i64,
+    cfg: &AccountConfig,
+    password: &str,
+    progress: impl Fn(SyncProgress),
+) -> Result<SyncReport> {
+    progress(SyncProgress {
+        stage: "connecting",
+        folder: None,
+        completed_folders: 0,
+        total_folders: 0,
+        downloaded: 0,
+        total_messages: 0,
+    });
     let mut session = imap::connect(cfg, password).await?;
     let mut condstore = imap::has_condstore(&mut session).await?;
+    progress(SyncProgress {
+        stage: "listing",
+        folder: None,
+        completed_folders: 0,
+        total_folders: 0,
+        downloaded: 0,
+        total_messages: 0,
+    });
     let remote = imap::list_folders(&mut session).await?;
     let names: Vec<String> = remote
         .iter()
         .filter(|f| f.selectable)
         .map(|f| f.name.clone())
         .collect();
+    // Publish the complete inventory before any folder's potentially large
+    // download. Previously later folders were invisible until earlier ones finished.
+    let mut folders = Vec::new();
+    for f in remote.iter().filter(|f| f.selectable) {
+        folders.push((f, store.upsert_remote_folder(account_id, f)?));
+    }
     store.retain_folders(account_id, &names)?;
+    let total_folders = folders.len();
+    progress(SyncProgress {
+        stage: "folders",
+        folder: None,
+        completed_folders: 0,
+        total_folders,
+        downloaded: 0,
+        total_messages: 0,
+    });
     let mut report = SyncReport::default();
     let days = store.account_settings(account_id)?.sync_days;
 
     let mut inbox_new: Option<(i64, Vec<u32>)> = None;
-    for f in remote.iter().filter(|f| f.selectable) {
-        let folder_id = store.upsert_remote_folder(account_id, f)?;
-        match sync_folder_detailed(store, folder_id, &f.name, &mut session, days, condstore).await {
+    for (completed_folders, (f, folder_id)) in folders.into_iter().enumerate() {
+        let on_page = |downloaded, total_messages| {
+            progress(SyncProgress {
+                stage: "messages",
+                folder: Some(f.display.clone()),
+                completed_folders,
+                total_folders,
+                downloaded,
+                total_messages,
+            })
+        };
+        progress(SyncProgress {
+            stage: "folder",
+            folder: Some(f.display.clone()),
+            completed_folders,
+            total_folders,
+            downloaded: 0,
+            total_messages: 0,
+        });
+        // A broken/very large folder must not hold all the other folders
+        // indefinitely. Committed pages survive; no checkpoint is advanced on timeout.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5 * 60),
+            sync_folder_with_progress(
+                store,
+                folder_id,
+                &f.name,
+                &mut session,
+                days,
+                condstore,
+                on_page,
+            ),
+        )
+        .await
+        .unwrap_or(Err(crate::Error::Timeout));
+        match result {
             Ok(st) => {
                 report.folders += 1;
                 report.new_messages += st.new;
@@ -92,7 +177,9 @@ pub async fn sync_account(
             Err(e) => {
                 tracing::warn!(folder = %f.name, "folder sync failed: {e}");
                 report.failed_folders.push(f.name.clone());
-                let _ = session.logout().await;
+                // A timed-out response leaves protocol framing uncertain. Drop
+                // the socket rather than attempting LOGOUT on that session.
+                drop(session);
                 session = imap::connect(cfg, password).await?;
                 condstore = imap::has_condstore(&mut session).await?;
             }
@@ -118,7 +205,7 @@ pub async fn sync_account(
             Err(e) => report.rule_errors.push(e.to_string()),
         }
     }
-    let _ = session.logout().await;
+    let _ = imap::logout(&mut session).await;
     Ok(report)
 }
 
@@ -176,6 +263,19 @@ pub async fn sync_folder_detailed(
     session: &mut Session,
     days: u32,
     condstore: bool,
+) -> Result<FolderSyncStats> {
+    sync_folder_with_progress(store, folder_id, name, session, days, condstore, |_, _| {}).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_folder_with_progress(
+    store: &Store,
+    folder_id: i64,
+    name: &str,
+    session: &mut Session,
+    days: u32,
+    condstore: bool,
+    progress: impl Fn(usize, usize),
 ) -> Result<FolderSyncStats> {
     // SEARCH SINCE uses calendar dates. Persist the same UTC day that
     // imap::uids_since formats, so the boundary advances only once per day.
@@ -269,6 +369,7 @@ pub async fn sync_folder_detailed(
 
     let mut to_fetch = to_fetch;
     to_fetch.sort_unstable_by(|a, b| b.cmp(a));
+    progress(0, to_fetch.len());
     for page in to_fetch.chunks(PAGE_SIZE) {
         let fetched = imap::fetch_full(session, page).await?;
         let batch: Vec<NewMessage<'_>> = fetched
@@ -282,6 +383,7 @@ pub async fn sync_folder_detailed(
             .collect();
         store.insert_messages(folder_id, &batch)?;
         stats.new += batch.len();
+        progress(stats.new, to_fetch.len());
         // A daily/legacy window reconciliation can recover older cached
         // mail. Only genuinely new UIDs should trigger automatic rules.
         stats.new_uids.extend(

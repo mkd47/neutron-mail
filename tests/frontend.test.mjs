@@ -148,3 +148,29 @@ test('closing task details before debounce still saves the edit', async () => {
   assert.equal(saved[0].notes, 'Keep this');
   assert.equal(c.getCurrent(), null);
 });
+
+test('folder discovery refreshes the sidebar while the account sync is still pending', async () => {
+  let reads = 0;
+  const c = componentScript('src/App.svelte', { api: {
+    listFolders: async () => { reads++; return [{id:10,role:'inbox'}, {id:11,name:'已发送'}]; },
+    listMessages: async () => [],
+  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({folders,status})})');
+  c.setAccount(account);
+  await c.onSyncProgress({account_id:1,stage:'folders',total_folders:2});
+  assert.equal(reads,1);
+  assert.equal(c.state().folders.length,2);
+  assert.match(c.state().status,/Found 2 folders/);
+  await c.onSyncProgress({account_id:2,stage:'folders',total_folders:99});
+  assert.equal(reads,1);
+});
+
+test('committed download pages become visible before the final sync response', async () => {
+  let reads = 0;
+  const c = componentScript('src/App.svelte', { api: {
+    listFolders: async () => [{id:10,role:'inbox'}], listMessages: async () => {reads++;return []},
+  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({status})})');
+  c.setAccount(account);
+  await c.onSyncProgress({account_id:1,stage:'messages',folder:'Inbox',completed_folders:0,total_folders:3,downloaded:50,total_messages:200});
+  assert.equal(reads,1);
+  assert.match(c.state().status,/50\/200 messages/);
+});

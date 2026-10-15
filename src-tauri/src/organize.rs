@@ -30,7 +30,7 @@ fn resync_later(app: &AppHandle, account_id: i64) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let r = crate::commands::run_sync(&state, account_id).await;
+        let r = crate::commands::run_sync(&app, &state, account_id).await;
         if let Err(e) = &r {
             tracing::warn!(account = account_id, "resync after change failed: {e}");
         }
@@ -58,7 +58,7 @@ pub async fn create_folder(
 ) -> Res<Folder> {
     let (mut s, _) = session(&state, account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state.account_sync_lock(account_id).lock_owned().await;
         folders::create(&state.store, &mut s, account_id, parent_id, name.trim()).await
     };
     done(s).await;
@@ -89,7 +89,7 @@ pub async fn rename_folder(
     };
     let (mut s, _) = session(&state, f.account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state.account_sync_lock(f.account_id).lock_owned().await;
         let leaf = name.as_deref().map(str::trim);
         folders::rename(&state.store, &mut s, folder_id, leaf, parent).await
     };
@@ -108,7 +108,7 @@ pub async fn delete_folder(
     let f = state.store.folder(folder_id)?;
     let (mut s, _) = session(&state, f.account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state.account_sync_lock(f.account_id).lock_owned().await;
         folders::delete(&state.store, &mut s, folder_id, mode).await
     };
     done(s).await;
@@ -151,7 +151,10 @@ pub async fn move_messages(
     let target = state.store.folder(target_folder_id)?;
     let (mut s, _) = session(&state, target.account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state
+            .account_sync_lock(target.account_id)
+            .lock_owned()
+            .await;
         folders::transfer(&state.store, &mut s, &message_ids, target_folder_id, copy).await
     };
     done(s).await;
@@ -174,7 +177,10 @@ pub async fn undo_transfer(
     }
     let (mut s, _) = session(&state, transfer.account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state
+            .account_sync_lock(transfer.account_id)
+            .lock_owned()
+            .await;
         folders::undo(&state.store, &mut s, &transfer).await
     };
     done(s).await;
@@ -240,7 +246,7 @@ pub async fn run_rules_now(
     let ids = state.store.message_ids(folder_id)?;
     let (mut s, password) = session(&state, f.account_id).await?;
     let r = {
-        let _g = state.sync_lock.lock().await;
+        let _g = state.account_sync_lock(f.account_id).lock_owned().await;
         rules_exec::run(
             &state.store,
             &mut s,

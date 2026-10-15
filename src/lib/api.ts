@@ -83,6 +83,7 @@ export interface AppInfo {
   version: string;
 }
 export interface SyncEvent { account_id: number; report?: SyncReport; error?: string }
+export interface SyncProgress { account_id: number; stage: string; folder: string | null; completed_folders: number; total_folders: number; downloaded: number; total_messages: number }
 
 export interface AccountSettings {
   signature_html: string;
@@ -143,6 +144,7 @@ export const api = {
     invoke<Transfer>("move_messages", { messageIds, targetFolderId, copy }),
   undoTransfer: (transfer: Transfer) => invoke<number>("undo_transfer", { transfer }),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
+  onSyncProgress: (cb: (e: SyncProgress) => void): Promise<UnlistenFn> => listen<SyncProgress>("mail://sync-progress", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>
     listen<LinkInfo | { error: string; original: string }>("mail://link", (e) => cb(e.payload)),
   onHover: (cb: (url: string | null) => void): Promise<UnlistenFn> => listen<string | null>("mail://hover", (e) => cb(e.payload)),

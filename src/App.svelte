@@ -13,7 +13,7 @@
   import Calendar from "./lib/Calendar.svelte";
   import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, pimApi } from "./lib/api";
+    type LinkInfo, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -370,6 +370,18 @@
     } catch (e) { if (version === accountVersion && request === detailRequest) status = errorText(e); }
   }
   const syncingAccounts = new Set<number>();
+  async function onSyncProgress(e: SyncProgress) {
+    if (e.account_id !== account?.id) return;
+    const version = accountVersion;
+    if (e.stage === "connecting") status = "Connecting to mail server…";
+    else if (e.stage === "listing") status = "Discovering folders…";
+    else if (e.stage === "folders") status = `Found ${e.total_folders} folders · downloading mail…`;
+    else status = `Syncing ${e.folder ?? "mail"} · folder ${e.completed_folders + 1}/${e.total_folders}${e.total_messages ? ` · ${e.downloaded}/${e.total_messages} messages` : ""}`;
+    if (e.stage === "folders" || (e.stage === "messages" && e.downloaded > 0)) {
+      await refreshFolders();
+      if (version === accountVersion) await refreshMessages();
+    }
+  }
   async function sync() {
     if (!account || syncingAccounts.has(account.id)) return;
     const id = account.id, version = accountVersion;
@@ -433,20 +445,21 @@
         info = await api.appInfo();
         if (info.cache.notice) showToast(info.cache.notice, info.cache.mode !== "encrypted" || info.cache.notice.includes("could not"));
         accounts = await api.listAccounts();
-        if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
         const u1 = await api.onLink(onLinkEvent);
         const u2 = await api.onHover((u) => (hoverUrl = u));
         const u3 = await api.onSync(async (e) => {
           if (e.account_id !== account?.id) return;
           if (e.error) { status = `Background sync: ${e.error}`; return; }
           if (e.report?.rule_errors.length) showToast(`Rules: ${e.report.rule_errors.join("; ")}`, true);
-          if (e.report && e.report.new_messages + e.report.removed_messages > 0) {
-            status = `${e.report.new_messages} new message${e.report.new_messages === 1 ? "" : "s"}${e.report.rules_matched ? ` · ${e.report.rules_matched} sorted by rules` : ""}`;
+          if (e.report) {
+            status = e.report.failed_folders.length ? `Synced with errors: ${e.report.failed_folders.join(", ")}` : `Up to date · ${e.report.new_messages} new message${e.report.new_messages === 1 ? "" : "s"}${e.report.rules_matched ? ` · ${e.report.rules_matched} sorted by rules` : ""}`;
             await refreshFolders(); await refreshMessages();
           }
         });
         const u4 = await pimApi.onReminder((t) => { showToast(`⏰ Reminder: ${t.title}`); pimKey++; });
-        unlisten = () => { u1(); u2(); u3(); u4(); };
+        const u5 = await api.onSyncProgress(onSyncProgress);
+        unlisten = () => { u1(); u2(); u3(); u4(); u5(); };
+        if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
       } catch (e) { status = errorText(e); }
     })();
     return () => unlisten?.();
