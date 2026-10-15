@@ -104,9 +104,7 @@ pub fn resolve_email_link(state: State<'_, AppState>, link: EmailLink) -> Res<Op
 }
 
 #[tauri::command]
-pub fn flagged_emails(
-    state: State<'_, AppState>,
-) -> Res<Vec<neutron_core::model::MessageSummary>> {
+pub fn flagged_emails(state: State<'_, AppState>) -> Res<Vec<neutron_core::model::MessageSummary>> {
     state.store.flagged_messages(200)
 }
 #[tauri::command]
