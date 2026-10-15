@@ -10,10 +10,15 @@ use serde::Deserialize;
 
 use crate::model::{ComposeDraft, ForwardedAttachment};
 use crate::parse::{self, strip_tags};
+use crate::sanitize::{escape_html, sanitize_compose_html, text_to_html};
 
 /// RFC 5322 recommends trimming long References chains; keep the first
 /// (thread root) and the most recent ones.
 const MAX_REFERENCES: usize = 20;
+
+/// Inline style of the quote block (works in most mail clients, which
+/// ignore `<style>` blocks).
+const QUOTE_STYLE: &str = "margin: 0 0 0 0.8ex; border-left: 2px solid #c9c4d8; padding-left: 1ex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +101,11 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
     } else {
         p.text.clone()
     };
+    // The original as compose-safe HTML (its own HTML if it has one).
+    let body_html = match p.html_raw.as_deref() {
+        Some(h) => sanitize_compose_html(h),
+        None => text_to_html(&body_text),
+    };
     let from = addrs(msg.from());
     let reply_to = addrs(msg.reply_to());
     let to = addrs(msg.to());
@@ -161,6 +171,11 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
                 bcc: Vec::new(),
                 subject: with_prefix("Re:", &p.subject),
                 body: format!("\n\nOn {date}, {sender} wrote:\n{}\n", quote(&body_text)),
+                html: Some(format!(
+                    "<p><br></p><p>On {}, {} wrote:</p><blockquote type=\"cite\" style=\"{QUOTE_STYLE}\">{body_html}</blockquote>",
+                    escape_html(&date),
+                    escape_html(&sender)
+                )),
                 in_reply_to: parent_id,
                 references,
                 attachments: Vec::new(),
@@ -180,6 +195,10 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
             }
             ComposeDraft {
                 subject: with_prefix("Fwd:", &p.subject),
+                html: Some(format!(
+                    "<p><br></p><p>{}</p><div>{body_html}</div>",
+                    text_to_html(header.trim())
+                )),
                 body: format!("{header}\n{}\n", body_text.trim_end()),
                 in_reply_to: None,
                 references: parent_id.into_iter().collect(),
@@ -192,6 +211,8 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
             cc: cc.iter().map(fmt_addr).collect(),
             bcc: addrs(msg.bcc()).iter().map(fmt_addr).collect(),
             subject: p.subject.clone(),
+            // A draft written in the HTML editor resumes as HTML.
+            html: p.html_raw.as_deref().map(sanitize_compose_html),
             body: body_text,
             in_reply_to: ids(msg.in_reply_to()).into_iter().next(),
             references: ids(msg.references()),

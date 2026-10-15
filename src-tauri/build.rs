@@ -25,6 +25,7 @@ fn main() {
             "open_attachment",
             "suggest_contacts",
             "contacts_status",
+            "sanitize_compose_html",
         ]),
     ))
     .expect("failed to run tauri-build");

@@ -22,6 +22,7 @@
     return s.name ? `${s.name} <${s.email}>` : s.email;
   }
   function add(v: string) {
+    clearTimeout(timer); seq++; // drop a lookup still in flight
     const t = v.trim().replace(/[,;]+$/, "").trim();
     if (t && !values.includes(t)) values = [...values, t];
     text = ""; suggestions = []; open = false;

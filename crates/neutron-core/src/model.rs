@@ -148,7 +148,12 @@ pub struct OutgoingMessage {
     #[serde(default)]
     pub bcc: Vec<String>,
     pub subject: String,
+    /// Plain-text body (the text/plain part).
     pub body: String,
+    /// Rich body from the HTML editor; when set the message is sent as
+    /// multipart/alternative (text + HTML). Sanitized again before sending.
+    #[serde(default)]
+    pub html_body: Option<String>,
     /// Message-ID being replied to (with or without angle brackets).
     #[serde(default)]
     pub in_reply_to: Option<String>,
@@ -189,6 +194,8 @@ pub struct ComposeDraft {
     pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// Initial content of the HTML editor (sanitized for compose).
+    pub html: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     /// Attachments carried over (forward / draft), shown as removable chips.

@@ -157,6 +157,7 @@ pub fn run() {
             attachments::open_attachment,
             contacts::suggest_contacts,
             contacts::contacts_status,
+            commands::sanitize_compose_html,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");

@@ -86,6 +86,16 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 - Read via D-Bus (`zbus` 5, pure Rust, no libebook C bindings): `Sources5` to list enabled address books, `AddressBook10.OpenAddressBook` + `GetContactList` with an `x-evolution-any-field` "contains" query. The query string is escaped for EDS's S-expression syntax (`sexp_escape`, tested). Calls have a 4 s timeout; if EDS isn't running the composer silently falls back to addresses from your own mail cache ("Recent", ranked below contacts) and retries EDS after 60 s.
 - Contact data is only read (the seeding example in `crates/neutron-core/examples/eds_seed.rs` is for tests). Suggestions are cached in memory for 30 s; nothing about contacts is logged except counts.
 
+### 2.12 HTML composing (v0.3)
+- The editor is a `contenteditable` element **in the app page** (not sandboxed), so everything that enters it is sanitized by a stricter **compose policy** (`sanitize_compose_html`): no `<style>` blocks, no `class`/`id` (app CSS can't be targeted or spoofed), an allow-list of CSS properties without `position`, `z-index`, `transform`, `top/left`, `background-image` or any `url()` (quoted mail can't draw over the app UI), images only as inline raster `data:` URLs (remote images dropped, never fetched), links only http/https/mailto with `rel="noopener noreferrer nofollow"`.
+- Applied (1) to the quoted original for Reply/Reply all/Forward and to resumed drafts, in Rust; (2) to every paste and drop (`text/html` goes through the `sanitize_compose_html` command; files are refused); (3) **again before sending/saving**, authoritatively, so a compromised UI can't send unsanitized HTML. The editor also has `contain: paint` as a CSS backstop, and the app CSP blocks inline script and remote images.
+- Links are added through an in-app link bar that accepts only https/http/mailto (`javascript:` is refused; GUI-tested).
+- Sent as `multipart/alternative` (text + HTML); inline images become `multipart/related` parts referenced by `cid:` (identical images share a part). The **text/plain part is generated in Rust from the sanitized HTML** (quotes as `> `, lists, link URLs), not taken from the UI, so both parts always match. Max 20 MB of HTML.
+- Sender names/dates in the quote header are HTML-escaped (test with `Eve <script>`); a plain-text original is escaped and quoted with `<br>`.
+- Users can switch a message to **plain text** (formatting dropped) per message.
+- Tests: 6 in `tests/compose_html.rs` (sanitizer policy incl. `position:fixed`, hostile paste, multipart structure and cid matching, quoting, text alternative) + the reply-all integration test now checks the delivered `multipart/alternative` with the quote. GUI: reply to the HTML newsletter with bold/list/paste, forward saved as a draft and resumed with formatting, new mail with a link; MIME tree and content verified in the server's Maildir.
+- Limits: `document.execCommand` (deprecated but supported by WebKitGTK) drives the formatting; WebKit may add `style` (e.g. `rgb()` colours, `font-size: medium`) on paste, which the allow-list keeps. Class-based styling of quoted newsletters is dropped (layout may be simpler than the original).
+
 ## 3. Findings
 
 | # | Severity | Finding | Status |
@@ -110,6 +120,8 @@ Verified: 11 sanitizer tests (incl. safe CSS kept, dangerous CSS dropped, remote
 | O9 | Low | (v0.2) Remote images, once loaded, reveal the user's IP and open time to the sender (inherent to the feature). No proxy. | Accepted; opt-in only. |
 | O10 | Low | (v0.2) CSS is allowed in messages, so layout-spoofing phishing (fake UI drawn by CSS) is easier than with plain text. | Accepted; the real link target is always shown on hover and in the confirm dialog. |
 | O11 | Info | (v0.2) Drafts stored on the IMAP server contain the Bcc header (needed to resume them). | Accepted; it is the user's own mailbox. |
+| F10 | Low | (v0.3, GUI testing) Typing in the new editor reset the caret on every keystroke (text appeared reversed). | **Fixed** before release; initial content is set once. |
+| F11 | Info | (v0.3, GUI testing) A contact suggestion request still in flight re-opened the dropdown after Enter had already added the chip. | **Fixed**: pending lookups are cancelled when a chip is added. |
 | O12 | Info | (v0.2) `lnkd.in` and other opaque short links can't be unwrapped without contacting the shortener; they are shown as-is with their real host. | Accepted. |
 
 ## 4. Not covered / limits of this audit

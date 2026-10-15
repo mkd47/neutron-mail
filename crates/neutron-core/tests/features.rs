@@ -149,6 +149,7 @@ async fn reply_all_threading_headers_and_bcc_end_to_end() {
         bcc: vec!["hidden@example.test".into()],
         subject: subject.clone(),
         body: all.body.clone(),
+        html_body: all.html.clone(),
         in_reply_to: all.in_reply_to.clone(),
         references: all.references.clone(),
         attachments: vec![],
@@ -163,6 +164,11 @@ async fn reply_all_threading_headers_and_bcc_end_to_end() {
         "{refs}"
     );
     assert!(header(&raw, "Bcc").is_none(), "Bcc must not be in headers");
+    // Sent as HTML: multipart/alternative with the original quoted.
+    let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+    let html = parsed.body_html(0).expect("html part delivered");
+    assert!(html.contains("<blockquote type=\"cite\""), "{html}");
+    assert!(String::from_utf8_lossy(&raw).contains("multipart/alternative"));
     let env_to = header(&raw, "X-Test-Envelope-To").unwrap();
     for r in [
         "kaan@localhost",

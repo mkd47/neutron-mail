@@ -19,6 +19,9 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
   "Load remote images" per message or "Always load from this sender" (fetched by the Rust core with an SSRF guard), and **View source**.
 - **Links that work, safely:** clicks in the sandboxed message are intercepted; a dialog shows the real host and
   the cleaned URL (LinkedIn/redirect tracking removed) before opening it in your browser. Hovering shows the real target. `mailto:` opens the composer.
+- **Rich-text (HTML) composing** for new mail, replies and forwards: bold/italic/lists/quotes/links, the original
+  quoted with its formatting and inline images, sent as multipart/alternative (text generated from the HTML);
+  everything pasted or quoted is sanitized, and you can switch any message to plain text.
 - **Reply / Reply all / Forward inline** in the reading pane (original stays visible), plus a standalone Compose window:
   To/Cc/Bcc chips, correct `In-Reply-To`/`References`, quoted text, forwarded attachments, **drafts** (save, resume, send), and a visible warning if the copy to Sent fails.
 - **Attachments:** attach via the native file picker; save (native save dialog) or open received files with the default app;
@@ -34,6 +37,10 @@ GNOME Calendar integration is still a stub.
 | Inline reply all + contact autocomplete | Forward with attachments | Link confirmation (LinkedIn tracking removed) |
 |---|---|---|
 | ![](docs/screenshots/autocomplete-inline.png) | ![](docs/screenshots/inline-forward-attachment.png) | ![](docs/screenshots/linkedin-link-confirm.png) |
+
+| Rich-text reply (quoted HTML) | Received rich reply | Encrypted cache (sidebar) |
+|---|---|---|
+| ![](docs/screenshots/html-compose-reply.png) | ![](docs/screenshots/html-compose-received.png) | ![](docs/screenshots/cache-encrypted.png) |
 
 | HTML + remote images loaded | View source | Dangerous attachment warning |
 |---|---|---|

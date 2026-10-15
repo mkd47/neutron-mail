@@ -14,7 +14,9 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_builder::headers::address::Address;
+use mail_builder::headers::content_type::ContentType;
 use mail_builder::headers::text::Text;
+use mail_builder::mime::MimePart;
 use mail_builder::MessageBuilder;
 
 use crate::attachments::{MAX_ATTACHMENTS, MAX_TOTAL_ATTACHMENT_BYTES};
@@ -121,8 +123,7 @@ pub fn build(
         .subject(m.subject.clone())
         .message_id(message_id.clone())
         .date(chrono::Utc::now().timestamp())
-        .header("User-Agent", Text::new("Neutron Mail"))
-        .text_body(m.body.replace("\r\n", "\n"));
+        .header("User-Agent", Text::new("Neutron Mail"));
     if !to.is_empty() {
         b = b.to(addr_list(&to));
     }
@@ -144,13 +145,7 @@ pub fn build(
     if !refs.is_empty() {
         b = b.references(refs);
     }
-    for a in attachments {
-        b = b.attachment(
-            a.mime.clone(),
-            crate::attachments::safe_filename(&a.name),
-            a.data.clone(),
-        );
-    }
+    b = b.body(mime_tree(m, attachments, &domain)?);
     let raw = b
         .write_to_vec()
         .map_err(|e| Error::Invalid(format!("cannot build message: {e}")))?;
@@ -213,4 +208,128 @@ pub async fn send(
         .send_raw(&built.envelope, &built.raw)
         .await?;
     Ok(built.raw)
+}
+
+fn utf8(ct: &'static str) -> ContentType<'static> {
+    ContentType::new(ct).attribute("charset", "utf-8")
+}
+
+/// MIME structure (RFC 2046/2387):
+/// mixed [ alternative [ text/plain, related [ text/html, inline images ] ], attachments ]
+/// with each level present only when needed.
+fn mime_tree(
+    m: &OutgoingMessage,
+    attachments: &[OutgoingAttachment],
+    domain: &str,
+) -> Result<MimePart<'static>> {
+    let content = match m.html_body.as_deref().filter(|h| !h.trim().is_empty()) {
+        None => MimePart::new(utf8("text/plain"), m.body.replace("\r\n", "\n")),
+        Some(html) => {
+            if html.len() > crate::sanitize::MAX_COMPOSE_HTML_BYTES {
+                return Err(Error::Invalid("the message is too large".into()));
+            }
+            // Authoritative sanitizing: never trust what the editor produced.
+            let clean = crate::sanitize::sanitize_compose_html(html);
+            // The text alternative is derived from the same HTML, so both
+            // parts always say the same thing.
+            let text = MimePart::new(utf8("text/plain"), crate::sanitize::html_to_text(&clean));
+            let (clean, images) = inline_images_to_cid(&clean, domain);
+            let doc = MimePart::new(
+                utf8("text/html"),
+                format!(
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>{clean}</body></html>"
+                ),
+            );
+            let html_part = if images.is_empty() {
+                doc
+            } else {
+                let mut parts = vec![doc];
+                parts.extend(
+                    images
+                        .into_iter()
+                        .map(|i| MimePart::new(i.mime, i.data).inline().cid(i.cid)),
+                );
+                MimePart::new("multipart/related", parts)
+            };
+            MimePart::new("multipart/alternative", vec![text, html_part])
+        }
+    };
+    if attachments.is_empty() {
+        return Ok(content);
+    }
+    let mut parts = vec![content];
+    for a in attachments {
+        parts.push(
+            MimePart::new(a.mime.clone(), a.data.clone())
+                .attachment(crate::attachments::safe_filename(&a.name)),
+        );
+    }
+    Ok(MimePart::new("multipart/mixed", parts))
+}
+
+struct InlineImage {
+    mime: &'static str,
+    cid: String,
+    data: Vec<u8>,
+}
+
+/// Replace `src="data:image/…;base64,…"` images (pasted or quoted) with
+/// `cid:` references to inline parts, which mail clients display far more
+/// reliably than data URLs. Identical images share one part.
+fn inline_images_to_cid(html: &str, domain: &str) -> (String, Vec<InlineImage>) {
+    let mut out = String::with_capacity(html.len());
+    let mut images: Vec<InlineImage> = Vec::new();
+    let mut seen: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut rest = html;
+    while let Some(i) = rest.find("src=\"data:image/") {
+        let start = i + 5; // after src="
+        let Some(len) = rest[start..].find('"') else {
+            break;
+        };
+        let url = &rest[start..start + len];
+        out.push_str(&rest[..start]);
+        let cid = if let Some(c) = seen.get(url) {
+            Some(c.clone())
+        } else {
+            decode_data_image(url).map(|(mime, data)| {
+                let cid = format!("img{}.{}@{}", images.len() + 1, rand_hex(), domain);
+                images.push(InlineImage {
+                    mime,
+                    cid: cid.clone(),
+                    data,
+                });
+                seen.insert(url, cid.clone());
+                cid
+            })
+        };
+        match cid {
+            Some(c) => out.push_str(&format!("cid:{c}")),
+            None => out.push_str(url),
+        }
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+    (out, images)
+}
+
+fn decode_data_image(url: &str) -> Option<(&'static str, Vec<u8>)> {
+    let (meta, b64) = url.strip_prefix("data:")?.split_once(',')?;
+    let meta = meta.to_ascii_lowercase();
+    let mime = match meta.strip_suffix(";base64")? {
+        "image/png" => "image/png",
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        _ => return None,
+    };
+    use base64::Engine as _;
+    let b64: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    Some((mime, data))
+}
+
+fn rand_hex() -> String {
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }

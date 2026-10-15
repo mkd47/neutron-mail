@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sanitize-compose-html"
+description = "Enables the sanitize_compose_html command without any pre-configured scope."
+commands.allow = ["sanitize_compose_html"]
+
+[[permission]]
+identifier = "deny-sanitize-compose-html"
+description = "Denies the sanitize_compose_html command without any pre-configured scope."
+commands.deny = ["sanitize_compose_html"]

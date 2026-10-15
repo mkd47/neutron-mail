@@ -376,3 +376,12 @@ pub async fn save_draft(
     }
     Ok(())
 }
+
+/// Sanitize HTML pasted into (or loaded into) the rich-text composer.
+#[tauri::command]
+pub fn sanitize_compose_html(html: String) -> Res<String> {
+    if html.len() > neutron_core::sanitize::MAX_COMPOSE_HTML_BYTES {
+        return Err(Error::Invalid("pasted content is too large".into()));
+    }
+    Ok(neutron_core::sanitize::sanitize_compose_html(&html))
+}

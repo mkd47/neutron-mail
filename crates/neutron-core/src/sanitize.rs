@@ -257,3 +257,332 @@ a{{color:{link};cursor:pointer}}img{{max-width:100%;height:auto}}table{{max-widt
 </head><body>{sanitized_body}</body></html>"
     )
 }
+
+/// Max size of composed HTML (including inline images as data URLs).
+pub const MAX_COMPOSE_HTML_BYTES: usize = 20 * 1024 * 1024;
+
+/// CSS properties kept in composed mail. The composer is part of the app
+/// page (not a sandboxed iframe), so layout properties that could draw over
+/// the app UI (`position`, `z-index`, `transform`, …) are not allowed, and
+/// neither are background images.
+const COMPOSE_CSS_PROPS: &[&str] = &[
+    "color",
+    "background-color",
+    "font",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "font-variant",
+    "text-align",
+    "text-decoration",
+    "text-indent",
+    "text-transform",
+    "letter-spacing",
+    "line-height",
+    "white-space",
+    "vertical-align",
+    "direction",
+    "margin",
+    "margin-top",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "padding",
+    "padding-top",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "border",
+    "border-left",
+    "border-right",
+    "border-top",
+    "border-bottom",
+    "border-color",
+    "border-style",
+    "border-width",
+    "border-collapse",
+    "border-spacing",
+    "border-radius",
+    "list-style-type",
+    "width",
+    "max-width",
+    "height",
+];
+
+fn compose_css(css: &str) -> String {
+    let mut st = Stats::default();
+    let base = sanitize_css(css, &HashMap::new(), &mut st);
+    base.split(';')
+        .filter_map(|decl| {
+            let (prop, value) = decl.split_once(':')?;
+            let prop = prop.trim().to_ascii_lowercase();
+            let value = value.trim();
+            let ok = COMPOSE_CSS_PROPS.contains(&prop.as_str())
+                && !value.to_ascii_lowercase().contains("url(")
+                && !value.is_empty();
+            ok.then(|| format!("{prop}: {value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Sanitize HTML written in (or pasted into, or quoted by) the composer.
+/// Stricter than the viewer policy because the composer is not sandboxed:
+/// no `<style>` blocks, no classes or ids, a CSS property allow-list, no
+/// remote images (inline raster `data:` images only), links http(s)/mailto.
+/// Used on paste, for quoting, and again (authoritatively) before sending.
+pub fn sanitize_compose_html(input: &str) -> String {
+    let schemes: HashSet<&str> = ["http", "https", "mailto", "data"].into_iter().collect();
+    let mut tag_attrs = HashMap::new();
+    tag_attrs.insert("blockquote", ["type"].into_iter().collect::<HashSet<_>>());
+    tag_attrs.insert("a", ["href", "title"].into_iter().collect());
+    tag_attrs.insert(
+        "img",
+        ["src", "alt", "width", "height"].into_iter().collect(),
+    );
+    tag_attrs.insert(
+        "td",
+        ["colspan", "rowspan", "align", "valign"]
+            .into_iter()
+            .collect(),
+    );
+    tag_attrs.insert(
+        "th",
+        ["colspan", "rowspan", "align", "valign"]
+            .into_iter()
+            .collect(),
+    );
+    tag_attrs.insert("ol", ["start"].into_iter().collect());
+    let out = ammonia::Builder::default()
+        .url_schemes(schemes)
+        .link_rel(Some("noopener noreferrer nofollow"))
+        .url_relative(ammonia::UrlRelative::Deny)
+        .add_tags(["font"])
+        .tag_attributes(tag_attrs)
+        .generic_attributes(["style", "dir", "align"].into_iter().collect())
+        .attribute_filter(|element, attribute, value| match (element, attribute) {
+            ("img", "src") => is_inline_image(value).then_some(Cow::Borrowed(value)),
+            (_, "href") if value.trim_start().to_ascii_lowercase().starts_with("data:") => None,
+            (_, "style") => {
+                let c = compose_css(value);
+                (!c.is_empty()).then_some(Cow::Owned(c))
+            }
+            _ => Some(Cow::Borrowed(value)),
+        })
+        .clean(input)
+        .to_string();
+    // Images whose source was dropped (remote, SVG…) would be empty boxes.
+    remove_srcless_imgs(&out)
+}
+
+fn remove_srcless_imgs(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find("<img") {
+        out.push_str(&rest[..i]);
+        let end = rest[i..].find('>').map_or(rest.len(), |e| i + e + 1);
+        let tag = &rest[i..end];
+        if tag.contains(" src=") {
+            out.push_str(tag);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Escape text for inclusion in HTML.
+pub fn escape_html(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&#39;"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+/// Plain text as HTML paragraphs (line breaks kept).
+pub fn text_to_html(s: &str) -> String {
+    escape_html(s.trim_end())
+        .replace("\r\n", "\n")
+        .replace('\n', "<br>")
+}
+
+/// Plain-text rendering of compose HTML for the text/plain alternative:
+/// block elements become line breaks, `<blockquote>` lines get `> `
+/// prefixes, links keep their URL, list items get bullets.
+/// Expects sanitizer output (well-formed, lower-case tags, escaped text).
+pub fn html_to_text(html: &str) -> String {
+    let mut lines: Vec<(usize, String)> = vec![(0, String::new())];
+    let mut depth = 0usize;
+    let mut href: Vec<Option<String>> = Vec::new();
+    let mut ol: Vec<Option<u32>> = Vec::new();
+    let mut rest = html;
+    let newline = |lines: &mut Vec<(usize, String)>, depth: usize| {
+        if lines.last().is_some_and(|l| !l.1.is_empty()) {
+            lines.push((depth, String::new()));
+        } else if let Some(l) = lines.last_mut() {
+            l.0 = depth;
+        }
+    };
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix('<') {
+            let end = stripped.find('>').map_or(rest.len(), |e| e + 2);
+            let tag = &rest[1..end.saturating_sub(1).max(1)];
+            rest = &rest[end.min(rest.len())..];
+            let closing = tag.starts_with('/');
+            let name: String = tag
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            match (name.as_str(), closing) {
+                ("br", _) => lines.push((depth, String::new())),
+                ("blockquote", false) => {
+                    depth += 1;
+                    newline(&mut lines, depth);
+                }
+                ("blockquote", true) => {
+                    depth = depth.saturating_sub(1);
+                    lines.push((depth, String::new()));
+                }
+                ("ol", false) => ol.push(Some(1)),
+                ("ul", false) => ol.push(None),
+                ("ol" | "ul", true) => {
+                    ol.pop();
+                    newline(&mut lines, depth);
+                }
+                ("li", false) => {
+                    newline(&mut lines, depth);
+                    let indent = "  ".repeat(ol.len().saturating_sub(1));
+                    let bullet = match ol.last_mut() {
+                        Some(Some(n)) => {
+                            let b = format!("{n}. ");
+                            *n += 1;
+                            b
+                        }
+                        _ => "• ".to_string(),
+                    };
+                    if let Some(l) = lines.last_mut() {
+                        l.1.push_str(&indent);
+                        l.1.push_str(&bullet);
+                    }
+                }
+                ("a", false) => {
+                    let h = tag
+                        .split("href=\"")
+                        .nth(1)
+                        .and_then(|v| v.split('"').next())
+                        .map(unescape);
+                    href.push(h);
+                }
+                ("a", true) => {
+                    if let Some(Some(h)) = href.pop() {
+                        let h = h.strip_prefix("mailto:").unwrap_or(&h).to_string();
+                        if let Some(l) = lines.last_mut() {
+                            if !l.1.trim_end().ends_with(&h) {
+                                l.1.push_str(&format!(" <{h}>"));
+                            }
+                        }
+                    }
+                }
+                (
+                    "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "tr" | "pre" | "table"
+                    | "hr",
+                    _,
+                ) => newline(&mut lines, depth),
+                ("td" | "th", true) => {
+                    if let Some(l) = lines.last_mut() {
+                        l.1.push('\t');
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            let end = rest.find('<').unwrap_or(rest.len());
+            let text = unescape(&rest[..end]).replace(['\n', '\r'], " ");
+            if let Some(l) = lines.last_mut() {
+                if l.1.is_empty() {
+                    l.0 = depth;
+                    l.1.push_str(text.trim_start());
+                } else {
+                    l.1.push_str(&text);
+                }
+            }
+            rest = &rest[end..];
+        }
+    }
+    // Collapse runs of blank lines, keep quote prefixes.
+    let mut out = String::new();
+    let mut blank = 0;
+    for (d, l) in &lines {
+        let l = l.trim_end();
+        if l.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        let prefix = ">".repeat(*d);
+        if *d > 0 {
+            out.push_str(&prefix);
+            if !l.is_empty() {
+                out.push(' ');
+            }
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    out.trim().to_string() + "\n"
+}
+
+fn unescape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        o.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(semi) = tail.find(';').filter(|&n| n <= 10) else {
+            o.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let ent = &tail[1..semi];
+        let ch = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => ent
+                .strip_prefix("#x")
+                .or_else(|| ent.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => {
+                o.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                o.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    o.push_str(rest);
+    o
+}

@@ -28,6 +28,7 @@
     "allow-save-attachment",
     "allow-open-attachment",
     "allow-suggest-contacts",
+    "allow-sanitize-compose-html",
     "allow-contacts-status",
     {
       "identifier": "opener:allow-open-url",

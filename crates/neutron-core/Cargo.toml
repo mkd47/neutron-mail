@@ -24,6 +24,7 @@ ammonia = "4"
 rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 getrandom = "0.3"
 zeroize = "1"
+base64 = "0.22"
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -34,6 +34,8 @@ export type AttachmentRef = { kind: "file"; token: string } | { kind: "message";
 export interface ForwardedAttachment { message_id: number; index: number; name: string; mime: string; size: number }
 export interface ComposeDraft {
   to: string[]; cc: string[]; bcc: string[]; subject: string; body: string;
+  /** Initial HTML for the rich editor (sanitized by the backend), or null. */
+  html: string | null;
   in_reply_to: string | null; references: string[]; attachments: ForwardedAttachment[];
 }
 export type ComposeMode = "reply" | "reply_all" | "forward" | "draft";
@@ -49,6 +51,8 @@ export interface SearchHit extends MessageSummary { snippet: string }
 export interface SyncReport { folders: number; new_messages: number; removed_messages: number; failed_folders: string[] }
 export interface Outgoing {
   to: string[]; cc: string[]; bcc: string[]; subject: string; body: string;
+  /** Rich body; sent as multipart/alternative. The backend sanitizes it again. */
+  html_body: string | null;
   in_reply_to: string | null; references: string[]; attachments: AttachmentRef[];
 }
 export interface AppInfo {
@@ -85,6 +89,7 @@ export const api = {
   openAttachment: (messageId: number, index: number, confirmed: boolean) =>
     invoke<{ status: "opened" | "needs_confirmation"; reason: string | null }>("open_attachment", { messageId, index, confirmed }),
   suggestContacts: (accountId: number, query: string) => invoke<ContactSuggestion[]>("suggest_contacts", { accountId, query }),
+  sanitizeComposeHtml: (html: string) => invoke<string>("sanitize_compose_html", { html }),
   contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>
@@ -97,4 +102,4 @@ export function errorText(e: unknown): string {
 }
 
 export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" };
-export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", in_reply_to: null, references: [], attachments: [] });
+export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [] });
