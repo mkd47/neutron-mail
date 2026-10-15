@@ -12,7 +12,15 @@
   "app": {
     "withGlobalTauri": false,
     "windows": [
-      { "title": "Neutron Mail", "width": 1280, "height": 800, "minWidth": 900, "minHeight": 560 }
+      {
+        "title": "Neutron Mail",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560,
+        "create": false,
+        "label": "main"
+      }
     ],
     "security": {
       "csp": {
@@ -32,9 +40,17 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm"],
+    "targets": [
+      "deb",
+      "rpm"
+    ],
     "category": "Email",
     "shortDescription": "Native IMAP/SMTP mail client (prototype)",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ]
   }
 }

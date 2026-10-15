@@ -19,7 +19,9 @@ async fn send_then_receive_and_search() {
             cc: vec![],
             subject: subject.clone(),
             body: "Hello from the integration test about quokkas.".into(),
+            ..Default::default()
         },
+        &[],
     )
     .await
     .expect("send");
@@ -58,7 +60,9 @@ async fn smtp_rejects_bad_credentials() {
             cc: vec![],
             subject: "x".into(),
             body: "x".into(),
+            ..Default::default()
         },
+        &[],
     )
     .await;
     let Err(err) = r else {
@@ -86,7 +90,9 @@ async fn smtp_rejects_untrusted_certificate() {
             cc: vec![],
             subject: "x".into(),
             body: "x".into(),
+            ..Default::default()
         },
+        &[],
     )
     .await;
     let Err(err) = r else {
@@ -109,7 +115,10 @@ fn build_rejects_header_injection_and_empty_recipients() {
             cc: vec![],
             subject: "s".into(),
             body: "b".into(),
+            ..Default::default()
         },
+        &[],
+        false,
     );
     assert!(empty.is_err());
     let inj = smtp::build(
@@ -119,7 +128,10 @@ fn build_rejects_header_injection_and_empty_recipients() {
             cc: vec![],
             subject: "s".into(),
             body: "b".into(),
+            ..Default::default()
         },
+        &[],
+        false,
     );
     assert!(inj.is_err());
     let m = smtp::build(
@@ -129,9 +141,11 @@ fn build_rejects_header_injection_and_empty_recipients() {
             cc: vec![],
             subject: "hi\r\nBcc: victim@evil.test".into(),
             body: "b".into(),
+            ..Default::default()
         },
-    )
-    .unwrap();
-    let raw = String::from_utf8(m.formatted()).unwrap();
-    assert!(!raw.contains("\r\nBcc: victim"), "{raw}");
+        &[],
+        false,
+    );
+    // A multi-line subject is rejected outright (no header injection).
+    assert!(m.is_err());
 }

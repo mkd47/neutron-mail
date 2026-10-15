@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-image-sender-trust"
+description = "Enables the set_image_sender_trust command without any pre-configured scope."
+commands.allow = ["set_image_sender_trust"]
+
+[[permission]]
+identifier = "deny-set-image-sender-trust"
+description = "Denies the set_image_sender_trust command without any pre-configured scope."
+commands.deny = ["set_image_sender_trust"]

@@ -102,9 +102,15 @@ pub struct MessageSummary {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AttachmentInfo {
+    /// Position in the message's attachment list (stable for a given raw
+    /// message); used to save/open/forward the attachment.
+    pub index: usize,
+    /// Display name, already made safe (see `attachments::safe_filename`).
     pub name: String,
     pub mime: String,
     pub size: usize,
+    /// Executable/script type: the UI must confirm before opening.
+    pub risky: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -118,6 +124,9 @@ pub struct MessageDetail {
     /// text-only messages.
     pub html: Option<String>,
     pub remote_images_blocked: usize,
+    /// Remote images that were fetched and embedded (only when the user
+    /// asked to load remote images).
+    pub remote_images_loaded: usize,
     pub attachments: Vec<AttachmentInfo>,
 }
 
@@ -130,13 +139,78 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OutgoingMessage {
     pub to: Vec<String>,
     #[serde(default)]
     pub cc: Vec<String>,
+    /// Envelope-only recipients: never written to the sent message headers.
+    #[serde(default)]
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// Message-ID being replied to (with or without angle brackets).
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
+}
+
+/// An attachment chosen in the composer. Files are referenced by an opaque
+/// token issued by the backend file picker, never by a path from the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttachmentRef {
+    File {
+        token: String,
+    },
+    /// Attachment `index` of cached message `message_id` (forward/draft).
+    Message {
+        message_id: i64,
+        index: usize,
+    },
+}
+
+/// Resolved attachment content, ready to be put into a MIME message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// Composer prefill for reply / reply all / forward / resume draft.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ComposeDraft {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+    /// Attachments carried over (forward / draft), shown as removable chips.
+    pub attachments: Vec<ForwardedAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForwardedAttachment {
+    pub message_id: i64,
+    pub index: usize,
+    pub name: String,
+    pub mime: String,
+    pub size: usize,
+}
+
+/// Address suggestion for recipient autocomplete.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContactSuggestion {
+    pub name: String,
+    pub email: String,
+    /// "contacts" (GNOME address book via EDS) or "history" (mail cache).
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]

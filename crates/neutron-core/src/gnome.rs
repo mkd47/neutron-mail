@@ -1,17 +1,314 @@
-//! GNOME integration interfaces (stubs).
+//! GNOME integration.
 //!
-//! The research report recommends libebook/libecal (evolution-data-server)
-//! on a dedicated glib main-loop thread, and GNOME Online Accounts over
-//! D-Bus. These traits define the boundary the rest of the app codes
-//! against; the prototype ships only no-op implementations.
+//! **Contacts (real):** evolution-data-server over D-Bus with zbus. The
+//! session's address books are discovered via the EDS source registry
+//! (`org.gnome.evolution.dataserver.Sources5`), opened through the address
+//! book factory (`…AddressBook10`), and queried with an EBookQuery
+//! S-expression `(contains "x-evolution-any-field" "<q>")`, which matches
+//! names, nicknames and emails. The D-Bus connection stays open because EDS
+//! closes a book when the client that opened it disconnects. Every call
+//! has a timeout; if EDS is missing, the caller falls back to the address
+//! history in the mail cache.
+//!
+//! **Calendar (stub):** the interface the app codes against; no-op for now.
+
+use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::Serialize;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+
+use crate::{Error, Result};
+
+const SOURCES_BUS: &str = "org.gnome.evolution.dataserver.Sources5";
+const SOURCES_PATH: &str = "/org/gnome/evolution/dataserver/SourceManager";
+const SOURCE_IFACE: &str = "org.gnome.evolution.dataserver.Source";
+const BOOK_FACTORY_BUS: &str = "org.gnome.evolution.dataserver.AddressBook10";
+const BOOK_FACTORY_PATH: &str = "/org/gnome/evolution/dataserver/AddressBookFactory";
+const BOOK_FACTORY_IFACE: &str = "org.gnome.evolution.dataserver.AddressBookFactory";
+const BOOK_IFACE: &str = "org.gnome.evolution.dataserver.AddressBook";
+/// UID of the local "Personal" address book every EDS installation has.
+pub const SYSTEM_BOOK: &str = "system-address-book";
+const CALL_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContactHit {
     pub name: String,
     pub email: String,
-    pub source: String,
+    /// Address book display name.
+    pub book: String,
+}
+
+struct Book {
+    uid: String,
+    name: String,
+    bus: String,
+    path: OwnedObjectPath,
+}
+
+/// Open connection to the user's EDS address books.
+pub struct Eds {
+    conn: zbus::Connection,
+    books: Vec<Book>,
+}
+
+fn dbus_err(e: impl std::fmt::Display) -> Error {
+    Error::Invalid(format!("contacts (EDS): {e}"))
+}
+
+async fn timed<T>(f: impl std::future::Future<Output = zbus::Result<T>>) -> Result<T> {
+    tokio::time::timeout(CALL_TIMEOUT, f)
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(dbus_err)
+}
+
+/// `key=value` from a section of an EDS source keyfile.
+fn keyfile_value<'a>(data: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut in_section = false;
+    for line in data.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_section = l == format!("[{section}]");
+        } else if in_section {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim());
+                }
+            }
+        }
+    }
+    None
+}
+
+impl Eds {
+    /// Connect to the session bus and open every enabled address book.
+    pub async fn connect() -> Result<Self> {
+        let conn = timed(zbus::Connection::session()).await?;
+        let reply = timed(conn.call_method(
+            Some(SOURCES_BUS),
+            SOURCES_PATH,
+            Some("org.freedesktop.DBus.ObjectManager"),
+            "GetManagedObjects",
+            &(),
+        ))
+        .await?;
+        type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+        let objects: Objects = reply.body().deserialize().map_err(dbus_err)?;
+        let mut sources: Vec<(String, String)> = objects
+            .values()
+            .filter_map(|ifaces| {
+                let props = ifaces.get(SOURCE_IFACE)?;
+                let uid = String::try_from(props.get("UID")?.try_clone().ok()?).ok()?;
+                let data = String::try_from(props.get("Data")?.try_clone().ok()?).ok()?;
+                let is_book = data.lines().any(|l| l.trim() == "[Address Book]");
+                let enabled = keyfile_value(&data, "Data Source", "Enabled") != Some("false");
+                let name = keyfile_value(&data, "Data Source", "DisplayName")
+                    .unwrap_or(&uid)
+                    .to_string();
+                (is_book && enabled).then_some((uid, name))
+            })
+            .collect();
+        // Local book first, then the rest in a stable order.
+        sources.sort_by_key(|(uid, name)| (uid != SYSTEM_BOOK, name.clone()));
+
+        let mut books = Vec::new();
+        let mut problems = Vec::new();
+        if sources.is_empty() {
+            problems.push(format!(
+                "no enabled address book among {} sources",
+                objects.len()
+            ));
+        }
+        for (uid, name) in sources {
+            match Self::open_book(&conn, &uid).await {
+                Ok((path, bus)) => books.push(Book {
+                    uid,
+                    name,
+                    bus,
+                    path,
+                }),
+                // A remote book that needs credentials or network must not
+                // break autocomplete for the others.
+                Err(e) => {
+                    tracing::info!(book = %uid, "address book not available: {e}");
+                    problems.push(format!("{uid}: {e}"));
+                }
+            }
+        }
+        if books.is_empty() {
+            return Err(Error::Invalid(format!(
+                "contacts (EDS): no address book could be opened ({})",
+                problems.join("; ")
+            )));
+        }
+        Ok(Self { conn, books })
+    }
+
+    async fn open_book(conn: &zbus::Connection, uid: &str) -> Result<(OwnedObjectPath, String)> {
+        let reply = timed(conn.call_method(
+            Some(BOOK_FACTORY_BUS),
+            BOOK_FACTORY_PATH,
+            Some(BOOK_FACTORY_IFACE),
+            "OpenAddressBook",
+            &(uid,),
+        ))
+        .await?;
+        // EDS returns the object path as a plain string (signature "ss").
+        let (path, bus): (String, String) = reply.body().deserialize().map_err(dbus_err)?;
+        let path = OwnedObjectPath::try_from(path).map_err(dbus_err)?;
+        timed(conn.call_method(
+            Some(bus.as_str()),
+            path.as_str(),
+            Some(BOOK_IFACE),
+            "Open",
+            &(),
+        ))
+        .await?;
+        Ok((path, bus))
+    }
+
+    pub fn book_count(&self) -> usize {
+        self.books.len()
+    }
+
+    /// Contacts whose any field contains `query`, one hit per email
+    /// address, from all open books (local book first).
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<ContactHit>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sexp = format!(
+            "(contains \"x-evolution-any-field\" \"{}\")",
+            sexp_escape(q)
+        );
+        let mut hits = Vec::new();
+        for b in &self.books {
+            let reply = match timed(self.conn.call_method(
+                Some(b.bus.as_str()),
+                b.path.as_str(),
+                Some(BOOK_IFACE),
+                "GetContactList",
+                &(sexp.as_str(),),
+            ))
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::info!(book = %b.uid, "contact query failed: {e}");
+                    continue;
+                }
+            };
+            let vcards: Vec<String> = reply.body().deserialize().map_err(dbus_err)?;
+            for v in vcards {
+                let c = parse_vcard(&v);
+                for email in c.emails {
+                    hits.push(ContactHit {
+                        name: c.name.clone(),
+                        email,
+                        book: b.name.clone(),
+                    });
+                }
+            }
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Store a vCard in the local ("Personal") address book. Returns the
+    /// new contact UID.
+    pub async fn add_contact_vcard(&self, vcard: &str) -> Result<String> {
+        let b = self
+            .books
+            .iter()
+            .find(|b| b.uid == SYSTEM_BOOK)
+            .ok_or_else(|| {
+                Error::Invalid("contacts (EDS): local address book not available".into())
+            })?;
+        let reply = timed(self.conn.call_method(
+            Some(b.bus.as_str()),
+            b.path.as_str(),
+            Some(BOOK_IFACE),
+            "CreateContacts",
+            &(vec![vcard], 0u32),
+        ))
+        .await?;
+        let uids: Vec<String> = reply.body().deserialize().map_err(dbus_err)?;
+        uids.into_iter()
+            .next()
+            .ok_or_else(|| dbus_err("no UID returned"))
+    }
+}
+
+/// Escape a string for an EBookQuery S-expression literal.
+pub fn sexp_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(100)
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            c => vec![c],
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VCardContact {
+    pub name: String,
+    pub emails: Vec<String>,
+}
+
+/// Minimal vCard 3/4 reader: FN (or N) and EMAIL properties.
+pub fn parse_vcard(v: &str) -> VCardContact {
+    // Unfold continuation lines (RFC 6350 §3.2).
+    let unfolded = v
+        .replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .replace("\n ", "")
+        .replace("\n\t", "");
+    let mut c = VCardContact::default();
+    let mut n_name = String::new();
+    for line in unfolded.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let prop = key.split(';').next().unwrap_or("").to_ascii_uppercase();
+        // Strip a group prefix like "item1.EMAIL".
+        let prop = prop.rsplit('.').next().unwrap_or("").to_string();
+        let value = unescape(value.trim());
+        match prop.as_str() {
+            "FN" => c.name = value,
+            "N" => {
+                let parts: Vec<&str> = value.split(';').collect();
+                n_name = format!(
+                    "{} {}",
+                    parts.get(1).unwrap_or(&""),
+                    parts.first().unwrap_or(&"")
+                )
+                .trim()
+                .to_string();
+            }
+            "EMAIL" if value.contains('@') => c.emails.push(value),
+            _ => {}
+        }
+    }
+    if c.name.is_empty() {
+        c.name = n_name;
+    }
+    c
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("\\n", " ")
+        .replace("\\N", " ")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -23,32 +320,15 @@ pub struct CalendarEvent {
     pub calendar: String,
 }
 
-/// Address-book access (future: EDS `EBookClient` + `EBookQuery`).
-pub trait ContactsProvider: Send + Sync {
-    fn autocomplete(&self, prefix: &str, limit: usize) -> crate::Result<Vec<ContactHit>>;
-    fn add_contact_vcard(&self, vcard: &str) -> crate::Result<String>;
-}
-
 /// Calendar access (future: EDS `ECalClient`, `occur-in-time-range?`).
 pub trait CalendarProvider: Send + Sync {
     fn events_in_range(&self, start: i64, end: i64) -> crate::Result<Vec<CalendarEvent>>;
     fn create_event_ics(&self, ics: &str) -> crate::Result<String>;
 }
 
-/// No-op implementation used until EDS integration lands.
+/// No-op calendar used until EDS calendar integration lands.
 #[derive(Debug, Default)]
 pub struct Unavailable;
-
-impl ContactsProvider for Unavailable {
-    fn autocomplete(&self, _prefix: &str, _limit: usize) -> crate::Result<Vec<ContactHit>> {
-        Ok(Vec::new())
-    }
-    fn add_contact_vcard(&self, _vcard: &str) -> crate::Result<String> {
-        Err(crate::Error::Invalid(
-            "GNOME Contacts integration is not implemented yet".into(),
-        ))
-    }
-}
 
 impl CalendarProvider for Unavailable {
     fn events_in_range(&self, _start: i64, _end: i64) -> crate::Result<Vec<CalendarEvent>> {
@@ -58,5 +338,42 @@ impl CalendarProvider for Unavailable {
         Err(crate::Error::Invalid(
             "GNOME Calendar integration is not implemented yet".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcard_parsing() {
+        let v = "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Yilmaz;Ayse;;;\r\nFN:Ayse Yilmaz\r\nEMAIL;TYPE=WORK:ayse@exam\r\n ple.test\r\nitem1.EMAIL:ayse.private@example.test\r\nTEL:123\r\nEND:VCARD\r\n";
+        let c = parse_vcard(v);
+        assert_eq!(c.name, "Ayse Yilmaz");
+        assert_eq!(
+            c.emails,
+            vec!["ayse@example.test", "ayse.private@example.test"]
+        );
+        let n_only = parse_vcard("BEGIN:VCARD\nN:Doe;Jane\nEMAIL:j@d.test\nEND:VCARD");
+        assert_eq!(n_only.name, "Jane Doe");
+    }
+
+    #[test]
+    fn sexp_escaping() {
+        assert_eq!(sexp_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(sexp_escape("x\u{0}\ny"), "xy");
+    }
+
+    #[test]
+    fn keyfile() {
+        let d = "\n[Data Source]\nDisplayName=Personal\nEnabled=true\n[Address Book]\nBackendName=local\n";
+        assert_eq!(
+            keyfile_value(d, "Data Source", "DisplayName"),
+            Some("Personal")
+        );
+        assert_eq!(
+            keyfile_value(d, "Address Book", "BackendName"),
+            Some("local")
+        );
     }
 }

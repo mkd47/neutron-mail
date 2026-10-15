@@ -192,6 +192,40 @@ pub async fn append(session: &mut Session, folder: &str, raw: &[u8], seen: bool)
     Ok(())
 }
 
+/// APPEND with an explicit flag list, e.g. `(\\Seen \\Draft)` for drafts.
+pub async fn append_with_flags(
+    session: &mut Session,
+    folder: &str,
+    raw: &[u8],
+    flags: &str,
+) -> Result<()> {
+    session.append(folder, Some(flags), None, raw).await?;
+    Ok(())
+}
+
+/// Permanently remove one message (used to replace a resumed draft).
+/// Uses UID EXPUNGE when the server has UIDPLUS so other messages already
+/// flagged \Deleted by another client are not expunged as a side effect.
+pub async fn delete_uid(session: &mut Session, folder: &str, uid: u32) -> Result<()> {
+    session.select(folder).await?;
+    let _: Vec<_> = session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .await?
+        .try_collect()
+        .await?;
+    let uidplus = session.capabilities().await?.has_str("UIDPLUS");
+    if uidplus {
+        let _: Vec<_> = session
+            .uid_expunge(uid.to_string())
+            .await?
+            .try_collect()
+            .await?;
+    } else {
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
+    Ok(())
+}
+
 pub async fn supports_idle(session: &mut Session) -> Result<bool> {
     Ok(session.capabilities().await?.has_str("IDLE"))
 }

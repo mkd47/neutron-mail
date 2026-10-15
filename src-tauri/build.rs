@@ -13,8 +13,18 @@ fn main() {
             "list_folders",
             "list_messages",
             "get_message",
+            "set_image_sender_trust",
+            "message_source",
             "search",
+            "compose_prefill",
             "send_message",
+            "save_draft",
+            "analyze_link",
+            "pick_attachments",
+            "save_attachment",
+            "open_attachment",
+            "suggest_contacts",
+            "contacts_status",
         ]),
     ))
     .expect("failed to run tauri-build");

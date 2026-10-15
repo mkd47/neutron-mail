@@ -3,6 +3,7 @@
 #   IMAP  : Dovecot 2.4, 127.0.0.1:10993 (TLS) and :10143 (STARTTLS)
 #   SMTP  : Python aiosmtpd, 127.0.0.1:10587 (STARTTLS required, AUTH)
 #   User  : kaan@localhost / testpass
+#   HTTP  : python3 http.server, 127.0.0.1:10880 (remote-image fixtures)
 #   CA    : $NM_TEST_BASE/certs/ca.pem (private test CA; leaf SAN localhost,127.0.0.1)
 # Requires: dovecot-imapd (2.4), python3-aiosmtpd, openssl. Runs as your user.
 set -euo pipefail
@@ -34,5 +35,10 @@ fi
 "$DOVECOT" -c "$BASE/dovecot.conf"
 pkill -f "smtp_server.py" 2>/dev/null || true
 NM_TEST_BASE="$BASE" nohup python3 "$HERE/smtp_server.py" > "$BASE/smtp.log" 2>&1 &
+# Remote-image fixtures (the app only fetches from 127.0.0.1 in debug
+# builds with NEUTRON_ALLOW_PRIVATE_IMAGE_HOSTS=1).
+python3 "$HERE/make_images.py" "$BASE/www"
+pkill -f "http.server 10880" 2>/dev/null || true
+nohup python3 -m http.server 10880 --bind 127.0.0.1 --directory "$BASE/www" > "$BASE/http.log" 2>&1 &
 sleep 2
-echo "IMAP 127.0.0.1:10993/10143, SMTP 127.0.0.1:10587, CA $BASE/certs/ca.pem"
+echo "IMAP 127.0.0.1:10993/10143, SMTP 127.0.0.1:10587, HTTP 127.0.0.1:10880, CA $BASE/certs/ca.pem"

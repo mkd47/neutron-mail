@@ -28,8 +28,12 @@ class Deliver:
         os.makedirs(os.path.join(MAILDIR, "cur"), exist_ok=True)
         name = f"{time.time_ns()}.{os.getpid()}.{socket.gethostname()}"
         tmp = os.path.join(MAILDIR, "tmp", name)
+        # Like a real MTA's Received/X-Original-To trace headers: record the
+        # SMTP envelope so tests can verify Bcc handling (envelope only).
+        trace = ("X-Test-Envelope-From: %s\r\nX-Test-Envelope-To: %s\r\n"
+                 % (envelope.mail_from, ", ".join(envelope.rcpt_tos))).encode()
         with open(tmp, "wb") as f:
-            f.write(envelope.original_content or envelope.content)
+            f.write(trace + (envelope.original_content or envelope.content))
         os.rename(tmp, os.path.join(MAILDIR, "new", name))
         return "250 OK delivered"
 

@@ -4,11 +4,15 @@
 //! tested without a GUI. The Tauri shell (`src-tauri`) is a thin layer that
 //! exposes these functions as commands.
 
+pub mod attachments;
+pub mod compose;
 pub mod error;
 pub mod gnome;
 pub mod imap;
+pub mod links;
 pub mod model;
 pub mod parse;
+pub mod remote;
 pub mod sanitize;
 pub mod search;
 pub mod secrets;

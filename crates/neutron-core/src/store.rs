@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS messages (
   raw BLOB NOT NULL,
   UNIQUE(folder_id, uid)
 );
+CREATE TABLE IF NOT EXISTS addresses (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email TEXT NOT NULL COLLATE NOCASE,
+  name TEXT NOT NULL DEFAULT '',
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(account_id, email)
+);
+CREATE TABLE IF NOT EXISTS image_senders (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email TEXT NOT NULL COLLATE NOCASE,
+  PRIMARY KEY(account_id, email)
+);
 CREATE INDEX IF NOT EXISTS messages_folder_date ON messages(folder_id, date DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   subject, sender, body, tokenize = 'unicode61 remove_diacritics 2'
@@ -108,9 +121,43 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
-        Ok(Self {
+        let store = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        store.backfill_addresses()?;
+        Ok(store)
+    }
+
+    /// Caches created before the address table existed: index once.
+    fn backfill_addresses(&self) -> Result<()> {
+        let mut db = self.db();
+        let empty: bool = db.query_row("SELECT NOT EXISTS (SELECT 1 FROM addresses)", [], |r| {
+            r.get(0)
+        })?;
+        if !empty {
+            return Ok(());
+        }
+        let tx = db.transaction()?;
+        {
+            let mut st = tx.prepare(
+                "SELECT f.account_id, m.raw FROM messages m JOIN folders f ON f.id = m.folder_id",
+            )?;
+            let rows: Vec<(i64, Vec<u8>)> = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (account_id, raw) in rows {
+                let p = parse::parse(&raw);
+                for (name, email) in &p.addresses {
+                    tx.execute(
+                        "INSERT INTO addresses (account_id, email, name, uses, last_seen) VALUES (?1, ?2, ?3, 1, ?4)
+                         ON CONFLICT(account_id, email) DO UPDATE SET uses = uses + 1, last_seen = max(last_seen, excluded.last_seen)",
+                        params![account_id, email, name, p.date],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -292,6 +339,16 @@ impl Store {
             params![folder_id, m.uid],
             |r| r.get(0),
         )?;
+        for (name, email) in &p.addresses {
+            tx.execute(
+                "INSERT INTO addresses (account_id, email, name, uses, last_seen)
+                 SELECT f.account_id, ?2, ?3, 1, ?4 FROM folders f WHERE f.id = ?1
+                 ON CONFLICT(account_id, email) DO UPDATE SET uses = uses + 1,
+                   last_seen = max(last_seen, excluded.last_seen),
+                   name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END",
+                params![folder_id, email, name, p.date],
+            )?;
+        }
         tx.execute("DELETE FROM messages_fts WHERE rowid = ?1", [id])?;
         tx.execute(
             "INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?1, ?2, ?3, ?4)",
@@ -356,6 +413,106 @@ impl Store {
         Ok(())
     }
 
+    /// Raw RFC 5322 bytes of a cached message.
+    pub fn raw(&self, id: i64) -> Result<Vec<u8>> {
+        self.db()
+            .query_row("SELECT raw FROM messages WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))
+    }
+
+    /// Account owning a cached message.
+    pub fn message_account(&self, id: i64) -> Result<i64> {
+        Ok(self.message_location(id)?.0)
+    }
+
+    pub fn folder_by_role(&self, account_id: i64, role: &str) -> Result<Option<Folder>> {
+        Ok(self
+            .folders(account_id)?
+            .into_iter()
+            .find(|f| f.role.as_deref() == Some(role)))
+    }
+
+    pub fn trust_image_sender(&self, account_id: i64, email: &str) -> Result<()> {
+        self.db().execute(
+            "INSERT OR IGNORE INTO image_senders (account_id, email) VALUES (?1, ?2)",
+            params![account_id, email.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn untrust_image_sender(&self, account_id: i64, email: &str) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM image_senders WHERE account_id = ?1 AND email = ?2",
+            params![account_id, email.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_image_sender_trusted(&self, account_id: i64, email: &str) -> Result<bool> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT 1 FROM image_senders WHERE account_id = ?1 AND email = ?2",
+                params![account_id, email.trim()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Addresses seen in cached mail whose name or email contains `q`,
+    /// most used first.
+    pub fn address_history(
+        &self,
+        account_id: i64,
+        q: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let q = q.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!(
+            "%{}%",
+            q.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT name, email FROM addresses
+             WHERE account_id = ?1 AND (email LIKE ?2 ESCAPE '\\' OR name LIKE ?2 ESCAPE '\\')
+             ORDER BY uses DESC, last_seen DESC LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![account_id, pattern, limit.clamp(1, 50)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Render a message, embedding the given fetched remote images.
+    /// Also returns the remote image URLs the message references.
+    pub fn render_message(
+        &self,
+        id: i64,
+        remote: &std::collections::HashMap<String, String>,
+    ) -> Result<(MessageDetail, Vec<String>)> {
+        let mut d = self.message_detail(id)?;
+        let p = parse::parse(&self.raw(id)?);
+        let s = parse::sanitized_html_with(&p, remote);
+        let urls = s
+            .as_ref()
+            .map(|s| s.remote_urls.clone())
+            .unwrap_or_default();
+        if let Some(s) = s {
+            d.html = Some(s.html);
+            d.remote_images_blocked = s.remote_images_blocked;
+            d.remote_images_loaded = s.remote_images_loaded;
+        }
+        Ok((d, urls))
+    }
+
     pub fn message_detail(&self, id: i64) -> Result<MessageDetail> {
         let (summary, raw) = {
             let db = self.db();
@@ -375,6 +532,7 @@ impl Store {
             cc: p.cc,
             text: p.text,
             remote_images_blocked: sanitized.as_ref().map_or(0, |s| s.remote_images_blocked),
+            remote_images_loaded: sanitized.as_ref().map_or(0, |s| s.remote_images_loaded),
             html: sanitized.map(|s| s.html),
             attachments: p.attachments,
         })

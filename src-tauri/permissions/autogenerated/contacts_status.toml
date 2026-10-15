@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-contacts-status"
+description = "Enables the contacts_status command without any pre-configured scope."
+commands.allow = ["contacts_status"]
+
+[[permission]]
+identifier = "deny-contacts-status"
+description = "Denies the contacts_status command without any pre-configured scope."
+commands.deny = ["contacts_status"]

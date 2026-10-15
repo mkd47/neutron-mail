@@ -2,8 +2,9 @@
 
 use mail_parser::{MessageParser, MimeHeaders, PartType};
 
-use crate::model::AttachmentInfo;
-use crate::sanitize::{sanitize_html, Sanitized};
+use crate::attachments::{is_risky, safe_filename};
+use crate::model::{AttachmentInfo, OutgoingAttachment};
+use crate::sanitize::{sanitize_html, sanitize_html_with, Sanitized};
 
 /// Max size of an inline (cid:) image converted to a data URL.
 const MAX_INLINE_IMAGE: usize = 2 * 1024 * 1024;
@@ -23,6 +24,8 @@ pub struct ParsedMessage {
     pub html_raw: Option<String>,
     pub preview: String,
     pub attachments: Vec<AttachmentInfo>,
+    /// (name, email) of From, To, Cc and Reply-To, for address history.
+    pub addresses: Vec<(String, String)>,
 }
 
 fn addr_list(a: Option<&mail_parser::Address<'_>>) -> String {
@@ -81,22 +84,28 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
                 continue;
             }
             let sub = ct.subtype().unwrap_or("png").to_ascii_lowercase();
+            // Raster formats only (SVG can carry script).
+            if !matches!(sub.as_str(), "png" | "jpeg" | "jpg" | "gif" | "webp") {
+                continue;
+            }
             let url = format!("data:image/{sub};base64,{}", base64(data));
             let cid = cid.trim_matches(|c| c == '<' || c == '>');
             *html = html.replace(&format!("cid:{cid}"), &url);
         }
     }
 
-    let attachments = msg
-        .attachments()
-        .filter(|p| p.content_id().is_none() || p.attachment_name().is_some())
-        .map(|p| AttachmentInfo {
-            name: p.attachment_name().unwrap_or("attachment").to_string(),
-            mime: p
-                .content_type()
-                .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")))
-                .unwrap_or_else(|| "application/octet-stream".into()),
-            size: p.contents().len(),
+    let attachments = listed_attachments(&msg)
+        .enumerate()
+        .map(|(index, p)| {
+            let name = safe_filename(p.attachment_name().unwrap_or("attachment"));
+            let mime = mime_of(p);
+            AttachmentInfo {
+                index,
+                risky: is_risky(&name, &mime, p.contents()),
+                name,
+                mime,
+                size: p.contents().len(),
+            }
         })
         .collect();
 
@@ -131,12 +140,58 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
         html_raw,
         preview,
         attachments,
+        addresses: [msg.from(), msg.to(), msg.cc(), msg.reply_to()]
+            .into_iter()
+            .flatten()
+            .flat_map(|a| a.iter())
+            .filter_map(|a| {
+                let e = a.address()?.trim();
+                (e.contains('@') && e.len() <= 254)
+                    .then(|| (a.name().unwrap_or("").trim().to_string(), e.to_string()))
+            })
+            .collect(),
     }
+}
+
+/// Attachments shown to the user: real attachments plus named parts.
+/// Unnamed inline (cid) images are rendered in the body instead.
+fn listed_attachments<'a>(
+    msg: &'a mail_parser::Message<'a>,
+) -> impl Iterator<Item = &'a mail_parser::MessagePart<'a>> {
+    msg.attachments()
+        .filter(|p| p.content_id().is_none() || p.attachment_name().is_some())
+}
+
+fn mime_of(p: &mail_parser::MessagePart<'_>) -> String {
+    p.content_type()
+        .map(|c| {
+            format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")).to_ascii_lowercase()
+        })
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
+/// Content of attachment `index` (same numbering as `AttachmentInfo`).
+pub fn attachment_content(raw: &[u8], index: usize) -> Option<OutgoingAttachment> {
+    let msg = MessageParser::default().parse(raw)?;
+    let p = listed_attachments(&msg).nth(index)?;
+    Some(OutgoingAttachment {
+        name: safe_filename(p.attachment_name().unwrap_or("attachment")),
+        mime: mime_of(p),
+        data: p.contents().to_vec(),
+    })
 }
 
 /// Sanitize the HTML part (if any) of a parsed message.
 pub fn sanitized_html(p: &ParsedMessage) -> Option<Sanitized> {
     p.html_raw.as_deref().map(sanitize_html)
+}
+
+/// Sanitize with fetched remote images substituted.
+pub fn sanitized_html_with(
+    p: &ParsedMessage,
+    remote: &std::collections::HashMap<String, String>,
+) -> Option<Sanitized> {
+    p.html_raw.as_deref().map(|h| sanitize_html_with(h, remote))
 }
 
 /// Very small tag stripper for previews / search indexing only (never used
@@ -150,7 +205,7 @@ pub fn strip_tags(html: &str) -> String {
         .replace("&gt;", ">")
 }
 
-fn base64(data: &[u8]) -> String {
+pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

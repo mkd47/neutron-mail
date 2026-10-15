@@ -1,13 +1,16 @@
-//! Tauri shell: thin command layer over `neutron-core` plus a background
-//! watcher per account (IMAP IDLE when supported, polling otherwise).
+//! Tauri shell: thin command layer over `neutron-core`, a background
+//! watcher per account (IMAP IDLE when supported, polling otherwise), and
+//! link interception for the message viewer.
 
+mod attachments;
 mod commands;
+mod contacts;
 mod watcher;
 
 use std::{collections::HashMap, sync::Arc};
 
-use neutron_core::{secrets::SecretStore, store::Store};
-use tauri::Manager;
+use neutron_core::{links, secrets::SecretStore, store::Store};
+use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub store: Arc<Store>,
@@ -16,7 +19,23 @@ pub struct AppState {
     /// the same cache.
     pub sync_lock: Arc<tokio::sync::Mutex<()>>,
     pub watchers: std::sync::Mutex<HashMap<i64, tauri::async_runtime::JoinHandle<()>>>,
+    /// Files chosen in the native picker, by opaque token. The UI only ever
+    /// sees tokens, so it cannot make the backend read arbitrary paths.
+    pub picked: std::sync::Mutex<HashMap<String, attachments::PickedFile>>,
+    pub contacts: contacts::Contacts,
 }
+
+/// Origins of the app's own UI. Any other navigation of the webview or of
+/// the message iframe is a link click and is intercepted.
+/// The Vite dev server origin is only trusted in debug builds.
+#[cfg(debug_assertions)]
+const APP_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "http://127.0.0.1:1420",
+];
+#[cfg(not(debug_assertions))]
+const APP_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost"];
 
 pub fn run() {
     // Log level from NEUTRON_LOG (default: info). Nothing logs passwords or
@@ -29,6 +48,8 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -41,9 +62,12 @@ pub fn run() {
                 secrets,
                 sync_lock: Arc::new(tokio::sync::Mutex::new(())),
                 watchers: std::sync::Mutex::new(HashMap::new()),
+                picked: std::sync::Mutex::new(HashMap::new()),
+                contacts: contacts::Contacts::default(),
             };
             let accounts = state.store.accounts()?;
             app.manage(state);
+            create_main_window(app.handle())?;
             for a in accounts {
                 watcher::start(app.handle(), a.id);
             }
@@ -59,20 +83,91 @@ pub fn run() {
             commands::list_folders,
             commands::list_messages,
             commands::get_message,
+            commands::set_image_sender_trust,
+            commands::message_source,
             commands::search,
+            commands::compose_prefill,
             commands::send_message,
+            commands::save_draft,
+            commands::analyze_link,
+            attachments::pick_attachments,
+            attachments::save_attachment,
+            attachments::open_attachment,
+            contacts::suggest_contacts,
+            contacts::contacts_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neutron Mail");
 }
 
+/// The main window is created here (not from tauri.conf.json) so that a
+/// navigation handler is attached before any content loads.
+fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let cfg = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or_else(|| tauri::Error::AssetNotFound("main window config".into()))?;
+    let handle = app.clone();
+    let window = tauri::WebviewWindowBuilder::from_config(app, &cfg)?
+        .on_navigation(move |url| {
+            let s = url.as_str();
+            if links::is_internal_navigation(s, APP_ORIGINS) {
+                return true;
+            }
+            // A link clicked in a message (the iframe tried to navigate).
+            // Never navigate; hand the link to the UI for confirmation.
+            let payload = match links::analyze(s) {
+                Ok(info) => serde_json_value(&info),
+                Err(e) => {
+                    tracing::info!("blocked link with disallowed scheme");
+                    serde_json::json!({ "error": e.to_string(), "original": s })
+                }
+            };
+            if let Err(e) = handle.emit("mail://link", payload) {
+                tracing::warn!("emit link failed: {e}");
+            }
+            false
+        })
+        .build()?;
+    hover_status(&window);
+    Ok(())
+}
+
+fn serde_json_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+/// Show the real target of a hovered link (like a browser status bar).
+/// WebKitGTK reports hit-test results for subframes too, so this works for
+/// links inside the sandboxed message iframe without any script in it.
+#[cfg(target_os = "linux")]
+fn hover_status(window: &tauri::WebviewWindow) {
+    let handle = window.app_handle().clone();
+    let res = window.with_webview(move |wv| {
+        use webkit2gtk::{HitTestResultExt, WebViewExt};
+        wv.inner().connect_mouse_target_changed(move |_, hit, _| {
+            let uri = hit.link_uri().map(|u| u.to_string());
+            let _ = handle.emit("mail://hover", uri);
+        });
+    });
+    if let Err(e) = res {
+        tracing::warn!("link hover status unavailable: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hover_status(_window: &tauri::WebviewWindow) {}
+
 /// The data dir holds the mail cache and WebKit storage: owner-only access.
-fn restrict_dir(dir: &std::path::Path) {
+pub(crate) fn restrict_dir(dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!("could not restrict data directory permissions: {e}");
+            tracing::warn!("could not restrict directory permissions: {e}");
         }
     }
 }

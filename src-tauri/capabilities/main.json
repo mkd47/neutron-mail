@@ -1,8 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Least privilege: the main window may call only Neutron's own commands and listen for its sync event. No fs, shell, http, opener or other plugins are enabled.",
-  "windows": ["main"],
+  "description": "Least privilege: the main window may call only Neutron's own commands, listen for its events, and open http(s) links in the default browser (opener scoped to http/https; mailto is handled in-app). No fs, shell, http or dialog permissions are granted to the webview: native file dialogs are driven from Rust.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
@@ -15,7 +17,28 @@
     "allow-list-folders",
     "allow-list-messages",
     "allow-get-message",
+    "allow-set-image-sender-trust",
+    "allow-message-source",
     "allow-search",
-    "allow-send-message"
+    "allow-compose-prefill",
+    "allow-send-message",
+    "allow-save-draft",
+    "allow-analyze-link",
+    "allow-pick-attachments",
+    "allow-save-attachment",
+    "allow-open-attachment",
+    "allow-suggest-contacts",
+    "allow-contacts-status",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://*"
+        },
+        {
+          "url": "http://*"
+        }
+      ]
+    }
   ]
 }

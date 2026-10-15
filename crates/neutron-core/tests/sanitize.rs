@@ -70,8 +70,9 @@ fn blocks_remote_images_and_css_loads() {
         <img src="//cdn.test/b.png"><div style="background:url(https://evil.test/bg.png)">s</div>
         <style>body{background:url(https://evil.test/x.png)}</style>"#,
     );
-    assert_eq!(blocked, 4, "{h}");
-    for bad in ["tracker.test", "x.test", "cdn.test", "evil.test", "style="] {
+    // 4 <img> + 2 CSS url() loads.
+    assert_eq!(blocked, 6, "{h}");
+    for bad in ["tracker.test", "x.test", "cdn.test", "evil.test"] {
         assert!(!h.contains(bad), "{bad} survived: {h}");
     }
 }
@@ -101,4 +102,73 @@ fn document_wrapper_has_strict_csp() {
     assert!(d.contains(MESSAGE_CSP));
     assert!(MESSAGE_CSP.contains("default-src 'none'"));
     assert!(!MESSAGE_CSP.contains("script-src"));
+}
+
+#[test]
+fn keeps_safe_css_and_layout() {
+    let input = r##"<style>.card{border-radius:8px;background:#0a66c2;color:#fff} @import url("https://evil.test/a.css"); .x{font-weight:bold}</style>
+        <table bgcolor="#f3f2ef" width="600" cellpadding="0" align="center"><tr><td class="card" style="padding:12px;color:#191919">Hi</td></tr></table>
+        <font color="red" face="Arial">old school</font><center>c</center>"##;
+    let s = sanitize_html(input);
+    let h = &s.html;
+    assert!(
+        h.contains(".card{border-radius:8px;background:#0a66c2"),
+        "{h}"
+    );
+    assert!(h.contains("style=\"padding:12px;color:#191919\""), "{h}");
+    assert!(h.contains("bgcolor=\"#f3f2ef\""), "{h}");
+    assert!(h.contains("class=\"card\""), "{h}");
+    assert!(h.contains("<font color=\"red\""), "{h}");
+    assert!(!h.contains("@import") && !h.contains("evil.test"), "{h}");
+}
+
+#[test]
+fn drops_dangerous_css() {
+    for bad in [
+        r#"<div style="width:expression(alert(1))">x</div>"#,
+        r#"<div style="-moz-binding:url(https://e.test/x.xml#x)">x</div>"#,
+        r#"<div style="background:url(javascript:alert(1))">x</div>"#,
+        r#"<style>div{behavior:url(x.htc)}</style>"#,
+    ] {
+        let h = sanitize_html(bad).html;
+        for needle in ["expression", "binding", "javascript", "behavior", "e.test"] {
+            assert!(!h.contains(needle), "{needle} survived in {h}");
+        }
+    }
+}
+
+#[test]
+fn remote_images_substituted_only_when_fetched() {
+    use std::collections::HashMap;
+    let input = r#"<img src="https://cdn.example.org/logo.png"><img src="https://other.example.org/p.gif"><div style="background:url('https://cdn.example.org/bg.png')">x</div>"#;
+    let s = sanitize_html(input);
+    assert_eq!(s.remote_urls.len(), 3);
+    assert_eq!(s.remote_images_blocked, 3);
+    let mut m = HashMap::new();
+    m.insert(
+        "https://cdn.example.org/logo.png".to_string(),
+        "data:image/png;base64,iVBORw0KGgo=".to_string(),
+    );
+    m.insert(
+        "https://cdn.example.org/bg.png".to_string(),
+        "data:image/png;base64,iVBORw0KGgo=".to_string(),
+    );
+    let t = neutron_core::sanitize::sanitize_html_with(input, &m);
+    assert_eq!(t.remote_images_loaded, 2);
+    assert_eq!(t.remote_images_blocked, 1);
+    assert!(
+        !t.html.contains("cdn.example.org") && !t.html.contains("other.example.org"),
+        "{}",
+        t.html
+    );
+    assert!(t
+        .html
+        .contains("src=\"data:image/png;base64,iVBORw0KGgo=\""));
+}
+
+#[test]
+fn style_tag_cannot_break_out() {
+    let h =
+        sanitize_html("<style>a{}</style><script>alert(1)</script><style>b{}</sty</style>").html;
+    assert!(!h.contains("<script"), "{h}");
 }
