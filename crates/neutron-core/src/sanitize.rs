@@ -258,6 +258,72 @@ a{{color:{link};cursor:pointer}}img{{max-width:100%;height:auto}}table{{max-widt
     )
 }
 
+/// A light, printable page for one message: an escaped header (subject,
+/// From/To/Cc, date) above the already-sanitized body, under the same CSP
+/// as the reading pane (no scripts, no network). `body_html` must come
+/// from this module's sanitizer; text-only mail is passed as `text`.
+pub fn print_document(
+    detail: &crate::model::MessageDetail,
+    date: &str,
+    body_html: Option<&str>,
+) -> String {
+    let s = &detail.summary;
+    let from = if s.from_name.is_empty() {
+        escape_html(&s.from_addr)
+    } else {
+        format!(
+            "{} &lt;{}&gt;",
+            escape_html(&s.from_name),
+            escape_html(&s.from_addr)
+        )
+    };
+    let mut rows = format!("<tr><th>From</th><td>{from}</td></tr>");
+    for (label, value) in [("To", &detail.to), ("Cc", &detail.cc)] {
+        if !value.is_empty() {
+            rows.push_str(&format!(
+                "<tr><th>{label}</th><td>{}</td></tr>",
+                escape_html(value)
+            ));
+        }
+    }
+    rows.push_str(&format!(
+        "<tr><th>Date</th><td>{}</td></tr>",
+        escape_html(date)
+    ));
+    let subject = if s.subject.is_empty() {
+        "(no subject)"
+    } else {
+        &s.subject
+    };
+    let body = match body_html {
+        Some(h) => h.to_string(),
+        None => format!("<pre class=\"text\">{}</pre>", escape_html(&detail.text)),
+    };
+    let attachments = if detail.attachments.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = detail
+            .attachments
+            .iter()
+            .map(|a| escape_html(&a.name))
+            .collect();
+        format!("<p class=\"att\">Attachments: {}</p>", names.join(", "))
+    };
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"{MESSAGE_CSP}\">\
+<title>{title}</title>\
+<style>html{{background:#fff;color:#111}}body{{font:12pt/1.45 system-ui,sans-serif;margin:24px;word-wrap:break-word}}\
+h1{{font-size:17pt;margin:0 0 10px}}table.h{{border-collapse:collapse;margin-bottom:14px;font-size:10.5pt}}\
+table.h th{{text-align:left;color:#555;font-weight:600;padding:1px 12px 1px 0;vertical-align:top}}\
+hr{{border:0;border-top:1px solid #bbb;margin:0 0 16px}}img{{max-width:100%;height:auto}}table{{max-width:100%}}\
+pre.text{{white-space:pre-wrap;font:inherit;margin:0}}.att{{margin-top:18px;color:#555;font-size:10.5pt}}\
+@page{{margin:16mm}}@media print{{body{{margin:0}}}}</style>\
+</head><body><h1>{title}</h1><table class=\"h\">{rows}</table><hr>{body}{attachments}</body></html>",
+        title = escape_html(subject),
+    )
+}
+
 /// Max size of composed HTML (including inline images as data URLs).
 pub const MAX_COMPOSE_HTML_BYTES: usize = 20 * 1024 * 1024;
 
@@ -589,4 +655,60 @@ fn unescape(s: &str) -> String {
     }
     o.push_str(rest);
     o
+}
+
+#[cfg(test)]
+mod print_tests {
+    use super::*;
+    use crate::model::{AttachmentInfo, MessageDetail, MessageSummary};
+
+    fn detail(subject: &str, text: &str) -> MessageDetail {
+        MessageDetail {
+            summary: MessageSummary {
+                id: 1,
+                folder_id: 1,
+                uid: 1,
+                subject: subject.into(),
+                from_name: "Eve <script>".into(),
+                from_addr: "eve@example.test".into(),
+                date: 0,
+                preview: String::new(),
+                seen: true,
+                flagged: false,
+                has_attachments: true,
+            },
+            to: "Bob <bob@example.test>".into(),
+            cc: String::new(),
+            to_list: vec![],
+            cc_list: vec![],
+            text: text.into(),
+            html: None,
+            remote_images_blocked: 0,
+            remote_images_loaded: 0,
+            attachments: vec![AttachmentInfo {
+                index: 0,
+                name: "<b>x</b>.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1,
+                risky: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn print_page_escapes_headers_and_keeps_the_message_csp() {
+        let doc = print_document(
+            &detail("<img src=x onerror=alert(1)>", "a < b"),
+            "Mon",
+            None,
+        );
+        assert!(doc.contains(MESSAGE_CSP));
+        assert!(!doc.contains("<script>") && !doc.contains("<img src=x"));
+        assert!(doc.contains("Eve &lt;script&gt; &lt;eve@example.test&gt;"));
+        assert!(doc.contains("<pre class=\"text\">a &lt; b</pre>"));
+        assert!(doc.contains("&lt;b&gt;x&lt;/b&gt;.pdf"));
+        assert!(!doc.contains("<th>Cc</th>"));
+        let html = print_document(&detail("", ""), "Mon", Some("<p>Hi</p>"));
+        assert!(html.contains("<h1>(no subject)</h1>") && html.contains("<hr><p>Hi</p>"));
+    }
 }

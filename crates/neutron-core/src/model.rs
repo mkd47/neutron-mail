@@ -138,6 +138,28 @@ pub struct MessageSummary {
     pub has_attachments: bool,
 }
 
+/// A conversation row in the message list (see `Store::threads`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ThreadSummary {
+    /// The newest message of the conversation in this folder.
+    #[serde(flatten)]
+    pub summary: MessageSummary,
+    pub thread_size: u32,
+    pub thread_unread: u32,
+    pub thread_flagged: bool,
+    /// Ids of the conversation's messages in this folder.
+    pub thread_ids: Vec<i64>,
+}
+
+/// One message of a conversation, with the folder it is in.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConversationItem {
+    #[serde(flatten)]
+    pub summary: MessageSummary,
+    pub folder_name: String,
+    pub folder_role: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AttachmentInfo {
     /// Position in the message's attachment list (stable for a given raw
@@ -189,6 +211,10 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OutgoingMessage {
+    /// Sender: the account's address or one of its configured aliases
+    /// (None = primary). Anything else is rejected.
+    #[serde(default)]
+    pub from: Option<String>,
     pub to: Vec<String>,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -246,6 +272,9 @@ pub struct ComposeDraft {
     pub html: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Sender address to preselect (an alias the original was sent to),
+    /// or None for the account's primary address.
+    pub from: Option<String>,
     /// Attachments carried over (forward / draft), shown as removable chips.
     pub attachments: Vec<ForwardedAttachment>,
 }

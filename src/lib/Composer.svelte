@@ -1,11 +1,12 @@
 <script lang="ts">
   // Shared message editor: used inline in the preview pane (Reply / Reply all /
   // Forward / Edit draft) and inside the standalone Compose window.
+  import { onMount } from "svelte";
   import { Icon } from "@neutron/ui";
   import RecipientField from "./RecipientField.svelte";
   import RichEditor from "./RichEditor.svelte";
   import { size } from "./format";
-  import { api, errorText, type Account, type ComposeDraft, type ComposerResult, type ForwardedAttachment, type PickedAttachment } from "./api";
+  import { api, errorText, type Account, type ComposeDraft, type ComposerResult, type ForwardedAttachment, type MailAddress, type PickedAttachment } from "./api";
 
   let { account, draft, title, inline = false, replaceDraft = null, onDone }:
     { account: Account; draft: ComposeDraft; title: string; inline?: boolean; replaceDraft?: number | null;
@@ -29,6 +30,13 @@
   let error = $state("");
   let notice = $state("");
   let bodyEl: HTMLTextAreaElement | undefined = $state();
+  // Sender: the account's address or one of its aliases (Account settings).
+  let identities = $state<MailAddress[]>([]);
+  // svelte-ignore state_referenced_locally
+  let from = $state<string>(init.from ?? account.email);
+  onMount(() => {
+    api.getAccountSettings(account.id).then((s) => { identities = s.identities ?? []; }).catch(() => {});
+  });
 
   $effect(() => {
     // Replies: cursor at the top, above the quote.
@@ -61,6 +69,7 @@
 
   function message() {
     return {
+      from: from.toLowerCase() === account.email.toLowerCase() ? null : from,
       to, cc, bcc, subject,
       body: rich ? "" : body,
       html_body: rich ? html : null,
@@ -110,7 +119,18 @@
 <section class="composer" class:inline aria-label={title} onkeydown={onKey} role="form">
   <header>
     <strong>{title}</strong>
-    <span class="from muted">from {account.display_name || account.email} &lt;{account.email}&gt;</span>
+    {#if identities.length}
+      <label class="from muted">from
+        <select bind:value={from} aria-label="From">
+          <option value={account.email}>{account.display_name || account.email} &lt;{account.email}&gt;</option>
+          {#each identities as i (i.email)}<option value={i.email}>{i.name || account.display_name || i.email} &lt;{i.email}&gt;</option>{/each}
+          {#if from.toLowerCase() !== account.email.toLowerCase() && !identities.some((i) => i.email.toLowerCase() === from.toLowerCase())}
+            <option value={from}>{from} (not configured)</option>
+          {/if}
+        </select></label>
+    {:else}
+      <span class="from muted">from {account.display_name || account.email} &lt;{account.email}&gt;</span>
+    {/if}
     {#if !showCcBcc}<button type="button" class="link" onclick={() => (showCcBcc = true)}>Cc / Bcc</button>{/if}
   </header>
   <RecipientField label="To" accountId={account.id} bind:values={to} autofocus={!init.to.length} />
@@ -157,6 +177,8 @@
   .composer.inline { border: 1px solid var(--border); border-radius: 14px; padding: 12px 16px; box-shadow: 0 -6px 24px #0003; }
   header { display: flex; align-items: baseline; gap: 10px; padding-bottom: 4px; }
   .from { font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  label.from { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: visible; }
+  label.from select { font-size: 12px; flex: 1 1 auto; min-width: 0; max-width: 100%; padding: 2px 4px; color: var(--text); text-overflow: ellipsis; }
   .link { border: 0; background: transparent; color: var(--unread); padding: 0; font-size: 13px; }
   .subject { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); padding: 2px 0; }
   .subject span { width: 56px; color: var(--muted); flex: none; }
@@ -171,7 +193,7 @@
   .total { font-size: 12px; }
   .notice { margin: 0; color: #f5b14c; font-size: 13px; }
   .error { margin: 0; font-size: 13px; }
-  footer { display: flex; gap: 8px; align-items: center; padding-top: 6px; }
+  footer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-top: 6px; }
   footer .btn { display: inline-flex; gap: 6px; align-items: center; }
   .spacer { flex: 1; }
   .ghost { background: transparent; }

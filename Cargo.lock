@@ -2639,6 +2639,7 @@ dependencies = [
 name = "neutron-mail"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "neutron-core",
  "serde",
  "serde_json",

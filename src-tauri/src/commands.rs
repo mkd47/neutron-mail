@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use neutron_core::{
     compose, imap, links,
     model::{
-        Account, AccountConfig, AttachmentRef, ComposeDraft, Folder, MessageDetail, MessageSummary,
-        OutgoingAttachment, OutgoingMessage, SearchHit, SyncReport,
+        Account, AccountConfig, AttachmentRef, ComposeDraft, ConversationItem, Folder,
+        MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMessage, SearchHit, SyncReport,
+        ThreadSummary,
     },
     remote, sanitize,
     secrets::Backend,
@@ -246,6 +247,25 @@ pub fn list_messages(
         .messages(folder_id, offset.max(0), limit.clamp(1, 500))
 }
 
+/// The message list grouped into conversations (see `Store::threads`).
+#[tauri::command]
+pub fn list_threads(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    offset: i64,
+    limit: i64,
+) -> Res<Vec<ThreadSummary>> {
+    state
+        .store
+        .threads(folder_id, offset.max(0), limit.clamp(1, 500))
+}
+
+/// Every message of a message's conversation, across the account's folders.
+#[tauri::command]
+pub fn conversation(state: State<'_, AppState>, message_id: i64) -> Res<Vec<ConversationItem>> {
+    state.store.conversation(message_id)
+}
+
 /// Returns the message from the cache and marks it read (locally at once,
 /// on the server in the background; a server failure is only logged and the
 /// next sync reconciles the flag).
@@ -350,12 +370,15 @@ pub fn compose_prefill(
         .store
         .account(state.store.message_account(message_id)?)?;
     let raw = state.store.raw(message_id)?;
-    let draft = compose::prepare(&raw, message_id, mode, &account.config.email);
+    let settings = state.store.account_settings(account.id)?;
+    let own: Vec<&str> = std::iter::once(account.config.email.as_str())
+        .chain(settings.identities.iter().map(|i| i.email.as_str()))
+        .collect();
+    let draft = compose::prepare_as(&raw, message_id, mode, &own);
     if matches!(mode, compose::Mode::Draft) {
         return Ok(draft); // a resumed draft already has whatever signature it had
     }
-    let sig = state.store.account_settings(account.id)?.signature_html;
-    Ok(compose::with_signature(draft, &sig))
+    Ok(compose::with_signature(draft, &settings.signature_html))
 }
 
 /// An empty draft for new mail, with the account's signature.
@@ -430,8 +453,10 @@ pub async fn send_message(
 ) -> Res<SendResult> {
     let account = state.store.account(account_id)?;
     let password = crate::providers::credential(&state, account_id).await?;
+    let identities = state.store.account_settings(account_id)?.identities;
+    let sender = smtp::with_sender(&account.config, &identities, message.from.as_deref())?;
     let files = resolve_attachments(&state, account_id, &message.attachments)?;
-    let raw = smtp::send(&account.config, &password, &message, &files).await?;
+    let raw = smtp::send(&sender, &password, &message, &files).await?;
     tracing::info!(
         account = account_id,
         recipients = message.to.len() + message.cc.len() + message.bcc.len(),
@@ -488,8 +513,10 @@ pub async fn save_draft(
         .store
         .folder_by_role(account_id, "drafts")?
         .ok_or_else(|| Error::Invalid("this account has no Drafts folder".into()))?;
+    let identities = state.store.account_settings(account_id)?.identities;
+    let sender = smtp::with_sender(&account.config, &identities, message.from.as_deref())?;
     let files = resolve_attachments(&state, account_id, &message.attachments)?;
-    let built = smtp::build(&account.config, &message, &files, true)?;
+    let built = smtp::build(&sender, &message, &files, true)?;
     let mut s = imap::connect(&account.config, &password).await?;
     imap::append_with_flags(&mut s, &drafts.name, &built.raw, "(\\Seen \\Draft)").await?;
     drop(s.logout().await);

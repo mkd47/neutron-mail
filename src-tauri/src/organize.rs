@@ -164,6 +164,58 @@ pub async fn move_messages(
     r
 }
 
+/// Star/unstar or mark read/unread, on the server and in the cache.
+#[tauri::command]
+pub async fn set_message_flag(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    flag: folders::MessageFlag,
+    on: bool,
+) -> Res<usize> {
+    if message_ids.is_empty() || message_ids.len() > 5000 {
+        return Err(Error::Invalid("select 1–5000 messages".into()));
+    }
+    let account_id = state.store.message_account(message_ids[0])?;
+    let (mut s, _) = session(&state, account_id).await?;
+    let r = {
+        let _g = state.account_sync_lock(account_id).lock_owned().await;
+        folders::set_flag(&state.store, &mut s, &message_ids, flag, on).await
+    };
+    done(s).await;
+    let (_, n) = r?;
+    resync_later(&app, account_id);
+    Ok(n)
+}
+
+/// Delete messages for good (used in Trash, or with Shift+Delete). The UI
+/// asks for confirmation first; this cannot be undone.
+#[tauri::command]
+pub async fn delete_messages(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> Res<usize> {
+    if message_ids.is_empty() || message_ids.len() > 5000 {
+        return Err(Error::Invalid("select 1–5000 messages".into()));
+    }
+    let account_id = state.store.message_account(message_ids[0])?;
+    let (mut s, _) = session(&state, account_id).await?;
+    let r = {
+        let _g = state.account_sync_lock(account_id).lock_owned().await;
+        folders::delete_permanently(&state.store, &mut s, &message_ids).await
+    };
+    done(s).await;
+    let (_, n) = r?;
+    tracing::info!(
+        account = account_id,
+        count = n,
+        "messages deleted permanently"
+    );
+    resync_later(&app, account_id);
+    Ok(n)
+}
+
 #[tauri::command]
 pub async fn undo_transfer(
     app: AppHandle,

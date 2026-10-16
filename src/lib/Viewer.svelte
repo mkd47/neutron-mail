@@ -5,13 +5,27 @@
   import InviteCard from "./InviteCard.svelte";
   import AddressCard from "./AddressCard.svelte";
   import { initials, shortDate, size } from "./format";
-  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MailAddress, type MessageView, type TaskList } from "./api";
+  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type ConversationItem, type MailAddress, type MessageView, type TaskList } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {} }: {
+  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {} }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
     onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
     onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void; onComposeTo?: (a: MailAddress) => void;
+    onOpenMessage?: (id: number) => void;
   } = $props();
+
+  // The whole conversation (all folders, incl. your replies in Sent).
+  let conversation = $state<ConversationItem[]>([]);
+  let conversationOpen = $state(true);
+  let conversationRequest = 0;
+  $effect(() => {
+    const id = message?.id;
+    const request = ++conversationRequest;
+    if (id === undefined) { conversation = []; return; }
+    api.conversation(id)
+      .then((c) => { if (request === conversationRequest) conversation = c; })
+      .catch(() => { if (request === conversationRequest) conversation = []; });
+  });
 
   // Sender and recipients as clickable chips; each opens an address card.
   const COLLAPSED_RECIPIENTS = 4;
@@ -200,12 +214,23 @@
     confirmOpen = null;
     if (pending) void openAtt(pending.index, true, pending.origin);
   }
+  async function print() {
+    const origin = selection();
+    if (!origin) return;
+    try { await api.printMessage(origin.messageId); }
+    catch (e) { if (isCurrent(origin)) onStatus(errorText(e), true); }
+  }
+  function onWindowKey(e: KeyboardEvent) {
+    // Ctrl+P prints the open message, not the whole app window.
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p" && message && !reply) { e.preventDefault(); void print(); }
+  }
   function done(key: number, origin: Selection, r: ComposerResult) {
     if (!isCurrent(origin) || reply?.key !== key) return;
     reply = null; onComposerDone(r);
   }
 </script>
 
+<svelte:window onkeydown={onWindowKey} />
 {#if message}
   <article class="viewer" class:composing={reply !== null} bind:this={viewerEl}>
     <div class="message">
@@ -237,10 +262,32 @@
         </span>
         <button class="tbtn" onclick={saveToNotes} disabled={notesBusy} title="Save this email as a note, linked to it"><Icon name="note" size={16} /> Save to Notes</button>
         <span class="spacer"></span>
+        <button class="tbtn" onclick={print} title="Print this message (Ctrl+P)"><Icon name="external" size={16} /> Print</button>
         <button class="tbtn" onclick={toggleSource} aria-pressed={source !== null || sourceLoading} title="View the raw message source">
           <Icon name="code" size={16} /> {sourceLoading ? "Cancel source" : source !== null ? "Message" : "View source"}</button>
       </div>
       <h1>{message.subject || "(no subject)"}</h1>
+      {#if conversation.length > 1}
+        <div class="conv">
+          <button class="conv-head" onclick={() => (conversationOpen = !conversationOpen)} aria-expanded={conversationOpen}>
+            <Icon name="chevron" size={13} /> Conversation · {conversation.length} messages</button>
+          {#if conversationOpen}
+            <ol class="conv-list">
+              {#each conversation as c (c.id)}
+                <li>
+                  <button class="conv-item" class:current={c.id === message.id} class:unread={!c.seen}
+                    aria-current={c.id === message.id ? "true" : undefined} onclick={() => { if (c.id !== message?.id) onOpenMessage(c.id); }}>
+                    <span class="cfrom">{c.from_name || c.from_addr}</span>
+                    {#if c.folder_id !== message.folder_id}<span class="cfolder">{c.folder_name}</span>{/if}
+                    <span class="cprev muted">{c.preview}</span>
+                    <span class="cdate muted">{shortDate(c.date)}</span>
+                  </button>
+                </li>
+              {/each}
+            </ol>
+          {/if}
+        </div>
+      {/if}
       <div class="head" bind:this={headEl}>
         {#if sender}
           {@const from = sender}
@@ -387,6 +434,21 @@
   .spacer { flex: 1; }
   h1 { font-size: 22px; margin: 4px 0 0; font-weight: 600; }
   .head { display: flex; gap: 12px; align-items: flex-start; position: relative; }
+  .conv { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); font-size: 13px; }
+  .conv-head { display: flex; gap: 6px; align-items: center; width: 100%; border: 0; background: transparent; padding: 6px 10px; color: var(--muted); font-size: 12px; font-weight: 600; }
+  .conv-head[aria-expanded="false"] :global(svg) { transform: rotate(-90deg); }
+  .conv-list { list-style: none; margin: 0; padding: 0 4px 4px; max-height: 190px; overflow: auto; }
+  .conv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; min-width: 0;
+    border: 0; background: transparent; text-align: left; padding: 4px 8px; border-radius: 6px; color: var(--text); }
+  .cfrom { flex: 0 1 10em; min-width: 3em; }
+  .cprev { flex: 1 1 0; min-width: 0; }
+  .cfolder, .cdate { flex: none; }
+  .conv-item:hover { background: var(--hover); }
+  .conv-item.current { background: var(--selected); }
+  .conv-item.unread .cfrom { font-weight: 700; }
+  .cfrom, .cprev { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cfolder { font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .cdate { font-size: 12px; white-space: nowrap; }
   .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
   .from-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; min-width: 0; }
   .name { font-weight: 600; }

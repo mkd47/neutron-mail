@@ -29,6 +29,49 @@ pub struct ParsedMessage {
     pub attachments: Vec<AttachmentInfo>,
     /// (name, email) of From, To, Cc and Reply-To, for address history.
     pub addresses: Vec<(String, String)>,
+    /// Conversation key (see [`thread_key`]), None without any Message-ID.
+    pub thread_key: Option<String>,
+}
+
+/// Normalized Message-ID for comparisons: no brackets, trimmed, lowercase.
+fn norm_id(s: &str) -> Option<String> {
+    let s = s
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    (!s.is_empty() && s.len() <= 512).then(|| s.to_ascii_lowercase())
+}
+
+fn header_ids(v: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    match v {
+        mail_parser::HeaderValue::Text(t) => vec![t.to_string()],
+        mail_parser::HeaderValue::TextList(l) => l.iter().map(|t| t.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Conversation key: the thread's root Message-ID, i.e. the first entry of
+/// References, else In-Reply-To, else the message's own Message-ID. Every
+/// reply in a well-formed thread shares the root's own ID, so they group
+/// together whichever arrives first.
+pub fn thread_key(msg: &mail_parser::Message<'_>) -> Option<String> {
+    header_ids(msg.references())
+        .iter()
+        .find_map(|r| norm_id(r))
+        .or_else(|| {
+            header_ids(msg.in_reply_to())
+                .iter()
+                .find_map(|r| norm_id(r))
+        })
+        .or_else(|| msg.message_id().and_then(norm_id))
+}
+
+/// [`thread_key`] from raw mail, parsing only the headers.
+pub fn thread_key_of(raw: &[u8]) -> Option<String> {
+    MessageParser::default()
+        .parse_headers(raw)
+        .and_then(|m| thread_key(&m))
 }
 
 fn addr_list(a: Option<&mail_parser::Address<'_>>) -> String {
@@ -185,6 +228,7 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
 
     ParsedMessage {
         message_id: msg.message_id().unwrap_or_default().to_string(),
+        thread_key: thread_key(&msg),
         subject: msg.subject().unwrap_or("(no subject)").to_string(),
         from_name: first_from
             .and_then(|a| a.name())

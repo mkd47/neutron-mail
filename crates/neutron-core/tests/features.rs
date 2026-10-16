@@ -143,6 +143,7 @@ async fn reply_all_threading_headers_and_bcc_end_to_end() {
 
     let subject = common::unique("Re: Release planning");
     let msg = OutgoingMessage {
+        from: None,
         // Send to ourselves so the test server delivers it back.
         to: vec!["Kaan Durmus <kaan@localhost>".into()],
         cc: all.cc.clone(),

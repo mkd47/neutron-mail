@@ -5,7 +5,7 @@
   import AccountSetup from "./AccountSetup.svelte";
   import RichEditor from "./RichEditor.svelte";
   import { Icon } from "@neutron/ui";
-  import { api, errorText, type Account, type AccountSettings } from "./api";
+  import { api, errorText, type Account, type AccountSettings, type MailAddress } from "./api";
 
   let { account, onClose, onUpdated, onRemoved }:
     { account: Account; onClose: () => void; onUpdated: (a: Account) => void; onRemoved: (id: number) => void } = $props();
@@ -13,6 +13,7 @@
   let settings = $state<AccountSettings | null>(null);
   let signature = $state("");
   let syncDays = $state(0);
+  let identities = $state<MailAddress[]>([]);
   let senders = $state<string[]>([]);
   let prefsBusy = $state(false);
   let prefsMsg = $state<{ text: string; error: boolean } | null>(null);
@@ -31,13 +32,16 @@
     try {
       const [s, list] = await Promise.all([api.getAccountSettings(account.id), api.listImageSenders(account.id)]);
       settings = s; signature = s.signature_html; syncDays = s.sync_days; senders = list;
+      identities = (s.identities ?? []).map((i) => ({ ...i }));
     } catch (e) { loadError = errorText(e); }
   });
 
   async function savePrefs() {
     prefsBusy = true; prefsMsg = null;
     try {
-      const saved = await api.setAccountSettings(account.id, { signature_html: signature, sync_days: syncDays });
+      const saved = await api.setAccountSettings(account.id, { signature_html: signature, sync_days: syncDays,
+        identities: identities.filter((i) => i.email.trim()) });
+      identities = saved.identities.map((i) => ({ ...i }));
       const narrowed = settings !== null && saved.sync_days !== 0 && (settings.sync_days === 0 || saved.sync_days < settings.sync_days);
       settings = saved;
       prefsMsg = { text: narrowed ? "Saved. Older mail will be dropped from the local cache at the next sync (it stays on the server)." : "Saved.", error: false };
@@ -78,6 +82,21 @@
       <h3>Signature</h3>
       <p class="muted">Added below your text in new mail, replies and forwards. Remote images aren't allowed.</p>
       <div class="sig"><RichEditor html={signature} onInput={(h) => (signature = h)} onError={(m) => (prefsMsg = { text: m, error: true })} /></div>
+      <h3>Sender addresses</h3>
+      <p class="muted">Aliases you can send from with this account, besides {account.email}. Your mail server must allow
+        sending as these addresses. Replies use the alias the message was sent to.</p>
+      <div class="ids">
+        {#each identities as id, i (i)}
+          <div class="id-row">
+            <input placeholder="Name (optional)" bind:value={id.name} maxlength="200" aria-label={`Alias ${i + 1} name`} />
+            <input placeholder="alias@example.com" type="email" bind:value={id.email} maxlength="320" aria-label={`Alias ${i + 1} address`} />
+            <button class="btn sm" onclick={() => (identities = identities.filter((_, j) => j !== i))} aria-label={`Remove alias ${i + 1}`}>Remove</button>
+          </div>
+        {/each}
+        {#if identities.length < 20}
+          <button class="btn sm add" onclick={() => (identities = [...identities, { name: "", email: "" }])}>+ Add sender address</button>
+        {/if}
+      </div>
       <h3>Sync window</h3>
       <p class="muted">Only download and keep mail from this period on this computer. Nothing is deleted on the server.</p>
       <select bind:value={syncDays} aria-label="Sync window">
@@ -85,7 +104,7 @@
       </select>
       <div class="actions">
         {#if prefsMsg}<span class:error={prefsMsg.error} class:ok={!prefsMsg.error} role="status">{prefsMsg.text}</span>{/if}
-        <button class="btn primary" onclick={savePrefs} disabled={prefsBusy}>{prefsBusy ? "Saving…" : "Save signature and sync window"}</button>
+        <button class="btn primary" onclick={savePrefs} disabled={prefsBusy}>{prefsBusy ? "Saving…" : "Save signature, addresses and sync window"}</button>
       </div>
     </section>
 
@@ -128,6 +147,9 @@
   p { margin: 0; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px;
     display: flex; flex-direction: column; gap: 10px; }
+  .ids { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .id-row { display: flex; gap: 6px; width: 100%; }
+  .id-row input { flex: 1; min-width: 0; }
   .sig { border: 1px solid var(--border); border-radius: 10px; min-height: 120px; display: flex; flex-direction: column; padding: 0 10px; }
   select { align-self: flex-start; }
   .actions button { white-space: nowrap; }

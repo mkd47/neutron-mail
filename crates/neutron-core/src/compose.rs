@@ -92,6 +92,13 @@ fn quote(text: &str) -> String {
 /// (used to reference its attachments); `self_email` is excluded from
 /// Reply All recipients.
 pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> ComposeDraft {
+    prepare_as(raw, message_id, mode, &[self_email])
+}
+
+/// [`prepare`] for an account with several sender addresses (its primary
+/// address plus aliases): none of `own` is added as a recipient, and a
+/// reply to one of our own sent messages answers its recipients.
+pub fn prepare_as(raw: &[u8], message_id: i64, mode: Mode, own: &[&str]) -> ComposeDraft {
     let Some(msg) = MessageParser::default().parse(raw) else {
         return ComposeDraft::default();
     };
@@ -128,7 +135,19 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
         references.truncate(1);
         references.extend(tail);
     }
-    let me = self_email.trim().to_ascii_lowercase();
+    let me: Vec<String> = own.iter().map(|e| e.trim().to_ascii_lowercase()).collect();
+    // An alias (not the primary own[0]) the original was addressed to, or
+    // for a resumed draft the alias it was written from.
+    let alias_in = |list: &[(String, String)]| {
+        list.iter()
+            .find(|a| me.iter().skip(1).any(|m| a.1.eq_ignore_ascii_case(m)))
+            .map(|a| a.1.clone())
+    };
+    let own_sender = if mode == Mode::Draft {
+        alias_in(&from)
+    } else {
+        alias_in(&to).or_else(|| alias_in(&cc))
+    };
 
     match mode {
         Mode::Reply | Mode::ReplyAll => {
@@ -137,7 +156,7 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
             } else {
                 reply_to
             };
-            let mut seen: Vec<String> = vec![me.clone()];
+            let mut seen: Vec<String> = me.clone();
             let mut keep = |list: Vec<(String, String)>| -> Vec<String> {
                 list.into_iter()
                     .filter(|a| {
@@ -153,7 +172,10 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
                     .collect()
             };
             // Replying to our own sent message: answer its recipients.
-            let primary = if primary.iter().all(|a| a.1.eq_ignore_ascii_case(&me)) && !to.is_empty()
+            let primary = if primary
+                .iter()
+                .all(|a| me.contains(&a.1.to_ascii_lowercase()))
+                && !to.is_empty()
             {
                 to.clone()
             } else {
@@ -166,6 +188,7 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
                 Vec::new()
             };
             ComposeDraft {
+                from: own_sender.clone(),
                 to: to_list,
                 cc: cc_list,
                 bcc: Vec::new(),
@@ -194,6 +217,7 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
                 ));
             }
             ComposeDraft {
+                from: own_sender.clone(),
                 subject: with_prefix("Fwd:", &p.subject),
                 html: Some(format!(
                     "<p><br></p><p>{}</p><div>{body_html}</div>",
@@ -207,6 +231,7 @@ pub fn prepare(raw: &[u8], message_id: i64, mode: Mode, self_email: &str) -> Com
             }
         }
         Mode::Draft => ComposeDraft {
+            from: own_sender,
             to: to.iter().map(fmt_addr).collect(),
             cc: cc.iter().map(fmt_addr).collect(),
             bcc: addrs(msg.bcc()).iter().map(fmt_addr).collect(),

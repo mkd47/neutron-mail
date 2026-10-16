@@ -10,7 +10,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{
-    Account, AccountConfig, AuthMethod, Folder, MessageDetail, MessageSummary, SearchHit, Security,
+    Account, AccountConfig, AuthMethod, ConversationItem, Folder, MessageDetail, MessageSummary,
+    SearchHit, Security, ThreadSummary,
 };
 use crate::parse::{self, ParsedMessage};
 use crate::secrets::CacheKey;
@@ -156,6 +157,52 @@ pub struct AccountSettings {
     pub signature_html: String,
     /// Only keep/download mail from the last N days (0 = all).
     pub sync_days: u32,
+    /// Extra sender addresses (aliases) besides the account's own.
+    #[serde(default)]
+    pub identities: Vec<crate::model::MailAddress>,
+}
+
+/// Most aliases one account can have.
+pub const MAX_IDENTITIES: usize = 20;
+
+/// Validate and normalize aliases: real addresses, single-line names,
+/// no duplicates, never the account's own address.
+fn clean_identities(
+    primary: &str,
+    list: &[crate::model::MailAddress],
+) -> Result<Vec<crate::model::MailAddress>> {
+    if list.len() > MAX_IDENTITIES {
+        return Err(Error::Invalid(format!(
+            "at most {MAX_IDENTITIES} sender addresses"
+        )));
+    }
+    let mut out: Vec<crate::model::MailAddress> = Vec::new();
+    for i in list {
+        let email = i.email.trim();
+        let name = i.name.trim();
+        if email.is_empty() {
+            continue;
+        }
+        if email.len() > 320
+            || name.chars().count() > 200
+            || name.chars().any(char::is_control)
+            || email.parse::<lettre::Address>().is_err()
+        {
+            return Err(Error::Invalid(format!(
+                "\"{email}\" is not a valid sender address"
+            )));
+        }
+        if email.eq_ignore_ascii_case(primary)
+            || out.iter().any(|o| o.email.eq_ignore_ascii_case(email))
+        {
+            continue;
+        }
+        out.push(crate::model::MailAddress {
+            name: name.to_string(),
+            email: email.to_string(),
+        });
+    }
+    Ok(out)
 }
 
 const SUMMARY_COLS: &str =
@@ -250,6 +297,23 @@ impl Store {
                 "ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'",
             )?;
         }
+        let has_thread = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'thread_key'")?
+            .exists([])?;
+        if !has_thread {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN thread_key TEXT;")?;
+        }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_key);")?;
+        let has_identities = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'identities'",
+            )?
+            .exists([])?;
+        if !has_identities {
+            conn.execute_batch(
+                "ALTER TABLE account_settings ADD COLUMN identities TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
         let has_sieve = conn
             .prepare(
                 "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'sieve_port'",
@@ -269,6 +333,11 @@ impl Store {
         store.db().execute(
             "INSERT OR IGNORE INTO cache_metadata (key,value)
              SELECT 'text-decoder','1' WHERE NOT EXISTS (SELECT 1 FROM messages)",
+            [],
+        )?;
+        store.db().execute(
+            "INSERT OR IGNORE INTO cache_metadata (key,value)
+             SELECT 'thread-index','1' WHERE NOT EXISTS (SELECT 1 FROM messages)",
             [],
         )?;
         Ok(store)
@@ -485,12 +554,14 @@ impl Store {
         Ok(self
             .db()
             .query_row(
-                "SELECT signature_html, sync_days FROM account_settings WHERE account_id = ?1",
+                "SELECT signature_html, sync_days, identities FROM account_settings WHERE account_id = ?1",
                 [id],
                 |r| {
+                    let identities: String = r.get(2)?;
                     Ok(AccountSettings {
                         signature_html: r.get(0)?,
                         sync_days: r.get(1)?,
+                        identities: serde_json::from_str(&identities).unwrap_or_default(),
                     })
                 },
             )
@@ -508,17 +579,21 @@ impl Store {
         if !SYNC_WINDOWS.contains(&s.sync_days) {
             return Err(Error::Invalid("unsupported sync window".into()));
         }
+        let account = self.account(id)?;
         let clean = AccountSettings {
             signature_html: crate::sanitize::sanitize_compose_html(&s.signature_html)
                 .trim()
                 .to_string(),
             sync_days: s.sync_days,
+            identities: clean_identities(&account.config.email, &s.identities)?,
         };
-        self.account(id)?;
+        let identities = serde_json::to_string(&clean.identities)
+            .map_err(|e| Error::Invalid(format!("sender addresses: {e}")))?;
         self.db().execute(
-            "INSERT INTO account_settings (account_id, signature_html, sync_days) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id) DO UPDATE SET signature_html = excluded.signature_html, sync_days = excluded.sync_days",
-            params![id, clean.signature_html, clean.sync_days],
+            "INSERT INTO account_settings (account_id, signature_html, sync_days, identities) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET signature_html = excluded.signature_html, sync_days = excluded.sync_days,
+               identities = excluded.identities",
+            params![id, clean.signature_html, clean.sync_days, identities],
         )?;
         Ok(clean)
     }
@@ -807,6 +882,154 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// One row per conversation in a folder, newest conversation first: the
+    /// newest message of each thread plus the thread's size, unread count,
+    /// whether any message is starred, and the ids of its messages in this
+    /// folder (so actions can apply to the whole conversation).
+    pub fn threads(&self, folder_id: i64, offset: i64, limit: i64) -> Result<Vec<ThreadSummary>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!(
+            "SELECT {SUMMARY_COLS}, m.n, m.unread, m.starred, m.ids FROM (
+               SELECT t.*,
+                 ROW_NUMBER() OVER (PARTITION BY tk ORDER BY t.date DESC, t.uid DESC) AS rn,
+                 COUNT(*) OVER (PARTITION BY tk) AS n,
+                 SUM(1 - t.seen) OVER (PARTITION BY tk) AS unread,
+                 MAX(t.flagged) OVER (PARTITION BY tk) AS starred,
+                 group_concat(t.id) OVER (PARTITION BY tk) AS ids
+               FROM (SELECT id, folder_id, uid, subject, from_name, from_addr, date, preview, seen, flagged,
+                       has_attachments, coalesce(thread_key, 'id:' || id) AS tk
+                     FROM messages WHERE folder_id = ?1) t
+             ) m WHERE m.rn = 1 ORDER BY m.date DESC, m.uid DESC LIMIT ?2 OFFSET ?3"
+        ))?;
+        let rows = st.query_map(
+            params![folder_id, limit.clamp(1, 500), offset.max(0)],
+            |r| {
+                let ids: String = r.get(14)?;
+                Ok(ThreadSummary {
+                    summary: summary_from_row(r)?,
+                    thread_size: r.get(11)?,
+                    thread_unread: r.get(12)?,
+                    thread_flagged: r.get(13)?,
+                    thread_ids: ids.split(',').filter_map(|i| i.parse().ok()).collect(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// All messages of a message's conversation in its account (every
+    /// folder, so your replies in Sent are included), oldest first. A
+    /// message present in several folders is listed once, preferring the
+    /// opened message's own folder and then folders other than Trash/Junk.
+    pub fn conversation(&self, message_id: i64) -> Result<Vec<ConversationItem>> {
+        let db = self.db();
+        let (account_id, key, own_folder): (i64, Option<String>, i64) = db
+            .query_row(
+                "SELECT f.account_id, m.thread_key, m.folder_id FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("message {message_id}")))?;
+        let mut st = db.prepare(&format!(
+            "SELECT {SUMMARY_COLS}, f.display, f.name, f.role, lower(m.message_id) FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE f.account_id = ?1 AND (m.thread_key = ?2 OR m.id = ?3)
+             ORDER BY m.date ASC, m.id ASC LIMIT 500"
+        ))?;
+        let rows = st.query_map(params![account_id, key, message_id], |r| {
+            let display: Option<String> = r.get(11)?;
+            let name: String = r.get(12)?;
+            Ok((
+                ConversationItem {
+                    summary: summary_from_row(r)?,
+                    folder_name: display.filter(|d| !d.is_empty()).unwrap_or(name),
+                    folder_role: r.get(13)?,
+                },
+                r.get::<_, String>(14)?,
+            ))
+        })?;
+        let all: Vec<(ConversationItem, String)> = rows.collect::<rusqlite::Result<_>>()?;
+        let rank = |c: &ConversationItem| -> u8 {
+            if c.summary.id == message_id {
+                0
+            } else if c.summary.folder_id == own_folder {
+                1
+            } else if matches!(c.folder_role.as_deref(), Some("trash" | "junk")) {
+                3
+            } else {
+                2
+            }
+        };
+        let mut out: Vec<(ConversationItem, String)> = Vec::new();
+        for (item, mid) in all {
+            match out.iter().position(|(_, m)| !mid.is_empty() && *m == mid) {
+                Some(i) if rank(&item) < rank(&out[i].0) => out[i] = (item, mid),
+                Some(_) => {}
+                None => out.push((item, mid)),
+            }
+        }
+        Ok(out.into_iter().map(|(i, _)| i).collect())
+    }
+
+    /// Give mail cached before threading existed its conversation key.
+    /// Batched with a checkpoint, run from a background thread like
+    /// [`Store::repair_text_decoding`]; returns the number of messages done.
+    pub fn backfill_threads(&self) -> Result<usize> {
+        const BATCH: i64 = 200;
+        let mut done = 0;
+        loop {
+            let rows: Vec<(i64, Vec<u8>)> = {
+                let db = self.db();
+                let meta = |key: &str| {
+                    db.query_row(
+                        "SELECT value FROM cache_metadata WHERE key = ?1",
+                        [key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                };
+                if meta("thread-index")?.as_deref() == Some("1") {
+                    return Ok(done);
+                }
+                let after: i64 = meta("thread-index-after")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut st =
+                    db.prepare("SELECT id, raw FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+                let rows = st
+                    .query_map(params![after, BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            let keys: Vec<(i64, Option<String>)> = rows
+                .into_iter()
+                .map(|(id, raw)| (id, parse::thread_key_of(&raw)))
+                .collect();
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            for (id, key) in &keys {
+                tx.execute(
+                    "UPDATE messages SET thread_key = ?2 WHERE id = ?1",
+                    params![id, key],
+                )?;
+            }
+            done += keys.len();
+            match keys.last() {
+                Some((last, _)) if keys.len() as i64 == BATCH => tx.execute(
+                    "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('thread-index-after', ?1)",
+                    [last.to_string()],
+                )?,
+                _ => tx
+                    .execute_batch(
+                        "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('thread-index','1');
+                         DELETE FROM cache_metadata WHERE key = 'thread-index-after';",
+                    )
+                    .map(|_| 0)?,
+            };
+            tx.commit()?;
+        }
+    }
+
     /// Starred messages in all accounts (To-do "Flagged emails"), not in Trash/Junk.
     pub fn flagged_messages(&self, limit: i64) -> Result<Vec<MessageSummary>> {
         let db = self.db();
@@ -1029,10 +1252,10 @@ fn insert_in_tx(tx: &rusqlite::Transaction<'_>, folder_id: i64, m: &NewMessage<'
         p.text.clone()
     };
     tx.execute(
-            "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw, thread_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![folder_id, m.uid, p.message_id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.date, p.preview,
-                    m.seen, m.flagged, !p.attachments.is_empty(), m.raw],
+                    m.seen, m.flagged, !p.attachments.is_empty(), m.raw, p.thread_key],
         )?;
     let id = tx.last_insert_rowid();
     for (name, email) in &p.addresses {
@@ -1316,6 +1539,25 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Set `seen` (or else `flagged`) for UIDs in a folder.
+    pub fn set_flag_local(&self, folder_id: i64, uids: &[u32], seen: bool, on: bool) -> Result<()> {
+        let sql = if seen {
+            "UPDATE messages SET seen = ?3 WHERE folder_id = ?1 AND uid = ?2"
+        } else {
+            "UPDATE messages SET flagged = ?3 WHERE folder_id = ?1 AND uid = ?2"
+        };
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        {
+            let mut st = tx.prepare_cached(sql)?;
+            for uid in uids {
+                st.execute(params![folder_id, uid, on])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_flagged_local(&self, folder_id: i64, uid: u32) -> Result<()> {

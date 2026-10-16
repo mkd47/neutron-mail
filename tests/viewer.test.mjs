@@ -8,7 +8,7 @@ const draft = (subject) => ({ subject });
 function viewer(api = {}, pimApi = {}) {
   const events = { statuses: [], reloads: [], notes: [], completed: [], pimChanges: 0 };
   const component = componentScript('src/lib/Viewer.svelte', {
-    api, pimApi, dayAt: (days) => days,
+    api: { conversation: async () => [], ...api }, pimApi, dayAt: (days) => days,
     $props: () => ({
       message: message(1), account: { id: 10, email: 'one@example.test' }, isDraft: false, hoverUrl: null,
       onStatus: (...args) => events.statuses.push(args),

@@ -603,6 +603,40 @@ pub async fn append_with_flags(
     cmd(session.append(folder, Some(flags), None, raw)).await
 }
 
+/// SELECT a folder (read-write).
+pub async fn select(session: &mut Session, folder: &str) -> Result<()> {
+    cmd(session.select(folder)).await?;
+    Ok(())
+}
+
+/// Permanently remove the given UIDs from a folder. Requires UIDPLUS so
+/// messages already flagged \Deleted by another client cannot be expunged
+/// as a side effect; unsupported servers are rejected before any change.
+pub async fn expunge_uids(session: &mut Session, folder: &str, uids: &[u32]) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    if !has_capability(session, "UIDPLUS").await? {
+        return Err(Error::Invalid(
+            "this server needs UIDPLUS to delete messages permanently".into(),
+        ));
+    }
+    cmd(session.select(folder)).await?;
+    for chunk in uids.chunks(200) {
+        store_uids(session, chunk, "+FLAGS.SILENT (\\Deleted)").await?;
+        let set = uid_set(chunk);
+        cmd(async {
+            session
+                .uid_expunge(&set)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 /// Permanently remove one message (used to replace a resumed draft).
 /// Requires UIDPLUS so messages already flagged \Deleted by another client
 /// cannot be expunged as a side effect. Unsupported servers are rejected

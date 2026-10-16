@@ -199,6 +199,36 @@ fn transport(cfg: &AccountConfig, password: &str) -> Result<AsyncSmtpTransport<T
 }
 
 /// Build and send; returns the transmitted bytes (for APPEND to Sent).
+/// The account config to send as: the primary address (`from` None or
+/// equal to it) or one of the account's configured aliases. Only the
+/// sender name/address change; server and login stay the account's.
+pub fn with_sender(
+    cfg: &AccountConfig,
+    identities: &[crate::model::MailAddress],
+    from: Option<&str>,
+) -> Result<AccountConfig> {
+    let Some(from) = from.map(str::trim).filter(|f| !f.is_empty()) else {
+        return Ok(cfg.clone());
+    };
+    if from.eq_ignore_ascii_case(&cfg.email) {
+        return Ok(cfg.clone());
+    }
+    let id = identities
+        .iter()
+        .find(|i| i.email.eq_ignore_ascii_case(from))
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "{from} is not one of this account's sender addresses (add it in Account settings)"
+            ))
+        })?;
+    let mut out = cfg.clone();
+    out.email = id.email.clone();
+    if !id.name.is_empty() {
+        out.display_name = id.name.clone();
+    }
+    Ok(out)
+}
+
 pub async fn send(
     cfg: &AccountConfig,
     password: &str,

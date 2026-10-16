@@ -418,3 +418,178 @@ fn decoding_repair_runs_in_resumable_batches() {
     assert_eq!(store.repair_text_decoding().unwrap(), 0);
     assert_eq!(store.search(account, "s120", 10).unwrap().len(), 1);
 }
+
+fn mail(mid: &str, refs: &str, irt: &str, subject: &str, date: &str) -> Vec<u8> {
+    let mut h = format!(
+        "From: a@example.test\r\nMessage-ID: <{mid}>\r\nSubject: {subject}\r\nDate: {date}\r\n"
+    );
+    if !refs.is_empty() {
+        h.push_str(&format!("References: {refs}\r\n"));
+    }
+    if !irt.is_empty() {
+        h.push_str(&format!("In-Reply-To: {irt}\r\n"));
+    }
+    h.push_str("\r\nbody\r\n");
+    h.into_bytes()
+}
+
+fn put(store: &Store, fid: i64, uid: u32, seen: bool, raw: &[u8]) -> i64 {
+    store
+        .insert_message(
+            fid,
+            &NewMessage {
+                uid,
+                seen,
+                flagged: false,
+                raw,
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn conversations_group_replies_across_arrival_order_and_folders() {
+    let store = Store::open_in_memory().unwrap();
+    let account = store.add_account(&cfg()).unwrap();
+    let inbox = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    let sent = store.upsert_folder(account, "Sent", Some("sent")).unwrap();
+    // The reply is downloaded before its parent (sync goes newest first).
+    let r2 = put(
+        &store,
+        inbox,
+        3,
+        false,
+        &mail(
+            "r2@x",
+            "<ROOT@x> <r1@x>",
+            "<r1@x>",
+            "Re: Plan",
+            "Tue, 3 Mar 2026 10:00:00 +0000",
+        ),
+    );
+    let root = put(
+        &store,
+        inbox,
+        1,
+        true,
+        &mail("root@x", "", "", "Plan", "Sun, 1 Mar 2026 10:00:00 +0000"),
+    );
+    let other = put(
+        &store,
+        inbox,
+        2,
+        false,
+        &mail("other@x", "", "", "Lunch", "Mon, 2 Mar 2026 10:00:00 +0000"),
+    );
+    // Clients that only set In-Reply-To still join a two-message thread.
+    let irt = put(
+        &store,
+        inbox,
+        4,
+        true,
+        &mail(
+            "q@x",
+            "",
+            "<other@x>",
+            "Re: Lunch",
+            "Mon, 2 Mar 2026 11:00:00 +0000",
+        ),
+    );
+    let mine = put(
+        &store,
+        sent,
+        1,
+        true,
+        &mail(
+            "r1@x",
+            "<root@x>",
+            "<root@x>",
+            "Re: Plan",
+            "Mon, 2 Mar 2026 09:00:00 +0000",
+        ),
+    );
+
+    let rows = store.threads(inbox, 0, 50).unwrap();
+    assert_eq!(rows.len(), 2);
+    let plan = &rows[0];
+    assert_eq!(plan.summary.id, r2, "newest message represents the thread");
+    assert_eq!((plan.thread_size, plan.thread_unread), (2, 1));
+    let mut ids = plan.thread_ids.clone();
+    ids.sort();
+    assert_eq!(ids, {
+        let mut v = vec![root, r2];
+        v.sort();
+        v
+    });
+    assert_eq!(rows[1].summary.id, irt);
+    assert_eq!(rows[1].thread_size, 2);
+    assert!(rows[1].thread_ids.contains(&other));
+
+    let conv: Vec<i64> = store
+        .conversation(root)
+        .unwrap()
+        .iter()
+        .map(|c| c.summary.id)
+        .collect();
+    assert_eq!(conv, vec![root, mine, r2], "oldest first, including Sent");
+    let item = store
+        .conversation(r2)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.summary.id == mine)
+        .unwrap();
+    assert_eq!(item.folder_role.as_deref(), Some("sent"));
+    assert_eq!(store.conversation(other).unwrap().len(), 2);
+}
+
+#[test]
+fn threads_of_older_caches_are_backfilled_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let store = Store::open_plaintext(&path).unwrap();
+    let account = store.add_account(&cfg()).unwrap();
+    let inbox = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    let a = put(
+        &store,
+        inbox,
+        1,
+        true,
+        &mail("a@x", "", "", "A", "Sun, 1 Mar 2026 10:00:00 +0000"),
+    );
+    put(
+        &store,
+        inbox,
+        2,
+        true,
+        &mail(
+            "b@x",
+            "<a@x>",
+            "<a@x>",
+            "Re: A",
+            "Mon, 2 Mar 2026 10:00:00 +0000",
+        ),
+    );
+    drop(store);
+    // A cache from before threading: no keys, no marker.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE messages SET thread_key = NULL", [])
+        .unwrap();
+    db.execute("DELETE FROM cache_metadata WHERE key = 'thread-index'", [])
+        .unwrap();
+    drop(db);
+    let store = Store::open_plaintext(&path).unwrap();
+    assert_eq!(
+        store.threads(inbox, 0, 50).unwrap().len(),
+        2,
+        "ungrouped until backfilled"
+    );
+    assert_eq!(store.backfill_threads().unwrap(), 2);
+    assert_eq!(store.backfill_threads().unwrap(), 0);
+    let rows = store.threads(inbox, 0, 50).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].thread_ids.contains(&a));
+}

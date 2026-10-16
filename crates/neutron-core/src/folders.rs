@@ -320,3 +320,71 @@ pub async fn undo(store: &Store, session: &mut Session, t: &Transfer) -> Result<
     }
     Ok(n)
 }
+
+/// Group cached message ids by folder for one account: folder id -> UIDs.
+fn uids_by_folder(store: &Store, ids: &[i64]) -> Result<(i64, BTreeMap<i64, Vec<u32>>)> {
+    let refs = store.message_refs(ids)?;
+    let Some(account_id) = refs.first().map(|r| r.0) else {
+        return Err(Error::NotFound("messages".into()));
+    };
+    if refs.iter().any(|r| r.0 != account_id) {
+        return Err(Error::Invalid("messages must belong to one account".into()));
+    }
+    let mut by_folder: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+    for (_, fid, uid, _) in refs {
+        by_folder.entry(fid).or_default().push(uid);
+    }
+    Ok((account_id, by_folder))
+}
+
+/// Which flag to change with [`set_flag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageFlag {
+    Seen,
+    Flagged,
+}
+
+/// Set or clear \Seen or \Flagged on messages, on the server and in the
+/// cache. Returns the account id and how many messages were changed.
+pub async fn set_flag(
+    store: &Store,
+    session: &mut Session,
+    ids: &[i64],
+    flag: MessageFlag,
+    on: bool,
+) -> Result<(i64, usize)> {
+    let (account_id, by_folder) = uids_by_folder(store, ids)?;
+    let imap_flag = match flag {
+        MessageFlag::Seen => "\\Seen",
+        MessageFlag::Flagged => "\\Flagged",
+    };
+    let op = format!("{}FLAGS.SILENT ({imap_flag})", if on { "+" } else { "-" });
+    let mut n = 0;
+    for (fid, uids) in by_folder {
+        let f = store.folder(fid)?;
+        imap::select(session, &f.name).await?;
+        imap::store_uids(session, &uids, &op).await?;
+        store.set_flag_local(fid, &uids, flag == MessageFlag::Seen, on)?;
+        n += uids.len();
+    }
+    Ok((account_id, n))
+}
+
+/// Permanently delete messages (\Deleted + UID EXPUNGE of exactly those
+/// UIDs; needs UIDPLUS so other clients' \Deleted mail is never expunged).
+/// Returns the account id and how many were deleted.
+pub async fn delete_permanently(
+    store: &Store,
+    session: &mut Session,
+    ids: &[i64],
+) -> Result<(i64, usize)> {
+    let (account_id, by_folder) = uids_by_folder(store, ids)?;
+    let mut n = 0;
+    for (fid, uids) in by_folder {
+        let f = store.folder(fid)?;
+        imap::expunge_uids(session, &f.name, &uids).await?;
+        n += store.remove_uids(fid, &uids)?;
+    }
+    Ok((account_id, n))
+}

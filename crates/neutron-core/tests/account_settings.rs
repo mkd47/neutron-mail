@@ -23,6 +23,7 @@ fn settings_default_roundtrip_and_sanitize() {
         .set_account_settings(
             id,
             &AccountSettings {
+                identities: vec![],
                 signature_html: "<p onclick=\"x()\"><b>Kaan</b></p><script>alert(1)</script><img src=\"https://t.example/p.gif\">".into(),
                 sync_days: 90,
             },
@@ -43,12 +44,14 @@ fn settings_default_roundtrip_and_sanitize() {
 fn settings_rejects_bad_window_unknown_account_and_huge_signature() {
     let (store, id) = store_with_account();
     let s = |d| AccountSettings {
+        identities: vec![],
         signature_html: String::new(),
         sync_days: d,
     };
     assert!(store.set_account_settings(id, &s(17)).is_err());
     assert!(store.set_account_settings(id + 99, &s(30)).is_err());
     let huge = AccountSettings {
+        identities: vec![],
         signature_html: "a".repeat(300 * 1024),
         sync_days: 0,
     };
@@ -80,6 +83,7 @@ fn update_account_and_cascade_on_delete() {
         .set_account_settings(
             id,
             &AccountSettings {
+                identities: vec![],
                 signature_html: "x".into(),
                 sync_days: 30,
             },
@@ -206,4 +210,90 @@ async fn sync_window_skips_and_prunes_old_mail() {
     );
     s.delete(&folder).await.ok();
     s.logout().await.ok();
+}
+
+fn alias(name: &str, email: &str) -> neutron_core::model::MailAddress {
+    neutron_core::model::MailAddress {
+        name: name.into(),
+        email: email.into(),
+    }
+}
+
+#[test]
+fn sender_aliases_are_validated_deduplicated_and_stored() {
+    let (store, id) = store_with_account();
+    let primary = store.account(id).unwrap().config.email;
+    let settings = |identities| AccountSettings {
+        identities,
+        ..Default::default()
+    };
+    let saved = store
+        .set_account_settings(
+            id,
+            &settings(vec![
+                alias(" Sales ", " sales@example.test "),
+                alias("dup", "SALES@example.test"),
+                alias("me", &primary),
+                alias("", ""),
+                alias("", "info@example.test"),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        saved.identities,
+        vec![
+            alias("Sales", "sales@example.test"),
+            alias("", "info@example.test")
+        ]
+    );
+    assert_eq!(store.account_settings(id).unwrap(), saved);
+    for bad in [
+        alias("x", "not an address"),
+        alias("Evil\r\nBcc: a@b.test", "ok@example.test"),
+    ] {
+        assert!(store
+            .set_account_settings(id, &settings(vec![bad]))
+            .is_err());
+    }
+    let many: Vec<_> = (0..21)
+        .map(|i| alias("", &format!("a{i}@example.test")))
+        .collect();
+    assert!(store.set_account_settings(id, &settings(many)).is_err());
+}
+
+#[test]
+fn only_configured_aliases_can_be_used_as_sender() {
+    let cfg = common::config(Security::Tls);
+    let aliases = [alias("Sales Team", "sales@example.test")];
+    let same = neutron_core::smtp::with_sender(&cfg, &aliases, None).unwrap();
+    assert_eq!(same.email, cfg.email);
+    let sales =
+        neutron_core::smtp::with_sender(&cfg, &aliases, Some("SALES@example.test")).unwrap();
+    assert_eq!(
+        (sales.email.as_str(), sales.display_name.as_str()),
+        ("sales@example.test", "Sales Team")
+    );
+    assert_eq!(sales.username, cfg.username);
+    assert_eq!(sales.smtp_host, cfg.smtp_host);
+    assert!(neutron_core::smtp::with_sender(&cfg, &aliases, Some("ceo@example.test")).is_err());
+}
+
+#[test]
+fn replies_use_the_alias_the_mail_was_sent_to_and_never_address_it() {
+    let raw = b"From: Bob <bob@example.test>\r\nTo: sales@example.test, carol@example.test\r\nCc: me@example.test\r\nMessage-ID: <x@example.test>\r\nSubject: Quote\r\n\r\nHi";
+    let own = ["me@example.test", "sales@example.test"];
+    let reply = compose::prepare_as(raw, 1, Mode::ReplyAll, &own);
+    assert_eq!(reply.from.as_deref(), Some("sales@example.test"));
+    let all: Vec<&String> = reply.to.iter().chain(reply.cc.iter()).collect();
+    assert!(all.iter().any(|a| a.contains("bob@example.test")));
+    assert!(all.iter().any(|a| a.contains("carol@example.test")));
+    assert!(
+        !all.iter()
+            .any(|a| a.contains("sales@") || a.contains("me@")),
+        "{all:?}"
+    );
+    let fwd = compose::prepare_as(raw, 1, Mode::Forward, &own);
+    assert_eq!(fwd.from.as_deref(), Some("sales@example.test"));
+    let plain = compose::prepare_as(raw, 1, Mode::Reply, &["me@example.test"]);
+    assert_eq!(plain.from, None);
 }

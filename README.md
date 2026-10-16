@@ -35,6 +35,18 @@ message list from a local SQLite cache, full-text search, IMAP IDLE push with a 
 - **Fast incremental sync:** UIDNEXT/EXISTS bookkeeping and CONDSTORE (`CHANGEDSINCE`) where the server has it,
   with a full-diff fallback; expunges handled; no cap on the number of messages (paged download and list);
   every IMAP command has a timeout. 5,000 messages: first sync ≈1.3 s, a no-change resync ≈10 ms (local Dovecot, debug build).
+- **Message actions:** Archive (**A**), Delete to Trash with Undo (**Del**; in Trash, or with **Shift+Del**, deletes
+  permanently after asking; needs UIDPLUS), Junk / Not junk (**!**), Mark read/unread (**U**) and Star (**S**), from the
+  reading-pane toolbar, the right-click menu in the message list, or the keyboard, on one or many selected messages.
+- **Conversations:** the list groups replies into conversations (References / In-Reply-To) with a message count, and
+  the reading pane lists the whole conversation, including your replies from Sent. Actions apply to the whole
+  conversation; switch to a plain message list with the "Conversations" toggle. Older caches are indexed in the background.
+- **Contact cards:** click a sender, recipient or avatar for New message, Copy address, Add to contacts (GNOME
+  address book) and Trust sender (always load remote images). Long recipient lists collapse to "+N more".
+- **Sender addresses (aliases)** per account in Account settings; the composer has a From picker and replies use
+  the alias the message was sent to. Only configured addresses can be used as sender.
+- **Print** (**Ctrl+P**): a preview window with just the message (header and sanitized body) and the print dialog.
+- **Resizable composer:** the New message window resizes and maximizes; the inline reply has a drag handle.
 - **Unread badge** (window title, and the dock icon where the dock supports the Unity LauncherEntry API) and
   **desktop notifications** for new mail in the inbox while the window is in the background.
 - **Provider tiles** for 263.net, Alimail (enterprise and personal), Google (Gmail) and Outlook (Outlook.com /

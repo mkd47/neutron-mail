@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { componentScript, deferred } from './component-harness.mjs';
 
+// The conversation list and the plain list share the same race handling.
+const threads = (api) => ({ listThreads: api.listMessages, ...api });
 const draft = { to: ['friend@example.test'], cc: [], bcc: [], subject: 'Hello', body: 'Body', html: null, references: [], in_reply_to: null, attachments: [] };
 const account = { id: 1, email: 'me@example.test' };
 const message = (id) => ({ id, seen: true, folder_id: 10, remote_images_failed: 0 });
@@ -34,7 +36,7 @@ test('send shortcut is blocked while a draft save is in flight', async () => {
 });
 
 function app(api) {
-  return componentScript('src/App.svelte', { api, pimApi: {} }, `({
+  return componentScript('src/App.svelte', { api: threads(api), pimApi: {} }, `({
     open, reload, selectAccount, selectFolder, onSearch,
     setAccount(a){account=a}, setQuery(q){query=q},
     getState:()=>({detail, selectedId, account, folders, folder, hits})
@@ -151,10 +153,10 @@ test('closing task details before debounce still saves the edit', async () => {
 
 test('folder discovery refreshes the sidebar while the account sync is still pending', async () => {
   let reads = 0;
-  const c = componentScript('src/App.svelte', { api: {
+  const c = componentScript('src/App.svelte', { api: threads({
     listFolders: async () => { reads++; return [{id:10,role:'inbox'}, {id:11,name:'已发送'}]; },
     listMessages: async () => [],
-  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({folders,status})})');
+  }), pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({folders,status})})');
   c.setAccount(account);
   await c.onSyncProgress({account_id:1,stage:'folders',total_folders:2});
   assert.equal(reads,1);
@@ -166,9 +168,9 @@ test('folder discovery refreshes the sidebar while the account sync is still pen
 
 test('committed download pages become visible before the final sync response', async () => {
   let reads = 0;
-  const c = componentScript('src/App.svelte', { api: {
+  const c = componentScript('src/App.svelte', { api: threads({
     listFolders: async () => [{id:10,role:'inbox'}], listMessages: async () => {reads++;return []},
-  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({status})})');
+  }), pimApi: {} }, '({onSyncProgress,setAccount(a){account=a},state:()=>({status})})');
   c.setAccount(account);
   await c.onSyncProgress({account_id:1,stage:'messages',folder:'Inbox',completed_folders:0,total_folders:3,downloaded:50,total_messages:200});
   assert.equal(reads,1);
@@ -178,10 +180,10 @@ test('committed download pages become visible before the final sync response', a
 test('download progress coalesces list refreshes instead of reloading per page', async () => {
   let reads = 0;
   const pending = [];
-  const c = componentScript('src/App.svelte', { api: {
+  const c = componentScript('src/App.svelte', { api: threads({
     listFolders: async () => [{id:10,role:'inbox'}],
     listMessages: () => { reads++; const d = deferred(); pending.push(d); return d.promise; },
-  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a}})');
+  }), pimApi: {} }, '({onSyncProgress,setAccount(a){account=a}})');
   c.setAccount(account);
   const first = c.onSyncProgress({account_id:1,stage:'messages',folder:'Inbox',completed_folders:0,total_folders:1,downloaded:50,total_messages:500});
   await new Promise((r) => setImmediate(r));
@@ -192,4 +194,109 @@ test('download progress coalesces list refreshes instead of reloading per page',
   await new Promise((r) => setImmediate(r));
   assert.equal(reads, 1);
   void first;
+});
+
+function mailbox(api, folderRole = 'inbox') {
+  const folders = [{ id: 10, role: 'inbox', name: 'INBOX', display: 'Inbox', unread: 1, total: 3 },
+    { id: 11, role: 'trash', name: 'Trash', display: 'Trash' }, { id: 12, role: 'archive', name: 'Archive', display: 'Archive' },
+    { id: 13, role: 'junk', name: 'Junk', display: 'Junk' }];
+  const rows = [1, 2, 3].map((id) => ({ id, folder_id: 10, seen: id !== 3, flagged: id === 2, subject: `m${id}` }));
+  const calls = [];
+  const c = componentScript('src/App.svelte', { api: threads({
+    listFolders: async () => folders, listMessages: async () => rows,
+    moveMessages: async (ids, target, copy) => { calls.push(['move', ids, target, copy]); return { account_id: 1, target_folder_id: target, copy, items: [], untracked: 0, count: ids.length }; },
+    deleteMessages: async (ids) => { calls.push(['delete', ids]); return ids.length; },
+    setMessageFlag: async (ids, flag, on) => { calls.push(['flag', ids, flag, on]); return ids.length; },
+    ...api,
+  }), pimApi: {} }, `({ deleteSelected, purge, moveToRole, toggleRead, toggleStar, setFlag,
+    setup(a, fs, f, ms) { account = a; folders = fs; folder = f; messages = ms; threaded = false; },
+    pick(ids) { picked = ids; }, state: () => ({ messages, picked, confirmPurge, lastTransfer }) })`);
+  c.setup(account, folders, folders.find((f) => f.role === folderRole), rows.map((r) => ({ ...r })));
+  return { c, calls };
+}
+
+test('Delete moves to Trash with undo; in Trash it asks before deleting permanently', async () => {
+  const { c, calls } = mailbox();
+  c.pick([1, 2]);
+  await c.deleteSelected();
+  assert.equal(JSON.stringify(calls[0]), JSON.stringify(['move', [1, 2], 11, false]));
+  assert.deepEqual(c.state().messages.map((m) => m.id), [3]);
+  assert.ok(c.state().lastTransfer);
+
+  const trash = mailbox({}, 'trash');
+  trash.c.pick([3]);
+  await trash.c.deleteSelected();
+  assert.deepEqual(trash.calls, []);
+  assert.equal(JSON.stringify(trash.c.state().confirmPurge), '{"ids":[3]}');
+  await trash.c.purge();
+  assert.deepEqual(trash.calls, [['delete', [3]]]);
+  assert.deepEqual(trash.c.state().messages.map((m) => m.id), [1, 2]);
+});
+
+test('Shift+Delete always asks first, even outside Trash', async () => {
+  const { c, calls } = mailbox();
+  await c.deleteSelected([1], true);
+  assert.deepEqual(calls, []);
+  assert.equal(JSON.stringify(c.state().confirmPurge), '{"ids":[1]}');
+});
+
+test('archive and junk move to the role folders', async () => {
+  const { c, calls } = mailbox();
+  await c.moveToRole('archive', [1]);
+  await c.moveToRole('junk', [2]);
+  assert.deepEqual(calls.map((x) => x[2]), [12, 13]);
+});
+
+test('read and star toggles follow the selection and update the list', async () => {
+  const { c, calls } = mailbox();
+  await c.toggleRead([1, 3]);           // one unread -> mark all read
+  await c.toggleRead([1]);              // all read -> mark unread
+  await c.toggleStar([2]);              // starred -> unstar
+  await c.toggleStar([1, 2]);           // not all starred -> star
+  assert.deepEqual(calls.map((x) => x.slice(1)), [
+    [[1, 3], 'seen', true], [[1], 'seen', false], [[2], 'flagged', false], [[1, 2], 'flagged', true],
+  ]);
+  const byId = Object.fromEntries(c.state().messages.map((m) => [m.id, m]));
+  assert.equal(byId[1].seen, false);
+  assert.equal(byId[3].seen, true);
+  assert.ok(byId[1].flagged && byId[2].flagged);
+});
+
+test('the composer sends from the primary address unless an alias is chosen', async () => {
+  const sent = [];
+  const make = (d) => componentScript('src/lib/Composer.svelte', {
+    $props: () => ({ account, draft: d, title: 'Reply', onDone() {} }),
+    api: { send: async (_id, m) => { sent.push(m.from); return { sent_copy: 'saved' }; } },
+  }, '({ send, setFrom(v) { from = v; } })');
+  await make(draft).send();
+  const reply = make({ ...draft, from: 'sales@example.test' });
+  await reply.send();
+  reply.setFrom('ME@example.test');
+  await reply.send();
+  assert.deepEqual(sent, [null, 'sales@example.test', null]);
+});
+
+test('in conversation view, actions on a row apply to every message of the conversation', async () => {
+  const folders = [{ id: 10, role: 'inbox', name: 'INBOX', display: 'Inbox', total: 3 }, { id: 11, role: 'trash', name: 'Trash', display: 'Trash' }];
+  const rows = [{ id: 5, folder_id: 10, seen: true, flagged: false, thread_size: 3, thread_unread: 1, thread_flagged: false, thread_ids: [5, 3, 1] },
+    { id: 4, folder_id: 10, seen: true, flagged: true, thread_size: 1, thread_unread: 0, thread_flagged: true, thread_ids: [4] }];
+  const calls = [];
+  const c = componentScript('src/App.svelte', { api: {
+    listFolders: async () => folders, listThreads: async () => rows.map((r) => ({ ...r })),
+    moveMessages: async (ids, target) => { calls.push(['move', [...ids], target]); return { count: ids.length, items: [], copy: false }; },
+    setMessageFlag: async (ids, flag, on) => { calls.push(['flag', [...ids], flag, on]); return ids.length; },
+  }, pimApi: {} }, `({ deleteSelected, toggleRead, toggleStar, selection,
+    setup(a, fs, f, ms) { account = a; folders = fs; folder = f; messages = ms; }, pick(ids) { picked = ids; } })`);
+  c.setup(account, folders, folders[0], rows.map((r) => ({ ...r })));
+  c.pick([5]);
+  assert.deepEqual([...c.selection()].sort(), [1, 3, 5]);
+  await c.toggleRead();                 // the conversation has an unread message -> read
+  await c.toggleStar();                 // not starred -> star all
+  c.pick([4]);
+  await c.toggleStar();                 // starred -> unstar
+  c.pick([5]);
+  await c.deleteSelected();
+  assert.equal(JSON.stringify(calls), JSON.stringify([
+    ['flag', [5, 3, 1], 'seen', true], ['flag', [5, 3, 1], 'flagged', true], ['flag', [4], 'flagged', false], ['move', [5, 3, 1], 11],
+  ]));
 });

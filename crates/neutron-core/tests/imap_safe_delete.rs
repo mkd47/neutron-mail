@@ -473,3 +473,88 @@ async fn rejected_message_fetch_does_not_advance_sync_checkpoint() {
     assert!(store.uids(fid).unwrap().is_empty());
     commands_after_drop(s, server).await;
 }
+
+fn store_with_inbox(uids: &[u32]) -> (Store, i64, Vec<i64>) {
+    let store = Store::open_in_memory().unwrap();
+    let account = store.add_account(&test_config(1)).unwrap();
+    let fid = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    let ids = uids
+        .iter()
+        .map(|&uid| {
+            let raw = format!("Message-ID: <m{uid}@example.test>\r\nSubject: m{uid}\r\n\r\nbody");
+            store
+                .insert_message(
+                    fid,
+                    &NewMessage {
+                        uid,
+                        seen: true,
+                        flagged: false,
+                        raw: raw.as_bytes(),
+                    },
+                )
+                .unwrap()
+        })
+        .collect();
+    (store, fid, ids)
+}
+
+#[tokio::test]
+async fn unsupported_permanent_delete_is_rejected_before_marking_anything() {
+    let (mut session, server) = mock_server("").await;
+    let (store, fid, ids) = store_with_inbox(&[7]);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        neutron_core::folders::delete_permanently(&store, &mut session, &ids),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(neutron_core::Error::Invalid(_))));
+    assert_eq!(store.uids(fid).unwrap(), vec![7]);
+    let commands = commands_after_drop(session, server).await;
+    assert!(commands
+        .iter()
+        .all(|c| c.starts_with("LOGIN ") || c == "CAPABILITY"));
+}
+
+#[tokio::test]
+async fn flags_and_permanent_delete_touch_only_the_selected_messages() {
+    let (mut session, server) = mock_server("UIDPLUS").await;
+    let (store, fid, ids) = store_with_inbox(&[7, 8, 9]);
+    let picked = &ids[..2];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        use neutron_core::folders::{self, MessageFlag};
+        folders::set_flag(&store, &mut session, picked, MessageFlag::Flagged, true)
+            .await
+            .unwrap();
+        folders::set_flag(&store, &mut session, picked, MessageFlag::Seen, false)
+            .await
+            .unwrap();
+        let summaries = store.messages(fid, 0, 10).unwrap();
+        for m in &summaries {
+            let picked = m.uid != 9;
+            assert_eq!(m.flagged, picked, "uid {}", m.uid);
+            assert_eq!(m.seen, !picked, "uid {}", m.uid);
+        }
+        let (_, n) = folders::delete_permanently(&store, &mut session, picked)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    })
+    .await
+    .unwrap();
+    assert_eq!(store.uids(fid).unwrap(), vec![9]);
+    let commands = commands_after_drop(session, server).await;
+    assert!(commands
+        .iter()
+        .any(|c| c == "UID STORE 7,8 +FLAGS.SILENT (\\Flagged)"));
+    assert!(commands
+        .iter()
+        .any(|c| c == "UID STORE 7,8 -FLAGS.SILENT (\\Seen)"));
+    assert!(commands
+        .iter()
+        .any(|c| c == "UID STORE 7,8 +FLAGS.SILENT (\\Deleted)"));
+    assert!(commands.iter().any(|c| c == "UID EXPUNGE 7,8"));
+    assert!(!commands.iter().any(|c| c == "EXPUNGE"));
+}

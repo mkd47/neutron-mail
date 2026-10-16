@@ -44,6 +44,8 @@ export interface MessageSummary {
   id: number; folder_id: number; uid: number; subject: string; from_name: string; from_addr: string;
   date: number; preview: string; seen: boolean; flagged: boolean; has_attachments: boolean;
 }
+export interface ThreadSummary extends MessageSummary { thread_size: number; thread_unread: number; thread_flagged: boolean; thread_ids: number[] }
+export interface ConversationItem extends MessageSummary { folder_name: string; folder_role: string | null }
 export interface Attachment { index: number; name: string; mime: string; size: number; risky: boolean }
 export interface MailAddress { name: string; email: string }
 export interface AddressInfo { contacts_available: boolean; in_contacts: boolean; trusted: boolean }
@@ -61,6 +63,8 @@ export interface ComposeDraft {
   /** Initial HTML for the rich editor (sanitized by the backend), or null. */
   html: string | null;
   in_reply_to: string | null; references: string[]; attachments: ForwardedAttachment[];
+  /** Alias to send from (preselected for replies to mail sent to it); null = the account's address. */
+  from?: string | null;
 }
 export type ComposeMode = "reply" | "reply_all" | "forward" | "draft";
 export interface PickedAttachment { token: string; name: string; size: number; mime: string }
@@ -78,6 +82,8 @@ export interface Outgoing {
   /** Rich body; sent as multipart/alternative. The backend sanitizes it again. */
   html_body: string | null;
   in_reply_to: string | null; references: string[]; attachments: AttachmentRef[];
+  /** Sender address: the account's or one of its aliases (null = the account's). */
+  from?: string | null;
 }
 export interface AppInfo {
   secret_backend: "keyring" | "memory";
@@ -91,6 +97,8 @@ export interface AccountSettings {
   signature_html: string;
   /** 0 = all mail */
   sync_days: number;
+  /** Extra sender addresses (aliases). */
+  identities: MailAddress[];
 }
 
 export const api = {
@@ -147,6 +155,12 @@ export const api = {
   moveMessages: (messageIds: number[], targetFolderId: number, copy: boolean) =>
     invoke<Transfer>("move_messages", { messageIds, targetFolderId, copy }),
   undoTransfer: (transfer: Transfer) => invoke<number>("undo_transfer", { transfer }),
+  setMessageFlag: (messageIds: number[], flag: "seen" | "flagged", on: boolean) =>
+    invoke<number>("set_message_flag", { messageIds, flag, on }),
+  deleteMessages: (messageIds: number[]) => invoke<number>("delete_messages", { messageIds }),
+  printMessage: (messageId: number) => invoke<void>("print_message", { messageId }),
+  listThreads: (folderId: number, offset: number, limit: number) => invoke<ThreadSummary[]>("list_threads", { folderId, offset, limit }),
+  conversation: (messageId: number) => invoke<ConversationItem[]>("conversation", { messageId }),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
   onSyncProgress: (cb: (e: SyncProgress) => void): Promise<UnlistenFn> => listen<SyncProgress>("mail://sync-progress", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>
@@ -180,7 +194,7 @@ export function errorText(e: unknown): string {
 }
 
 export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" };
-export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [] });
+export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [], from: null });
 
 export type DeleteMode = "move_to_trash" | "delete_messages";
 export interface Transfer { account_id: number; target_folder_id: number; copy: boolean; items: [number, string][]; untracked: number; count: number }

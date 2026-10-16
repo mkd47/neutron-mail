@@ -13,7 +13,7 @@
   import Calendar from "./lib/Calendar.svelte";
   import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, pimApi } from "./lib/api";
+    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -26,7 +26,12 @@
   let account = $state<Account | null>(null);
   let folders = $state<Folder[]>([]);
   let folder = $state<Folder | null>(null);
-  let messages = $state<MessageSummary[]>([]);
+  // A list row: a message, or (conversation view) a thread's newest message
+  // with the thread's size, unread count, star and member ids.
+  type ListRow = MessageSummary & Partial<Omit<ThreadSummary, keyof MessageSummary>>;
+  let messages = $state<ListRow[]>([]);
+  let threaded = $state(((): boolean => { try { return localStorage.getItem("threaded") !== "0"; } catch { return true; } })());
+  let listEnd = false;
   let selectedId = $state<number | null>(null);
   let detail = $state<MessageView | null>(null);
   let accountVersion = 0;
@@ -103,6 +108,9 @@
   let picked = $state<number[]>([]);
   let anchor: number | null = null;
   let lastTransfer = $state<Transfer | null>(null);
+  // Right-click menu on messages, and the "delete permanently?" confirmation.
+  let msgMenu = $state<{ x: number; y: number } | null>(null);
+  let confirmPurge = $state<{ ids: number[] } | null>(null);
   let draggingFolder = $state(false);
   let dropTarget = $state<number | "root" | null>(null);
   let showAll = $state(localStorage.getItem("showUnsubscribed") === "1");
@@ -169,7 +177,7 @@
     return out;
   });
   const descendants = (f: Folder) => folders.filter((x) => f.delimiter && x.name.startsWith(f.name + f.delimiter));
-  const list = $derived(hits ?? messages);
+  const list = $derived<ListRow[]>(hits ?? messages);
 
   async function refreshFolders() {
     if (!account) return;
@@ -186,28 +194,30 @@
     const request = ++messageRequest, version = accountVersion;
     if (!folder) { messages = []; return; }
     // Keep as many rows as were already loaded (paged by the backend's 500 cap).
-    const want = Math.max(PAGE, messages.length), id = folder.id;
-    const out: MessageSummary[] = [];
+    const want = Math.max(PAGE, messages.length), id = folder.id, th = threaded;
+    const out: ListRow[] = [];
+    let end = false;
     while (out.length < want) {
       const n = Math.min(500, want - out.length);
-      const page = await api.listMessages(id, out.length, n);
-      if (version !== accountVersion || folder?.id !== id || request !== messageRequest) return;
+      const page = th ? await api.listThreads(id, out.length, n) : await api.listMessages(id, out.length, n);
+      if (version !== accountVersion || folder?.id !== id || request !== messageRequest || th !== threaded) return;
       out.push(...page);
-      if (page.length < n) break;
+      if (page.length < n) { end = true; break; }
     }
-    messages = out;
+    messages = out; listEnd = end;
   }
   async function loadMore() {
-    if (!folder || hits || loadingMore) return;
+    if (!folder || hits || loadingMore || listEnd) return;
     const total = folders.find((f) => f.id === folder!.id)?.total ?? 0;
-    if (messages.length >= total) return;
+    if (!threaded && messages.length >= total) return;
     loadingMore = true;
-    const request = messageRequest, version = accountVersion, id = folder.id;
+    const request = messageRequest, version = accountVersion, id = folder.id, th = threaded;
     try {
-      const page = await api.listMessages(id, messages.length, PAGE);
-      if (version === accountVersion && folder?.id === id && request === messageRequest) {
+      const page: ListRow[] = th ? await api.listThreads(id, messages.length, PAGE) : await api.listMessages(id, messages.length, PAGE);
+      if (version === accountVersion && folder?.id === id && request === messageRequest && th === threaded) {
         const existing = new Set(messages.map((m) => m.id));
         messages = [...messages, ...page.filter((m) => !existing.has(m.id))];
+        if (page.length < PAGE) listEnd = true;
       }
     } catch (e) { if (version === accountVersion && folder?.id === id) showToast(errorText(e), true); }
     finally { loadingMore = false; }
@@ -245,7 +255,22 @@
     void open(m);
   }
   const focus = (el: HTMLElement) => { el.focus(); };
-  const selection = () => (picked.length ? picked : selectedId !== null ? [selectedId] : []);
+  /** The list row showing a message (itself, or the conversation containing it). */
+  const rowOf = (id: number): ListRow | undefined => ((hits ?? messages) as ListRow[]).find((m) => m.id === id || m.thread_ids?.includes(id));
+  /** In conversation view, a row stands for every message of its conversation in this folder. */
+  function expand(ids: number[]) {
+    if (hits || !threaded) return ids;
+    const out = new Set<number>();
+    for (const id of ids) for (const x of rowOf(id)?.thread_ids ?? [id]) out.add(x);
+    return [...out];
+  }
+  const selection = () => expand(picked.length ? picked : selectedId !== null ? [selectedId] : []);
+  function setThreaded(on: boolean) {
+    threaded = on;
+    try { localStorage.setItem("threaded", on ? "1" : "0"); } catch { /* ignore */ }
+    picked = []; messages = []; listEnd = false;
+    void refreshMessages();
+  }
 
   // ---- moving / copying mail ----
   async function transfer(ids: number[], target: Folder, copy: boolean) {
@@ -275,6 +300,76 @@
       await refreshFolders(); await refreshMessages();
     } catch (e) { showToast(`Undo failed: ${errorText(e)}`, true); }
   }
+
+  // ---- message actions: delete / archive / junk / read / star ----
+  const roleFolder = (role: string) => folders.find((f) => f.role === role) ?? null;
+  function isUnread(id: number) {
+    const r = rowOf(id) as ListRow | undefined;
+    if (!r) return detail?.id === id ? !detail.seen : false;
+    return r.thread_unread !== undefined ? r.thread_unread > 0 : !r.seen;
+  }
+  function isStarred(id: number) {
+    const r = rowOf(id) as ListRow | undefined;
+    if (!r) return detail?.id === id ? detail.flagged : false;
+    return r.thread_flagged ?? r.flagged;
+  }
+  const inFolder = (role: string) => folder !== null && folder.role === role && !hits;
+  function removeFromList(ids: number[]) {
+    messages = messages.filter((m) => !ids.includes(m.id));
+    if (hits) hits = hits.filter((m) => !ids.includes(m.id));
+    if (selectedId !== null && ids.includes(selectedId)) { detail = null; selectedId = null; }
+    picked = [];
+  }
+  /** Delete moves to Trash (undoable); in Trash, without one, or with Shift it deletes for good after asking. */
+  async function deleteSelected(ids = selection(), permanent = false) {
+    msgMenu = null;
+    if (!ids.length) return;
+    const trash = roleFolder("trash");
+    if (permanent || !trash || inFolder("trash")) { confirmPurge = { ids }; return; }
+    await transfer(ids, trash, false);
+  }
+  async function purge() {
+    const c = confirmPurge; confirmPurge = null;
+    if (!c) return;
+    try {
+      status = `Deleting ${c.ids.length}…`;
+      const n = await api.deleteMessages(c.ids);
+      removeFromList(c.ids); status = "";
+      showToast(`Deleted ${n} message${n === 1 ? "" : "s"} permanently`);
+      await refreshFolders();
+    } catch (e) { status = ""; showToast(errorText(e), true); }
+  }
+  async function moveToRole(role: "archive" | "junk" | "inbox", ids = selection()) {
+    msgMenu = null;
+    const target = roleFolder(role);
+    if (!target) { showToast(`This account has no ${role === "archive" ? "Archive" : role === "junk" ? "Junk" : "Inbox"} folder`, true); return; }
+    await transfer(ids, target, false);
+  }
+  async function setFlag(flag: "seen" | "flagged", on: boolean, ids = selection()) {
+    msgMenu = null;
+    if (!ids.length) return;
+    try {
+      await api.setMessageFlag(ids, flag, on);
+      const apply = <T extends { id: number; seen: boolean; flagged: boolean }>(m: T): T =>
+        ids.includes(m.id) ? { ...m, [flag]: on } : m;
+      messages = messages.map(apply);
+      if (hits) hits = hits.map(apply);
+      if (detail && ids.includes(detail.id)) detail = apply(detail);
+      if (flag === "seen") await refreshFolders();
+      // Conversation rows carry counts for the whole thread: reload them.
+      if (threaded && !hits) await refreshMessages();
+    } catch (e) { showToast(errorText(e), true); }
+  }
+  /** Star (or unstar if every selected message is starred). */
+  const toggleStar = (ids = selection()) => setFlag("flagged", !ids.every(isStarred), ids);
+  /** Mark unread (or read if any selected message is unread). */
+  const toggleRead = (ids = selection()) => setFlag("seen", ids.some(isUnread), ids);
+  function openMsgMenu(e: MouseEvent, m: MessageSummary) {
+    e.preventDefault(); e.stopPropagation(); menu = null;
+    if (!picked.includes(m.id) && selectedId !== m.id) { picked = [m.id]; anchor = m.id; }
+    msgMenu = { x: Math.min(e.clientX, window.innerWidth - 220), y: Math.min(e.clientY, window.innerHeight - 330) };
+  }
+
   const MSG_TYPE = "application/x-neutron-messages", FOLDER_TYPE = "application/x-neutron-folder";
   function dragMessages(e: DragEvent, m: MessageSummary) {
     const ids = picked.includes(m.id) ? picked : [m.id];
@@ -360,7 +455,13 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && lastTransfer) { e.preventDefault(); void undo(); }
     else if (e.key.toLowerCase() === "v" && !e.ctrlKey && !e.metaKey && selection().length) { e.preventDefault(); pickerQuery = ""; picker = { copy: e.shiftKey }; }
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && t.closest(".list")) { e.preventDefault(); picked = list.map((m) => m.id); }
-    else if (e.key === "Escape") { picked = []; menu = null; }
+    else if (e.key === "Escape") { picked = []; menu = null; msgMenu = null; }
+    else if (e.ctrlKey || e.metaKey || e.altKey || !selection().length || confirmPurge || picker) return;
+    else if (e.key === "Delete") { e.preventDefault(); void deleteSelected(selection(), e.shiftKey); }
+    else if (e.key === "a" || e.key === "e") { e.preventDefault(); void moveToRole("archive"); }
+    else if (e.key === "!") { e.preventDefault(); void moveToRole(inFolder("junk") ? "inbox" : "junk"); }
+    else if (e.key === "u") { e.preventDefault(); void toggleRead(); }
+    else if (e.key === "s") { e.preventDefault(); void toggleStar(); }
   }
 
   async function open(m: MessageSummary) {
@@ -371,7 +472,13 @@
       const result = await api.getMessage(m.id, theme === "dark", false);
       if (version !== accountVersion || request !== detailRequest || selectedId !== m.id) return;
       detail = result;
-      if (!m.seen) { m.seen = true; await refreshFolders(); }
+      const row = m as ListRow;
+      if (threaded && !hits && (row.thread_unread ?? 0) > 0 && (row.thread_ids?.length ?? 0) > 1) {
+        // Opening a conversation reads all of it.
+        await api.setMessageFlag(row.thread_ids!, "seen", true).catch(() => {});
+        await refreshFolders();
+        if (version === accountVersion) await refreshMessages();
+      } else if (!m.seen) { m.seen = true; await refreshFolders(); }
     } catch (e) { if (version === accountVersion && request === detailRequest) status = errorText(e); }
   }
   const syncingAccounts = new Set<number>();
@@ -485,7 +592,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onKey} onclick={() => (menu = null)} />
+<svelte:window onkeydown={onKey} onclick={() => { menu = null; msgMenu = null; }} />
 {#if showRules && account}
   <main class="setup-wrap">
     <Rules {account} {folders} testMessage={detail ? { id: detail.id, subject: detail.subject } : null}
@@ -578,10 +685,19 @@
       <div class="meta muted">
         {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length).toLocaleString()} message${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length) === 1 ? "" : "s"}`}
         <span class="status" title={status}>{status}</span>
+        {#if !hits}
+          <button class="threads" onclick={() => setThreaded(!threaded)} aria-pressed={threaded}
+            title={threaded ? "Showing conversations: click to list every message" : "Group messages into conversations"}>
+            {threaded ? "Conversations" : "Messages"}</button>
+        {/if}
       </div>
       {#if picked.length > 1 || (picked.length === 1 && selectedId === null)}
         <div class="selbar">
           <span>{picked.length} selected</span>
+          <button class="icon-btn sm" onclick={() => moveToRole("archive")} title="Archive (A)" aria-label="Archive" disabled={!roleFolder("archive") || inFolder("archive")}><Icon name="archive" size={14} /></button>
+          <button class="icon-btn sm" onclick={() => deleteSelected()} title="Delete (Del)" aria-label="Delete"><Icon name="trash" size={14} /></button>
+          <button class="icon-btn sm" onclick={() => toggleRead()} title="Mark read / unread (U)" aria-label="Mark read or unread"><Icon name="mail" size={14} /></button>
+          <button class="icon-btn sm" onclick={() => toggleStar()} title="Star / unstar (S)" aria-label="Star or unstar"><Icon name="star" size={14} /></button>
           <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: false }; }} title="Move to… (V)">Move to…</button>
           <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: true }; }} title="Copy to… (Shift+V)">Copy to…</button>
           <button class="icon-btn sm" aria-label="Clear selection" onclick={() => (picked = [])}><Icon name="close" size={13} /></button>
@@ -590,11 +706,12 @@
       <ul onscroll={onListScroll}>
         {#each list as m (m.id)}
           <li>
-            <button class="item" class:selected={selectedId === m.id || picked.includes(m.id)} class:unread={!m.seen}
+            <button class="item" class:selected={selectedId === m.id || picked.includes(m.id) || (selectedId !== null && !!m.thread_ids?.includes(selectedId))}
+              class:unread={m.thread_unread !== undefined ? m.thread_unread > 0 : !m.seen}
               draggable="true" ondragstart={(e) => dragMessages(e, m)} ondragend={() => (dropTarget = null)}
-              onclick={(e) => clickItem(e, m)} aria-pressed={picked.includes(m.id)}>
+              onclick={(e) => clickItem(e, m)} oncontextmenu={(e) => openMsgMenu(e, m)} aria-pressed={picked.includes(m.id)}>
               <span class="dot"></span>
-              <span class="row1"><span class="from">{m.from_name || m.from_addr}</span><span class="date">{#if m.flagged}<span class="star" title="Starred"><Icon name="star" size={13} /></span> {/if}{shortDate(m.date)}</span></span>
+              <span class="row1"><span class="from">{m.from_name || m.from_addr}{#if (m.thread_size ?? 1) > 1}<span class="tcount" title={`${m.thread_size} messages in this conversation`}>{m.thread_size}</span>{/if}</span><span class="date">{#if m.thread_flagged ?? m.flagged}<span class="star" title="Starred"><Icon name="star" size={13} /></span> {/if}{shortDate(m.date)}</span></span>
               <span class="subject">{m.subject || "(no subject)"}{#if m.has_attachments} <Icon name="clip" size={13} />{/if}</span>
               <span class="preview">
                 {#if "snippet" in m}
@@ -612,7 +729,19 @@
     <section class="reader">
       <Agenda refreshKey={agendaKey} />
       {#if detail}
-        <div class="msgbar">
+        {@const d = detail}
+        <div class="msgbar" role="toolbar" aria-label="Message">
+          <button class="btn sm" onclick={() => moveToRole("archive", expand([d.id]))} disabled={!roleFolder("archive") || inFolder("archive")}
+            title={roleFolder("archive") ? "Archive (A)" : "This account has no Archive folder"}><Icon name="archive" size={14} /> Archive</button>
+          <button class="btn sm" onclick={() => deleteSelected(expand([d.id]))} title={inFolder("trash") ? "Delete permanently (Del)" : "Move to Trash (Del) · Shift+Del deletes permanently"}>
+            <Icon name="trash" size={14} /> Delete</button>
+          {#if inFolder("junk")}
+            <button class="btn sm" onclick={() => moveToRole("inbox", expand([d.id]))} title="Not junk: move to Inbox (!)"><Icon name="inbox" size={14} /> Not junk</button>
+          {:else}
+            <button class="btn sm" onclick={() => moveToRole("junk", expand([d.id]))} disabled={!roleFolder("junk")} title={roleFolder("junk") ? "Mark as junk (!)" : "This account has no Junk folder"}><Icon name="junk" size={14} /> Junk</button>
+          {/if}
+          <button class="btn sm" onclick={() => setFlag("seen", !d.seen, expand([d.id]))} title="Mark read / unread (U)"><Icon name="mail" size={14} /> {d.seen ? "Mark unread" : "Mark read"}</button>
+          <button class="btn sm" class:on={d.flagged} onclick={() => setFlag("flagged", !d.flagged, expand([d.id]))} aria-pressed={d.flagged} title="Star / unstar (S)"><Icon name="star" size={14} /> {d.flagged ? "Starred" : "Star"}</button>
           <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: false }; }} title="Move to… (V)"><Icon name="folder" size={14} /> Move to…</button>
           <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: true }; }} title="Copy to… (Shift+V)">Copy to…</button>
         </div>
@@ -620,7 +749,8 @@
       <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
         onPimChanged={() => pimKey++} onOpenNote={() => {}}
         onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
-        onCalendarChanged={() => agendaKey++} onComposeTo={composeTo} />
+        onCalendarChanged={() => agendaKey++} onComposeTo={composeTo}
+        onOpenMessage={(id) => open(rowOf(id)?.id === id ? rowOf(id)! : ({ id, seen: true } as MessageSummary))} />
     </section>
     {#if showPanel}
       <TodayPanel refreshKey={pimKey} onClose={() => (showPanel = false)} onOpenTodo={() => (appView = "todo")}
@@ -692,6 +822,39 @@
       </div>
     </div>
   {/if}
+  {#if msgMenu}
+    {@const ids = selection()}
+    {@const anyUnread = ids.some(isUnread)}
+    {@const allStarred = ids.every(isStarred)}
+    <div class="ctx" style:left="{msgMenu.x}px" style:top="{msgMenu.y}px" role="menu" aria-label="Message actions">
+      <button role="menuitem" onclick={() => setFlag("seen", anyUnread, ids)}>{anyUnread ? "Mark as read" : "Mark as unread"}</button>
+      <button role="menuitem" onclick={() => setFlag("flagged", !allStarred, ids)}>{allStarred ? "Remove star" : "Star"}</button>
+      <hr />
+      <button role="menuitem" onclick={() => moveToRole("archive", ids)} disabled={!roleFolder("archive") || inFolder("archive")}>Archive</button>
+      {#if inFolder("junk")}
+        <button role="menuitem" onclick={() => moveToRole("inbox", ids)}>Not junk</button>
+      {:else}
+        <button role="menuitem" onclick={() => moveToRole("junk", ids)} disabled={!roleFolder("junk")}>Mark as junk</button>
+      {/if}
+      <button role="menuitem" onclick={() => { msgMenu = null; pickerQuery = ""; picker = { copy: false }; }}>Move to…</button>
+      <button role="menuitem" onclick={() => { msgMenu = null; pickerQuery = ""; picker = { copy: true }; }}>Copy to…</button>
+      <hr />
+      <button role="menuitem" class="danger" onclick={() => deleteSelected(ids)}>{inFolder("trash") ? "Delete permanently…" : "Delete"}</button>
+      {#if !inFolder("trash")}<button role="menuitem" class="danger" onclick={() => deleteSelected(ids, true)}>Delete permanently…</button>{/if}
+      <div class="muted small pad">{ids.length} message{ids.length === 1 ? "" : "s"}</div>
+    </div>
+  {/if}
+  {#if confirmPurge}
+    {@const c = confirmPurge}
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Delete permanently">
+      <div class="card">
+        <h3>Delete {c.ids.length} message{c.ids.length === 1 ? "" : "s"} permanently?</h3>
+        <p>{c.ids.length === 1 ? "It is" : "They are"} removed from the server and can't be recovered.</p>
+        <div class="row"><button class="btn" onclick={() => (confirmPurge = null)} use:focus>Cancel</button>
+          <button class="btn primary danger-fill" onclick={purge}>Delete permanently</button></div>
+      </div>
+    </div>
+  {/if}
   {#if toast}
     <div class="toast" class:warn={toast.warn} role="status">{toast.text}
       {#if toast.undo}{@const u = toast.undo}<button class="btn sm" onclick={() => undo(u)} title="Undo (Ctrl+Z)">Undo</button>{/if}
@@ -727,6 +890,10 @@
   .search input { border: 0; background: transparent; flex: 1; padding: 10px 0; outline: none; }
   .meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 4px 18px 8px; }
   .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  .threads { border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); border-radius: 999px; padding: 0 8px; font-size: 11px; flex: none; }
+  .threads[aria-pressed="true"] { color: var(--unread); border-color: var(--accent); }
+  .tcount { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; color: var(--muted); line-height: 16px; vertical-align: 1px; }
   ul { list-style: none; margin: 0; padding: 0 8px 8px; overflow: auto; flex: 1; }
   .item { width: 100%; display: grid; grid-template-columns: 14px 1fr; column-gap: 6px; text-align: left; border: 0; background: transparent; padding: 10px 10px; border-radius: 10px; border-bottom: 1px solid var(--border); }
   .item:hover { background: var(--hover); }
@@ -758,7 +925,8 @@
   .droproot.on, nav.rootdrop .droproot { border-color: var(--accent); background: var(--accent-soft); color: var(--text); display: block; }
   .selbar { display: flex; align-items: center; gap: 8px; margin: 0 14px 6px; padding: 6px 10px; border-radius: 10px; background: var(--accent-soft); font-size: 13px; }
   .selbar span { flex: 1; }
-  .msgbar { display: flex; gap: 6px; padding: 8px 16px 0; flex: none !important; }
+  .msgbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px 0; flex: none !important; }
+  .msgbar .btn.on { color: #e3a008; border-color: #e3a00866; }
   .ctx { position: fixed; z-index: 70; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px; box-shadow: 0 10px 30px #0006; min-width: 190px; display: flex; flex-direction: column; }
   .ctx button { border: 0; background: transparent; text-align: left; padding: 7px 12px; border-radius: 6px; }
   .ctx button:hover:not(:disabled) { background: var(--hover); } .ctx button:disabled { opacity: .45; }

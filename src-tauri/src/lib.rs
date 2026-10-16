@@ -8,6 +8,7 @@ mod commands;
 mod contacts;
 mod organize;
 mod pim;
+mod print;
 mod providers;
 mod watcher;
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub contacts: contacts::Contacts,
     pub calendar: calendar::Calendar,
     pub cache: CacheStatus,
+    pub print: print::PrintJobs,
 }
 
 impl AppState {
@@ -125,6 +127,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol(print::SCHEME, print::protocol)
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -137,10 +140,20 @@ pub fn run() {
             // background so a large cache can't delay the window or, on
             // failure, push the app into the in-memory fallback.
             let repair = Arc::clone(&store);
-            std::thread::spawn(move || match repair.repair_text_decoding() {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(messages = n, "cached text re-indexed"),
-                Err(e) => tracing::warn!("cached text re-index failed (retried next start): {e}"),
+            std::thread::spawn(move || {
+                match repair.repair_text_decoding() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(messages = n, "cached text re-indexed"),
+                    Err(e) => {
+                        tracing::warn!("cached text re-index failed (retried next start): {e}")
+                    }
+                }
+                // Conversation keys for mail cached before threading existed.
+                match repair.backfill_threads() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(messages = n, "conversations indexed"),
+                    Err(e) => tracing::warn!("conversation index failed (retried next start): {e}"),
+                }
             });
             let state = AppState {
                 store,
@@ -151,6 +164,7 @@ pub fn run() {
                 contacts: contacts::Contacts::default(),
                 calendar: calendar::Calendar::default(),
                 cache,
+                print: print::PrintJobs::default(),
             };
             let accounts = state.store.accounts()?;
             app.manage(state);
@@ -176,6 +190,8 @@ pub fn run() {
             commands::sync_account,
             commands::list_folders,
             commands::list_messages,
+            commands::list_threads,
+            commands::conversation,
             commands::get_message,
             commands::set_image_sender_trust,
             commands::update_account,
@@ -207,6 +223,9 @@ pub fn run() {
             organize::set_folder_subscribed,
             organize::move_messages,
             organize::undo_transfer,
+            organize::set_message_flag,
+            organize::delete_messages,
+            print::print_message,
             organize::list_rules,
             organize::save_rules,
             organize::test_rule,
