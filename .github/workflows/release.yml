@@ -1,12 +1,15 @@
 name: Release
 
-# Push a tag like v0.2.0 to build the Fedora 44 RPM and publish a GitHub
-# Release with it. The tag must match the version in src-tauri/tauri.conf.json;
-# release notes are read from docs/releases/<tag>.md when that file exists.
+# Push a tag like v0.2.0, or run this workflow by hand ("Run workflow" on
+# the Actions tab), to build the Fedora 44 RPM and publish a GitHub Release
+# with it. The tag is always v<version in src-tauri/tauri.conf.json>; a manual
+# run creates it on the commit it ran on. Release notes are read from
+# docs/releases/<tag>.md when that file exists.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,13 +34,15 @@ jobs:
             gnome-keyring libsecret evolution-data-server git tar jq
           dnf group install -y c-development
       - uses: actions/checkout@v4
-      - name: Tag matches the app version
+      - name: Release tag from the app version
+        id: tag
         run: |
-          version=$(jq -r .version src-tauri/tauri.conf.json)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match tauri.conf.json version $version"
+          tag="v$(jq -r .version src-tauri/tauri.conf.json)"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$tag" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match tauri.conf.json version $tag"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Rust and the Tauri CLI
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -64,11 +69,13 @@ jobs:
       - name: Release notes
         id: notes
         run: |
-          notes="docs/releases/$GITHUB_REF_NAME.md"
+          notes="docs/releases/${{ steps.tag.outputs.tag }}.md"
           if [ -f "$notes" ]; then echo "path=$notes" >> "$GITHUB_OUTPUT"; fi
       - uses: softprops/action-gh-release@v2
         with:
-          name: Neutron Mail ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Neutron Mail ${{ steps.tag.outputs.tag }}
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.path == '' }}
           files: |
