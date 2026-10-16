@@ -1,6 +1,6 @@
 [package]
 name = "neutron-mail"
-version = "0.1.0"
+version = "0.2.0"
 description = "Neutron Mail – a native IMAP/SMTP client (prototype)"
 edition.workspace = true
 rust-version.workspace = true

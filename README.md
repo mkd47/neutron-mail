@@ -11,7 +11,7 @@ A free, open-source desktop mail client inspired by modern privacy-focused webma
 
 ## Status
 
-**Working prototype (v0.1.0 + v0.2 features).** Verified in the real GUI against a local Dovecot + SMTP test server:
+**Working prototype (v0.2.0).** Verified in the real GUI against a local Dovecot + SMTP test server:
 add an account (IMAP/SMTP over TLS or STARTTLS, certificate always verified), folder list,
 message list from a local SQLite cache, full-text search, IMAP IDLE push with a polling fallback, and:
 

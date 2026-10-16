@@ -1,0 +1,76 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the Fedora 44 RPM and publish a GitHub
+# Release with it. The tag must match the version in src-tauri/tauri.conf.json;
+# release notes are read from docs/releases/<tag>.md when that file exists.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rpm:
+    name: Build and publish RPM (Fedora 44 container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Prerequisites from the README
+        run: |
+          dnf install -y webkit2gtk4.1-devel openssl-devel curl wget file \
+            libappindicator-gtk3-devel librsvg2-devel libxdo-devel nodejs npm \
+            gnome-keyring libsecret evolution-data-server git tar jq
+          dnf group install -y c-development
+      - uses: actions/checkout@v4
+      - name: Tag matches the app version
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match tauri.conf.json version $version"
+            exit 1
+          fi
+      - name: Rust and the Tauri CLI
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli@^2
+      - run: npm ci
+      - name: cargo tauri build (RPM)
+        run: cargo tauri build --bundles rpm
+      - name: Inspect and install the RPM
+        run: |
+          rpm -qip target/release/bundle/rpm/*.rpm
+          dnf install -y target/release/bundle/rpm/*.rpm
+          ! ldd /usr/bin/neutron-mail | grep "not found"
+      - name: Checksums
+        # The bundle is named "Neutron Mail-…"; GitHub would rename the space
+        # on upload and break SHA256SUMS, so publish a space-free name.
+        run: |
+          cd target/release/bundle/rpm
+          for f in *.rpm; do mv "$f" "neutron-mail-${f#Neutron Mail-}"; done
+          sha256sum *.rpm > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        id: notes
+        run: |
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then echo "path=$notes" >> "$GITHUB_OUTPUT"; fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Neutron Mail ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.path == '' }}
+          files: |
+            target/release/bundle/rpm/*.rpm
+            target/release/bundle/rpm/SHA256SUMS
