@@ -372,15 +372,29 @@
   const syncingAccounts = new Set<number>();
   async function onSyncProgress(e: SyncProgress) {
     if (e.account_id !== account?.id) return;
-    const version = accountVersion;
     if (e.stage === "connecting") status = "Connecting to mail server…";
     else if (e.stage === "listing") status = "Discovering folders…";
     else if (e.stage === "folders") status = `Found ${e.total_folders} folders · downloading mail…`;
     else status = `Syncing ${e.folder ?? "mail"} · folder ${e.completed_folders + 1}/${e.total_folders}${e.total_messages ? ` · ${e.downloaded}/${e.total_messages} messages` : ""}`;
-    if (e.stage === "folders" || (e.stage === "messages" && e.downloaded > 0)) {
-      await refreshFolders();
-      if (version === accountVersion) await refreshMessages();
-    }
+    if (e.stage === "folders" || (e.stage === "messages" && e.downloaded > 0)) await refreshForProgress();
+  }
+  // Progress arrives once per downloaded page: run at most one refresh at a
+  // time, queue at most one more, and space them a second apart, so a large
+  // first sync doesn't reload the folder and message lists for every page.
+  let progressRefreshing = false, progressQueued = false;
+  async function refreshForProgress() {
+    if (progressRefreshing) { progressQueued = true; return; }
+    progressRefreshing = true;
+    try {
+      do {
+        progressQueued = false;
+        const version = accountVersion;
+        await refreshFolders();
+        if (version === accountVersion) await refreshMessages();
+        if (progressQueued) await new Promise((r) => setTimeout(r, 1000));
+      } while (progressQueued);
+    } catch { /* the sync result reports errors */ }
+    finally { progressRefreshing = false; }
   }
   async function sync() {
     if (!account || syncingAccounts.has(account.id)) return;

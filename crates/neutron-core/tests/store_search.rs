@@ -346,6 +346,7 @@ fn decoding_upgrade_repairs_cached_text_and_search_without_redownloading() {
         .unwrap();
     drop(db);
     let store = Store::open_plaintext(&path).unwrap();
+    assert_eq!(store.repair_text_decoding().unwrap(), 1);
     let row = store.messages(fid, 0, 10).unwrap().remove(0);
     assert_eq!(row.id, id);
     assert_eq!(row.subject, text);
@@ -366,5 +367,54 @@ fn decoding_upgrade_repairs_cached_text_and_search_without_redownloading() {
     drop(db);
     // A second open does not repeat/duplicate the migration.
     let store = Store::open_plaintext(&path).unwrap();
+    assert_eq!(store.repair_text_decoding().unwrap(), 0);
     assert_eq!(store.messages(fid, 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn decoding_repair_runs_in_resumable_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big-cache.sqlite3");
+    let store = Store::open_plaintext(&path).unwrap();
+    let account = store.add_account(&cfg()).unwrap();
+    let fid = store
+        .upsert_folder(account, "INBOX", Some("inbox"))
+        .unwrap();
+    for uid in 1..=120u32 {
+        let raw = format!("From: a@example.test\r\nSubject: s{uid}\r\n\r\nbody {uid}");
+        store
+            .insert_message(
+                fid,
+                &NewMessage {
+                    uid,
+                    seen: false,
+                    flagged: false,
+                    raw: raw.as_bytes(),
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+    // Simulate an older cache whose repair was interrupted after one batch.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let after: i64 = db
+        .query_row(
+            "SELECT id FROM messages ORDER BY id LIMIT 1 OFFSET 49",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute("DELETE FROM cache_metadata WHERE key='text-decoder'", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO cache_metadata (key,value) VALUES ('text-decoder-after', ?1)",
+        [after.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_plaintext(&path).unwrap();
+    // Opening does not do the work; the explicit call resumes after the checkpoint.
+    assert_eq!(store.repair_text_decoding().unwrap(), 70);
+    assert_eq!(store.repair_text_decoding().unwrap(), 0);
+    assert_eq!(store.search(account, "s120", 10).unwrap().len(), 1);
 }

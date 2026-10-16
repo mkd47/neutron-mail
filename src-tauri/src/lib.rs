@@ -133,6 +133,15 @@ pub fn run() {
             tracing::info!(backend = ?secrets.backend(), "secret storage selected");
             let (store, cache) = open_cache(&dir, &secrets);
             let store = Arc::new(store);
+            // One-off re-index of mail cached by older decoders. In the
+            // background so a large cache can't delay the window or, on
+            // failure, push the app into the in-memory fallback.
+            let repair = Arc::clone(&store);
+            std::thread::spawn(move || match repair.repair_text_decoding() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(messages = n, "cached text re-indexed"),
+                Err(e) => tracing::warn!("cached text re-index failed (retried next start): {e}"),
+            });
             let state = AppState {
                 store,
                 secrets,

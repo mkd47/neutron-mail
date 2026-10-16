@@ -400,7 +400,7 @@ async fn delete_draft(
     if acc != account.id {
         return Err(Error::Invalid("draft belongs to another account".into()));
     }
-    let folder_id = state.store.message_detail(draft_id)?.summary.folder_id;
+    let folder_id = state.store.message_folder_id(draft_id)?;
     let mut s = imap::connect(&account.config, password).await?;
     imap::delete_uid(&mut s, &folder, uid).await?;
     drop(s.logout().await);

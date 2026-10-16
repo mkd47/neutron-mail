@@ -503,14 +503,18 @@ fn uid_set(uids: &[u32]) -> String {
 pub async fn fetch_full(session: &mut Session, uids: &[u32]) -> Result<Vec<FetchedMessage>> {
     let mut out = Vec::with_capacity(uids.len());
     for chunk in uids.chunks(50) {
-        let fetches: Vec<_> = cmd(async {
-            session
-                .uid_fetch(uid_set(chunk), "(UID FLAGS BODY.PEEK[])")
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
+        // The deadline applies to each message, not the whole page: 50
+        // large messages on a slow link can legitimately take longer than
+        // one command timeout, and a page that always times out would stop
+        // the folder from ever syncing.
+        let mut fetches = Vec::with_capacity(chunk.len());
+        {
+            let stream = cmd(session.uid_fetch(uid_set(chunk), "(UID FLAGS BODY.PEEK[])")).await?;
+            futures::pin_mut!(stream);
+            while let Some(f) = cmd(stream.try_next()).await? {
+                fetches.push(f);
+            }
+        }
         // The upstream fetch stream also drops tagged NO/BAD. A missing
         // UID/body must not advance the sync checkpoint as if it was saved.
         let returned: HashSet<u32> = fetches

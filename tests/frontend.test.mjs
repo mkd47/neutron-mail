@@ -174,3 +174,22 @@ test('committed download pages become visible before the final sync response', a
   assert.equal(reads,1);
   assert.match(c.state().status,/50\/200 messages/);
 });
+
+test('download progress coalesces list refreshes instead of reloading per page', async () => {
+  let reads = 0;
+  const pending = [];
+  const c = componentScript('src/App.svelte', { api: {
+    listFolders: async () => [{id:10,role:'inbox'}],
+    listMessages: () => { reads++; const d = deferred(); pending.push(d); return d.promise; },
+  }, pimApi: {} }, '({onSyncProgress,setAccount(a){account=a}})');
+  c.setAccount(account);
+  const first = c.onSyncProgress({account_id:1,stage:'messages',folder:'Inbox',completed_folders:0,total_folders:1,downloaded:50,total_messages:500});
+  await new Promise((r) => setImmediate(r));
+  for (let n = 100; n <= 500; n += 50)
+    await c.onSyncProgress({account_id:1,stage:'messages',folder:'Inbox',completed_folders:0,total_folders:1,downloaded:n,total_messages:500});
+  assert.equal(reads, 1);
+  pending[0].resolve([]);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(reads, 1);
+  void first;
+});

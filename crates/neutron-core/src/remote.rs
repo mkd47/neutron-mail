@@ -71,11 +71,35 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 return is_public_ip(IpAddr::V4(v4));
             }
             let s = v6.segments();
+            // Addresses that embed an IPv4 address and are routed to it by
+            // translators/relays: NAT64 (64:ff9b::/96, RFC 6052), 6to4
+            // (2002::/16, RFC 3056) and deprecated IPv4-compatible (::/96).
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(std::net::Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                ))
+            };
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+                return is_public_ip(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_public_ip(embedded(s[1], s[2]));
+            }
+            if s[..6] == [0; 6] {
+                // ::/96 (also covers :: and ::1).
+                return false;
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // unique local
                 || (s[0] & 0xffc0) == 0xfe80 // link local
+                || (s[0] & 0xffc0) == 0xfec0 // deprecated site local
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1) // local-use NAT64 (RFC 8215)
+                || (s[0] == 0x0100 && s[1..4] == [0; 3]) // discard-only
                 || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation
         }
     }
@@ -345,10 +369,21 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:c0a8:0101::1",
+            "::127.0.0.1",
+            "fec0::1",
         ] {
             assert!(!is_public_ip(private.parse().unwrap()), "{private}");
         }
-        for public in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
+        for public in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::5db8:d822",
+            "2002:5db8:d822::1",
+        ] {
             assert!(is_public_ip(public.parse().unwrap()), "{public}");
         }
     }

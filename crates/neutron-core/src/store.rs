@@ -265,73 +265,113 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.backfill_addresses()?;
-        store.repair_text_decoding()?;
+        // A new (empty) cache has nothing for repair_text_decoding to fix.
+        store.db().execute(
+            "INSERT OR IGNORE INTO cache_metadata (key,value)
+             SELECT 'text-decoder','1' WHERE NOT EXISTS (SELECT 1 FROM messages)",
+            [],
+        )?;
         Ok(store)
     }
 
-    /// Rebuild summaries/search once with the multibyte decoder enabled.
-    /// Stream one raw message at a time; preserve IDs, flags, links, raw bytes
-    /// and address-use counts. Commit the version marker with the repair.
-    fn repair_text_decoding(&self) -> Result<()> {
-        let mut db = self.db();
-        if db
-            .query_row(
-                "SELECT value FROM cache_metadata WHERE key = 'text-decoder'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .as_deref()
-            == Some("1")
-        {
-            return Ok(());
-        }
-        let tx = db.transaction()?;
-        let mut after = 0i64;
+    /// Rebuild summaries/search once with the multibyte decoder enabled,
+    /// preserving IDs, flags, links, raw bytes and address-use counts.
+    ///
+    /// Runs in small batches with a persisted checkpoint, so a large cache
+    /// neither delays opening the store nor holds the connection for long:
+    /// the app calls this from a background thread after startup, and an
+    /// interrupted repair resumes where it stopped. Returns the number of
+    /// messages re-indexed (0 once the repair is complete).
+    pub fn repair_text_decoding(&self) -> Result<usize> {
+        const BATCH: i64 = 50;
+        let mut repaired = 0;
         loop {
-            let next: Option<(i64, i64, Vec<u8>)> = tx.query_row(
-                "SELECT m.id, f.account_id, m.raw FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id > ?1 ORDER BY m.id LIMIT 1",
-                [after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-            let Some((id, account_id, raw)) = next else {
-                break;
-            };
-            let p = parse::parse(&raw);
-            let body = if p.text.trim().is_empty() {
-                p.html_raw
-                    .as_deref()
-                    .map(parse::strip_tags)
-                    .unwrap_or_default()
-            } else {
-                p.text.clone()
-            };
-            tx.execute("UPDATE messages SET subject=?2, from_name=?3, from_addr=?4, to_addrs=?5, cc_addrs=?6, preview=?7 WHERE id=?1",
-                params![id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.preview])?;
-            tx.execute("DELETE FROM messages_fts WHERE rowid=?1", [id])?;
-            tx.execute(
-                "INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    id,
-                    p.subject,
-                    format!("{} {}", p.from_name, p.from_addr),
-                    body
-                ],
-            )?;
-            for (name, email) in &p.addresses {
-                if !name.is_empty() {
-                    tx.execute(
-                        "UPDATE addresses SET name=?3 WHERE account_id=?1 AND email=?2",
-                        params![account_id, email, name],
-                    )?;
+            // Read under the lock, parse without it, write in one short
+            // transaction. Parsing is the expensive part.
+            let rows: Vec<(i64, i64, Vec<u8>)> = {
+                let db = self.db();
+                let meta = |key: &str| {
+                    db.query_row(
+                        "SELECT value FROM cache_metadata WHERE key = ?1",
+                        [key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                };
+                if meta("text-decoder")?.as_deref() == Some("1") {
+                    return Ok(repaired);
                 }
+                let after: i64 = meta("text-decoder-after")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut stmt = db.prepare(
+                    "SELECT m.id, f.account_id, m.raw FROM messages m JOIN folders f ON f.id = m.folder_id
+                     WHERE m.id > ?1 ORDER BY m.id LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(params![after, BATCH], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            let parsed: Vec<(i64, i64, ParsedMessage)> = rows
+                .into_iter()
+                .map(|(id, account_id, raw)| (id, account_id, parse::parse(&raw)))
+                .collect();
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            for (id, account_id, p) in &parsed {
+                let updated = tx.execute(
+                    "UPDATE messages SET subject=?2, from_name=?3, from_addr=?4, to_addrs=?5, cc_addrs=?6, preview=?7 WHERE id=?1",
+                    params![id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.preview],
+                )?;
+                // Deleted while it was being parsed: don't leave an orphan FTS row.
+                if updated == 0 {
+                    continue;
+                }
+                let body = if p.text.trim().is_empty() {
+                    p.html_raw
+                        .as_deref()
+                        .map(parse::strip_tags)
+                        .unwrap_or_default()
+                } else {
+                    p.text.clone()
+                };
+                tx.execute("DELETE FROM messages_fts WHERE rowid=?1", [id])?;
+                tx.execute(
+                    "INSERT INTO messages_fts (rowid, subject, sender, body) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        p.subject,
+                        format!("{} {}", p.from_name, p.from_addr),
+                        body
+                    ],
+                )?;
+                for (name, email) in &p.addresses {
+                    if !name.is_empty() {
+                        tx.execute(
+                            "UPDATE addresses SET name=?3 WHERE account_id=?1 AND email=?2",
+                            params![account_id, email, name],
+                        )?;
+                    }
+                }
+                repaired += 1;
             }
-            after = id;
+            match parsed.last() {
+                Some((last, _, _)) if parsed.len() as i64 == BATCH => tx.execute(
+                    "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('text-decoder-after', ?1)",
+                    [last.to_string()],
+                )?,
+                // Messages added from now on are parsed with the new decoder.
+                _ => tx.execute_batch(
+                    "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('text-decoder','1');
+                     DELETE FROM cache_metadata WHERE key = 'text-decoder-after';",
+                )
+                .map(|_| 0)?,
+            };
+            tx.commit()?;
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('text-decoder','1')",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// Caches created before the address table existed: index once.
@@ -806,6 +846,15 @@ impl Store {
     }
 
     /// Account owning a cached message.
+    pub fn message_folder_id(&self, id: i64) -> Result<i64> {
+        self.db()
+            .query_row("SELECT folder_id FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))
+    }
+
     pub fn message_account(&self, id: i64) -> Result<i64> {
         Ok(self.message_location(id)?.0)
     }
