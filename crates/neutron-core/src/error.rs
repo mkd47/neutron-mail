@@ -21,6 +21,10 @@ pub enum Error {
     NotFound(String),
     #[error("operation timed out")]
     Timeout,
+    #[error(
+        "Sync is taking very long; the mail downloaded so far is saved. Sync again to continue"
+    )]
+    SyncIncomplete,
 }
 
 impl From<async_imap::error::Error> for Error {

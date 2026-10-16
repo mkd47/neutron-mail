@@ -174,49 +174,59 @@ pub async fn sync_account(
     run_sync(&app, &state, account_id).await
 }
 
+/// Longest a sync holds the account's lock in one go.
+const SYNC_ROUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// A first sync of a very large mailbox can need several rounds.
+const MAX_SYNC_ROUNDS: u32 = 8;
+
+/// Sync an account, waiting for a sync that is already running (the
+/// watcher's or another window action's) instead of failing. Each page of
+/// mail is committed as it arrives, so a sync that outlasts a round simply
+/// continues in the next one; the lock is released in between, so queued
+/// folder and move operations are not held up by a long first sync.
 pub async fn run_sync(app: &AppHandle, state: &AppState, account_id: i64) -> Res<SyncReport> {
-    let account = state.store.account(account_id)?;
-    let password = crate::providers::credential(state, account_id).await?;
-    use std::time::Duration;
     use tauri::Emitter;
     let lock = state.account_sync_lock(account_id);
-    let _guard = tokio::time::timeout(Duration::from_secs(30), lock.lock())
-        .await
-        .map_err(|_| {
-            Error::Invalid(
-                "This account is busy syncing; progress will update automatically".into(),
-            )
-        })?;
-    tokio::time::timeout(
-        Duration::from_secs(15 * 60),
-        sync::sync_account_with_progress(
-            &state.store,
-            account_id,
-            &account.config,
-            &password,
-            |progress| {
-                #[derive(Clone, Serialize)]
-                struct Event {
-                    account_id: i64,
-                    #[serde(flatten)]
-                    progress: sync::SyncProgress,
-                }
-                let _ = app.emit(
-                    "mail://sync-progress",
-                    Event {
-                        account_id,
-                        progress,
-                    },
-                );
-            },
-        ),
-    )
-    .await
-    .map_err(|_| {
-        Error::Invalid(
-            "Sync time limit reached; downloaded mail is saved. Sync again to continue".into(),
+    for round in 1..=MAX_SYNC_ROUNDS {
+        let _guard = lock.lock().await;
+        // Read per round: an OAuth access token can expire during a long sync.
+        let account = state.store.account(account_id)?;
+        let password = crate::providers::credential(state, account_id).await?;
+        let result = tokio::time::timeout(
+            SYNC_ROUND,
+            sync::sync_account_with_progress(
+                &state.store,
+                account_id,
+                &account.config,
+                &password,
+                |progress| {
+                    #[derive(Clone, Serialize)]
+                    struct Event {
+                        account_id: i64,
+                        #[serde(flatten)]
+                        progress: sync::SyncProgress,
+                    }
+                    let _ = app.emit(
+                        "mail://sync-progress",
+                        Event {
+                            account_id,
+                            progress,
+                        },
+                    );
+                },
+            ),
         )
-    })?
+        .await;
+        match result {
+            Ok(report) => return report,
+            Err(_) => tracing::info!(
+                account = account_id,
+                round,
+                "sync round reached its time limit; continuing"
+            ),
+        }
+    }
+    Err(Error::SyncIncomplete)
 }
 
 #[tauri::command]
