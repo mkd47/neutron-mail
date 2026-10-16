@@ -3,14 +3,61 @@
   import { Icon } from "@neutron/ui";
   import Composer from "./Composer.svelte";
   import InviteCard from "./InviteCard.svelte";
+  import AddressCard from "./AddressCard.svelte";
   import { initials, shortDate, size } from "./format";
-  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MessageView, type TaskList } from "./api";
+  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type MailAddress, type MessageView, type TaskList } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {} }: {
+  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {} }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
     onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
-    onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void;
+    onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void; onComposeTo?: (a: MailAddress) => void;
   } = $props();
+
+  // Sender and recipients as clickable chips; each opens an address card.
+  const COLLAPSED_RECIPIENTS = 4;
+  let card = $state<{ address: MailAddress; left: number } | null>(null);
+  let recipientsOpen = $state(false);
+  let headEl: HTMLElement | undefined = $state();
+  const sender = $derived<MailAddress | null>(message?.from_addr ? { name: message.from_name, email: message.from_addr } : null);
+  const recipients = $derived(message ? [
+    ...(message.to_list ?? []).map((a) => ({ kind: "to", a })),
+    ...(message.cc_list ?? []).map((a) => ({ kind: "cc", a })),
+  ] : []);
+  const shownRecipients = $derived(recipientsOpen ? recipients : recipients.slice(0, COLLAPSED_RECIPIENTS));
+  function openCard(e: MouseEvent, address: MailAddress) {
+    if (card?.address.email === address.email) { card = null; return; }
+    const head = headEl?.getBoundingClientRect();
+    const at = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const left = head ? Math.max(0, Math.min(at.left - head.left, head.width - 300)) : 0;
+    card = { address, left };
+  }
+  // Inline composer height, adjustable with the splitter above it.
+  let viewerEl: HTMLElement | undefined = $state();
+  let composerHeight = $state<number | null>(null);
+  let split: { y: number; h: number } | null = null;
+  function startSplit(e: PointerEvent) {
+    const el = (e.currentTarget as HTMLElement).nextElementSibling as HTMLElement | null;
+    split = { y: e.clientY, h: el?.getBoundingClientRect().height ?? 320 };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+  function moveSplit(e: PointerEvent) {
+    if (!split) return;
+    const total = viewerEl?.getBoundingClientRect().height ?? window.innerHeight;
+    composerHeight = Math.round(Math.max(220, Math.min(total - 140, split.h + split.y - e.clientY)));
+  }
+  function endSplit() { split = null; }
+  function splitKey(e: KeyboardEvent) {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    const total = viewerEl?.getBoundingClientRect().height ?? window.innerHeight;
+    const now = composerHeight ?? total * 0.55;
+    composerHeight = Math.round(Math.max(220, Math.min(total - 140, now + (e.key === "ArrowUp" ? 40 : -40))));
+  }
+  function trustChanged(email: string, trusted: boolean) {
+    // Re-render so the sender's images load (or are blocked) right away.
+    if (message && email.toLowerCase() === message.from_addr.toLowerCase()) onReload(trusted);
+  }
 
   type Selection = { messageId: number; accountId: number; generation: number };
   let generation = 0;
@@ -89,7 +136,7 @@
     if (next !== lastSelection) {
       lastSelection = next; generation++;
       source = null; sourceLoading = false; reply = null; confirmOpen = null; todo = null;
-      todoBusy = false; notesBusy = false; trustBusy = false;
+      todoBusy = false; notesBusy = false; trustBusy = false; card = null; recipientsOpen = false;
     }
   });
 
@@ -160,7 +207,7 @@
 </script>
 
 {#if message}
-  <article class="viewer" class:composing={reply !== null}>
+  <article class="viewer" class:composing={reply !== null} bind:this={viewerEl}>
     <div class="message">
       <div class="toolbar" role="toolbar" aria-label="Message actions">
         {#if isDraft}
@@ -194,14 +241,48 @@
           <Icon name="code" size={16} /> {sourceLoading ? "Cancel source" : source !== null ? "Message" : "View source"}</button>
       </div>
       <h1>{message.subject || "(no subject)"}</h1>
-      <div class="head">
-        <div class="avatar">{initials(message.from_name, message.from_addr)}</div>
+      <div class="head" bind:this={headEl}>
+        {#if sender}
+          {@const from = sender}
+          <button class="avatar" onclick={(e) => openCard(e, from)} title={`${from.name ? `${from.name} ` : ""}<${from.email}>`}
+            aria-label={`Contact card for ${from.email}`}>{initials(message.from_name, message.from_addr)}</button>
+        {:else}
+          <div class="avatar">{initials(message.from_name, message.from_addr)}</div>
+        {/if}
         <div class="who">
-          <div class="name">{message.from_name || message.from_addr}</div>
-          <div class="muted addr">{message.from_addr}</div>
-          <div class="muted addr">to {message.to}{message.cc ? `, cc ${message.cc}` : ""}</div>
+          <div class="from-line">
+            {#if sender}
+              {@const from = sender}
+              <button class="chip name" onclick={(e) => openCard(e, from)} aria-expanded={card?.address.email === from.email}>
+                {message.from_name || message.from_addr}</button>
+              {#if message.from_name}<span class="muted addr">&lt;{message.from_addr}&gt;</span>{/if}
+            {:else}
+              <span class="name">(unknown sender)</span>
+            {/if}
+            <span class="muted date">{shortDate(message.date)}</span>
+          </div>
+          {#if recipients.length}
+            <div class="recips">
+              {#each shownRecipients as r, i (`${r.kind}:${i}:${r.a.email}`)}
+                {#if i === 0 || shownRecipients[i - 1].kind !== r.kind}<span class="label muted">{r.kind}</span>{/if}
+                <button class="chip" onclick={(e) => openCard(e, r.a)} title={`${r.a.name ? `${r.a.name} ` : ""}<${r.a.email}>`}
+                  aria-expanded={card?.address.email === r.a.email}>{r.a.name || r.a.email}</button>
+              {/each}
+              {#if recipients.length > COLLAPSED_RECIPIENTS}
+                <button class="more" onclick={() => (recipientsOpen = !recipientsOpen)} aria-expanded={recipientsOpen}>
+                  {recipientsOpen ? "Show less" : `+${recipients.length - COLLAPSED_RECIPIENTS} more`}</button>
+              {/if}
+            </div>
+          {:else if message.to || message.cc}
+            <div class="muted addr">to {message.to}{message.cc ? `, cc ${message.cc}` : ""}</div>
+          {/if}
         </div>
-        <div class="muted">{shortDate(message.date)}</div>
+        {#if card}
+          {#key card.address.email}
+            <AddressCard address={card.address} accountId={account.id} left={card.left}
+              onClose={() => (card = null)} onCompose={onComposeTo} onTrustChanged={trustChanged} {onStatus} />
+          {/key}
+        {/if}
       </div>
       {#if source !== null}
         <!-- Raw RFC 822 source as escaped text (Svelte text node, never HTML). -->
@@ -252,7 +333,13 @@
     {#if reply}
       {#key reply.key}
         {@const composing = reply}
-        <div class="inline-composer">
+        <!-- WAI-ARIA window splitter: a focusable separator, resized with drag or the arrow keys. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+        <div class="splitter" role="separator" aria-orientation="horizontal" aria-label="Resize composer" tabindex="0"
+          aria-valuemin={220} aria-valuenow={composerHeight ?? undefined}
+          title="Drag to resize the composer" onpointerdown={startSplit} onpointermove={moveSplit} onpointerup={endSplit}
+          onpointercancel={endSplit} onkeydown={splitKey} ondblclick={() => (composerHeight = null)}></div>
+        <div class="inline-composer" style:flex={composerHeight === null ? null : `0 0 ${composerHeight}px`}>
           <Composer account={composing.account} draft={composing.draft} title={titles[composing.mode]} inline
             replaceDraft={composing.mode === "draft" ? composing.origin.messageId : null}
             onDone={(r) => done(composing.key, composing.origin, r)} />
@@ -280,7 +367,10 @@
   .viewer { display: flex; flex-direction: column; height: auto; flex: 1; min-height: 0; overflow: hidden; position: relative; }
   .message { display: flex; flex-direction: column; gap: 10px; padding: 12px 28px 16px; flex: 1; min-height: 0; overflow: auto; position: relative; }
   .composing .message { flex: 1 1 45%; }
-  .inline-composer { flex: 1 1 55%; min-height: 300px; padding: 0 16px 14px; display: flex; flex-direction: column; }
+  .inline-composer { flex: 1 1 55%; min-height: 220px; padding: 0 16px 14px; display: flex; flex-direction: column; }
+  .splitter { flex: none; height: 10px; margin: 0 16px; cursor: ns-resize; position: relative; touch-action: none; outline: none; }
+  .splitter::after { content: ""; position: absolute; left: 50%; top: 3px; width: 44px; height: 4px; margin-left: -22px; border-radius: 2px; background: var(--border); }
+  .splitter:hover::after, .splitter:focus-visible::after { background: var(--accent); }
   .toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   .pim { position: relative; }
   .popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; width: 300px; display: flex; flex-direction: column; gap: 10px;
@@ -296,11 +386,24 @@
   .tbtn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .spacer { flex: 1; }
   h1 { font-size: 22px; margin: 4px 0 0; font-weight: 600; }
-  .head { display: flex; gap: 12px; align-items: flex-start; }
-  .who { flex: 1; min-width: 0; }
+  .head { display: flex; gap: 12px; align-items: flex-start; position: relative; }
+  .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .from-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; min-width: 0; }
   .name { font-weight: 600; }
   .addr { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .avatar { width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 600; flex: none; }
+  .date { flex: none; margin-left: auto; padding-left: 8px; font-size: 13px; }
+  .avatar { width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 600; flex: none;
+    border: 0; padding: 0; font-size: inherit; }
+  button.avatar { cursor: pointer; }
+  button.avatar:hover { filter: brightness(1.1); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .recips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 13px; }
+  .label { text-transform: lowercase; margin-left: 2px; }
+  .chip { border: 1px solid transparent; background: var(--panel-2); color: var(--text); border-radius: 999px; padding: 1px 8px; font-size: 13px;
+    max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .chip.name { font-weight: 600; font-size: 14px; padding: 1px 6px; margin-left: -6px; background: transparent; }
+  .chip:hover, .chip[aria-expanded="true"] { background: var(--hover); border-color: var(--border); }
+  .more { border: 0; background: transparent; color: var(--unread); font-weight: 600; font-size: 13px; padding: 1px 4px; }
+  .more:hover { text-decoration: underline; }
   .notice { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; background: var(--accent-soft); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
   .link { border: 0; background: transparent; color: var(--unread); padding: 0; font-weight: 600; font-size: 13px; }
   .link:hover { text-decoration: underline; }

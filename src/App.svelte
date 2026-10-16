@@ -13,7 +13,7 @@
   import Calendar from "./lib/Calendar.svelte";
   import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, pimApi } from "./lib/api";
+    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -118,6 +118,11 @@
     if (!account) return;
     try { compose = await api.newDraft(account.id); }
     catch (e) { compose = emptyDraft(); showToast(`Couldn't load your signature: ${errorText(e)}`, true); }
+  }
+  // "New message" from an address card in the reading pane.
+  async function composeTo(a: MailAddress) {
+    await newCompose();
+    if (compose) compose = { ...compose, to: [a.name ? `"${a.name.replaceAll('"', "")}" <${a.email}>` : a.email] };
   }
   async function accountRemoved(id: number) {
     showSettings = false;
@@ -615,7 +620,7 @@
       <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
         onPimChanged={() => pimKey++} onOpenNote={() => {}}
         onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
-        onCalendarChanged={() => agendaKey++} />
+        onCalendarChanged={() => agendaKey++} onComposeTo={composeTo} />
     </section>
     {#if showPanel}
       <TodayPanel refreshKey={pimKey} onClose={() => (showPanel = false)} onOpenTodo={() => (appView = "todo")}

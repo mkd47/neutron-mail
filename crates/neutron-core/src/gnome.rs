@@ -223,6 +223,16 @@ impl Eds {
         Ok(hits)
     }
 
+    /// Whether any address book has a contact with exactly this email.
+    pub async fn has_email(&self, email: &str) -> Result<bool> {
+        let email = email.trim();
+        Ok(self
+            .search(email, 50)
+            .await?
+            .iter()
+            .any(|h| h.email.trim().eq_ignore_ascii_case(email)))
+    }
+
     /// Store a vCard in the local ("Personal") address book. Returns the
     /// new contact UID.
     pub async fn add_contact_vcard(&self, vcard: &str) -> Result<String> {
@@ -246,6 +256,61 @@ impl Eds {
             .next()
             .ok_or_else(|| dbus_err("no UID returned"))
     }
+}
+
+/// vCard 3.0 for a new contact with one email address. Names and
+/// addresses come from received mail, so both are validated and escaped
+/// (RFC 2426 TEXT: backslash, comma, semicolon, newline); control
+/// characters are dropped so no extra properties can be injected.
+pub fn contact_vcard(name: &str, email: &str) -> Result<String> {
+    let email = email.trim();
+    if email.is_empty()
+        || email.len() > 320
+        || !email.contains('@')
+        || email.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(Error::Invalid(format!(
+            "\"{email}\" is not an email address"
+        )));
+    }
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let esc = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                ',' => out.push_str("\\,"),
+                ';' => out.push_str("\\;"),
+                _ => out.push(c),
+            }
+        }
+        out
+    };
+    let name = clean(name);
+    let shown = if name.is_empty() {
+        email.to_string()
+    } else {
+        name.clone()
+    };
+    // Structured name: "Given Family" -> N:Family;Given.
+    let (given, family) = match name.rsplit_once(' ') {
+        Some((g, f)) => (g.trim(), f.trim()),
+        None => (name.as_str(), ""),
+    };
+    Ok(format!(
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{}\r\nN:{};{};;;\r\nEMAIL;TYPE=INTERNET:{}\r\nEND:VCARD\r\n",
+        esc(&shown),
+        esc(family),
+        esc(given),
+        esc(email)
+    ))
 }
 
 /// Escape a string for an EBookQuery S-expression literal.
@@ -628,6 +693,25 @@ pub async fn launcher_badge(desktop_file: &str, count: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_contact_vcards_are_escaped_and_round_trip() {
+        let v = contact_vcard("Ayşe Yılmaz", "ayse@example.test").unwrap();
+        assert!(v.contains("FN:Ayşe Yılmaz\r\n") && v.contains("N:Yılmaz;Ayşe;;;\r\n"));
+        let c = parse_vcard(&v);
+        assert_eq!(c.emails, vec!["ayse@example.test".to_string()]);
+        // A hostile display name cannot add properties or break fields.
+        let v = contact_vcard("Evil\r\nEMAIL:x@attacker.test;a,b\\", "v@example.test").unwrap();
+        assert_eq!(v.lines().filter(|l| l.starts_with("EMAIL")).count(), 1);
+        assert_eq!(parse_vcard(&v).emails, vec!["v@example.test".to_string()]);
+        assert!(v.contains("FN:EvilEMAIL:x@attacker.test\\;a\\,b\\\\\r\n"));
+        assert!(contact_vcard("", "not-an-address").is_err());
+        assert!(contact_vcard("", "a b@example.test").is_err());
+        assert!(contact_vcard("", "a@example.test\r\nTEL:1").is_err());
+        assert!(contact_vcard("", "solo@example.test")
+            .unwrap()
+            .contains("FN:solo@example.test\r\n"));
+    }
 
     #[test]
     fn vcard_parsing() {

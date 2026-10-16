@@ -45,8 +45,10 @@ export interface MessageSummary {
   date: number; preview: string; seen: boolean; flagged: boolean; has_attachments: boolean;
 }
 export interface Attachment { index: number; name: string; mime: string; size: number; risky: boolean }
+export interface MailAddress { name: string; email: string }
+export interface AddressInfo { contacts_available: boolean; in_contacts: boolean; trusted: boolean }
 export interface MessageDetail extends MessageSummary {
-  to: string; cc: string; text: string; html: string | null; remote_images_blocked: number;
+  to: string; cc: string; to_list: MailAddress[]; cc_list: MailAddress[]; text: string; html: string | null; remote_images_blocked: number;
   remote_images_loaded: number; attachments: Attachment[];
 }
 export interface MessageView extends MessageDetail {
@@ -133,6 +135,8 @@ export const api = {
   sanitizeComposeHtml: (html: string) => invoke<string>("sanitize_compose_html", { html }),
   setUnreadBadge: (count: number) => invoke<void>("set_unread_badge", { count }),
   contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
+  addressInfo: (accountId: number, email: string) => invoke<AddressInfo>("address_info", { accountId, email }),
+  addContact: (name: string, email: string) => invoke<void>("add_contact", { name, email }),
   createFolder: (accountId: number, parentId: number | null, name: string) =>
     invoke<Folder>("create_folder", { accountId, parentId, name }),
   renameFolder: (folderId: number, name: string | null, newParentId: number | null, toRoot = false) =>

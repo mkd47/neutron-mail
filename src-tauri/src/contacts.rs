@@ -136,3 +136,63 @@ pub async fn contacts_status(state: State<'_, AppState>) -> Res<ContactsStatus> 
         error: inner.last_error.clone(),
     })
 }
+
+/// What the address card in the reading pane shows for one address.
+#[derive(Serialize)]
+pub struct AddressInfo {
+    /// GNOME address books are reachable (adding a contact is possible).
+    contacts_available: bool,
+    /// Some address book already has this email.
+    in_contacts: bool,
+    /// Remote images from this sender load automatically.
+    trusted: bool,
+}
+
+#[tauri::command]
+pub async fn address_info(
+    state: State<'_, AppState>,
+    account_id: i64,
+    email: String,
+) -> Res<AddressInfo> {
+    let trusted = state.store.is_image_sender_trusted(account_id, &email)?;
+    let mut inner = state.contacts.inner.lock().await;
+    inner.ensure_eds().await;
+    let (contacts_available, in_contacts) = match inner.eds.as_ref() {
+        Some(eds) => match eds.has_email(&email).await {
+            Ok(found) => (true, found),
+            Err(e) => {
+                tracing::info!("contact lookup failed: {e}");
+                inner.eds = None;
+                (false, false)
+            }
+        },
+        None => (false, false),
+    };
+    Ok(AddressInfo {
+        contacts_available,
+        in_contacts,
+        trusted,
+    })
+}
+
+/// Add an address from a message to the personal GNOME address book.
+/// Does nothing if a contact with this email already exists.
+#[tauri::command]
+pub async fn add_contact(state: State<'_, AppState>, name: String, email: String) -> Res<()> {
+    let vcard = neutron_core::gnome::contact_vcard(&name, &email)?;
+    let mut inner = state.contacts.inner.lock().await;
+    inner.ensure_eds().await;
+    let eds = inner.eds.as_ref().ok_or_else(|| {
+        neutron_core::Error::Invalid(
+            "GNOME Contacts (evolution-data-server) is not available".into(),
+        )
+    })?;
+    if eds.has_email(&email).await? {
+        return Ok(());
+    }
+    eds.add_contact_vcard(&vcard).await?;
+    // Autocomplete should rank the new contact as an address-book entry.
+    inner.cache.clear();
+    tracing::info!("contact added to the personal address book");
+    Ok(())
+}

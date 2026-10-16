@@ -40,6 +40,8 @@
     "allow-suggest-contacts",
     "allow-sanitize-compose-html",
     "allow-contacts-status",
+    "allow-address-info",
+    "allow-add-contact",
     "allow-upcoming-events",
     "allow-set-unread-badge",
     "allow-get-invite",

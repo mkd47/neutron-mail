@@ -35,6 +35,8 @@ fn main() {
             "open_attachment",
             "suggest_contacts",
             "contacts_status",
+            "address_info",
+            "add_contact",
             "sanitize_compose_html",
             "upcoming_events",
             "set_unread_badge",

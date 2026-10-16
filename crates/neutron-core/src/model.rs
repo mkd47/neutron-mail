@@ -151,12 +151,22 @@ pub struct AttachmentInfo {
     pub risky: bool,
 }
 
+/// One mailbox from an address header (name may be empty).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailAddress {
+    pub name: String,
+    pub email: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MessageDetail {
     #[serde(flatten)]
     pub summary: MessageSummary,
     pub to: String,
     pub cc: String,
+    /// The same recipients as `to`/`cc`, one entry per address.
+    pub to_list: Vec<MailAddress>,
+    pub cc_list: Vec<MailAddress>,
     pub text: String,
     /// Sanitized HTML, safe to place in a sandboxed iframe. `None` for
     /// text-only messages.

@@ -19,9 +19,10 @@ function viewer(api = {}, pimApi = {}) {
     }),
   }, `({
     startCompose, toggleSource, openAtt, confirmAttachment, openTodo, addTodo, saveToNotes, trustSender, done,
+    openCard, trustChanged, setRecipientsOpen(value) { recipientsOpen = value; },
     setMessage(value) { message = value; }, setAccount(value) { account = value; },
     setTodo(value) { todo = value; },
-    state: () => ({ reply, source, sourceLoading, confirmOpen, todo, todoBusy, notesBusy, trustBusy })
+    state: () => ({ reply, source, sourceLoading, confirmOpen, todo, todoBusy, notesBusy, trustBusy, card, recipientsOpen })
   })`);
   component.flushEffects();
   return { ...component, events };
@@ -185,4 +186,28 @@ test('unmounted viewers ignore outstanding compose and source completions', asyn
   await Promise.all([composing, loading]);
   assert.equal(c.state().reply, null);
   assert.equal(c.events.statuses.length, 0);
+});
+
+const chipClick = () => ({ currentTarget: { getBoundingClientRect: () => ({ left: 0 }) } });
+
+test('clicking an address toggles its card, and switching messages closes it', () => {
+  const c = viewer();
+  const who = { name: 'Ayşe', email: 'ayse@example.test' };
+  c.openCard(chipClick(), who);
+  assert.equal(c.state().card.address.email, who.email);
+  c.openCard(chipClick(), who);
+  assert.equal(c.state().card, null);
+  c.openCard(chipClick(), who); c.setRecipientsOpen(true);
+  select(c, 2);
+  assert.equal(c.state().card, null);
+  assert.equal(c.state().recipientsOpen, false);
+});
+
+test('trusting the sender from its card re-renders the message; other addresses do not', () => {
+  const c = viewer();
+  c.trustChanged('someone-else@example.test', true);
+  assert.deepEqual(c.events.reloads, []);
+  c.trustChanged('SENDER1@example.test', true);
+  c.trustChanged('sender1@example.test', false);
+  assert.deepEqual(c.events.reloads, [[true], [false]]);
 });

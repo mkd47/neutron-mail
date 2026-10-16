@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-address-info"
+description = "Enables the address_info command without any pre-configured scope."
+commands.allow = ["address_info"]
+
+[[permission]]
+identifier = "deny-address-info"
+description = "Denies the address_info command without any pre-configured scope."
+commands.deny = ["address_info"]

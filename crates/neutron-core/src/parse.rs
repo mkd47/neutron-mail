@@ -4,7 +4,7 @@ use mail_parser::{Encoding, MessageParser, MimeHeaders, PartType};
 use std::borrow::Cow;
 
 use crate::attachments::{is_risky, safe_filename};
-use crate::model::{AttachmentInfo, OutgoingAttachment};
+use crate::model::{AttachmentInfo, MailAddress, OutgoingAttachment};
 use crate::sanitize::{sanitize_html, sanitize_html_with, Sanitized};
 
 /// Max size of an inline (cid:) image converted to a data URL.
@@ -19,6 +19,8 @@ pub struct ParsedMessage {
     pub from_addr: String,
     pub to: String,
     pub cc: String,
+    pub to_list: Vec<MailAddress>,
+    pub cc_list: Vec<MailAddress>,
     pub date: i64,
     pub text: String,
     /// Raw (unsanitized) HTML body if the message has one.
@@ -41,6 +43,21 @@ fn addr_list(a: Option<&mail_parser::Address<'_>>) -> String {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(", ")
+    })
+    .unwrap_or_default()
+}
+
+fn addr_vec(a: Option<&mail_parser::Address<'_>>) -> Vec<MailAddress> {
+    a.map(|a| {
+        a.iter()
+            .filter_map(|x| {
+                let email = x.address()?.trim();
+                (!email.is_empty()).then(|| MailAddress {
+                    name: x.name().unwrap_or_default().trim().to_string(),
+                    email: email.to_string(),
+                })
+            })
+            .collect()
     })
     .unwrap_or_default()
 }
@@ -179,6 +196,8 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
             .to_string(),
         to: addr_list(msg.to()),
         cc: addr_list(msg.cc()),
+        to_list: addr_vec(msg.to()),
+        cc_list: addr_vec(msg.cc()),
         date: msg.date().map(|d| d.to_timestamp()).unwrap_or(0),
         text,
         html_raw,
@@ -337,6 +356,21 @@ pub fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recipients_are_listed_one_per_address() {
+        let raw = b"From: A <a@example.test>\r\nTo: \"Doe, Jane\" <jane@example.test>, bob@example.test\r\nCc: Team: x@example.test, y@example.test;\r\nSubject: s\r\n\r\nbody";
+        let p = super::parse(raw);
+        let emails =
+            |v: &[crate::model::MailAddress]| v.iter().map(|a| a.email.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            emails(&p.to_list),
+            ["jane@example.test", "bob@example.test"]
+        );
+        assert_eq!(p.to_list[0].name, "Doe, Jane");
+        assert_eq!(p.to_list[1].name, "");
+        assert_eq!(emails(&p.cc_list), ["x@example.test", "y@example.test"]);
+    }
+
     #[test]
     fn base64_matches_reference() {
         assert_eq!(super::base64(b""), "");

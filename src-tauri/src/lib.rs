@@ -194,6 +194,8 @@ pub fn run() {
             attachments::open_attachment,
             contacts::suggest_contacts,
             contacts::contacts_status,
+            contacts::address_info,
+            contacts::add_contact,
             commands::sanitize_compose_html,
             calendar::upcoming_events,
             commands::set_unread_badge,

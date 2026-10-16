@@ -991,6 +991,8 @@ fn detail_from_parsed(
         summary,
         to: p.to,
         cc: p.cc,
+        to_list: p.to_list,
+        cc_list: p.cc_list,
         text: p.text,
         remote_images_blocked: sanitized.as_ref().map_or(0, |s| s.remote_images_blocked),
         remote_images_loaded: sanitized.as_ref().map_or(0, |s| s.remote_images_loaded),
