@@ -172,3 +172,25 @@ fn style_tag_cannot_break_out() {
         sanitize_html("<style>a{}</style><script>alert(1)</script><style>b{}</sty</style>").html;
     assert!(!h.contains("<script"), "{h}");
 }
+
+#[test]
+fn coloured_mail_stays_on_a_light_page_in_dark_mode() {
+    use neutron_core::sanitize::sets_own_colors;
+    for coloured in [
+        r##"<p style="color: #222">Dear Musa</p>"##,
+        r##"<td style="BACKGROUND-COLOR:#fff">x</td>"##,
+        r##"<table bgcolor="#f3f2ef"><tr><td>x</td></tr></table>"##,
+        r##"<font color="#1f3864">Signature</font>"##,
+        r##"<style>p{color :black}</style><p>x</p>"##,
+    ] {
+        assert!(sets_own_colors(coloured), "{coloured}");
+        assert!(
+            wrap_document(coloured, true).contains("html{background:#ffffff"),
+            "{coloured}"
+        );
+    }
+    let plain = "<p>Hello <b>there</b></p>";
+    assert!(!sets_own_colors(plain));
+    assert!(wrap_document(plain, true).contains("html{background:#1c1b22"));
+    assert!(wrap_document(plain, false).contains("html{background:#ffffff"));
+}

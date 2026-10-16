@@ -30,6 +30,13 @@
   // with the thread's size, unread count, star and member ids.
   type ListRow = MessageSummary & Partial<Omit<ThreadSummary, keyof MessageSummary>>;
   let messages = $state<ListRow[]>([]);
+  // Mail on a light page even in dark mode (mail with its own colours always is).
+  let lightMail = $state(((): boolean => { try { return localStorage.getItem("lightMail") === "1"; } catch { return false; } })());
+  const darkMail = () => theme === "dark" && !lightMail;
+  function setLightMail(on: boolean) {
+    lightMail = on;
+    try { localStorage.setItem("lightMail", on ? "1" : "0"); } catch { /* ignore */ }
+  }
   let threaded = $state(((): boolean => { try { return localStorage.getItem("threaded") !== "0"; } catch { return true; } })());
   let listEnd = false;
   let selectedId = $state<number | null>(null);
@@ -83,7 +90,7 @@
     const navigation = ++navigationRequest;
     detailRequest++;
     try {
-      const d = await api.getMessage(id, theme === "dark", false);
+      const d = await api.getMessage(id, darkMail(), false);
       if (navigation !== navigationRequest) return;
       const candidates = account ? [account, ...accounts.filter((x) => x.id !== account?.id)] : accounts;
       for (const a of candidates) {
@@ -469,7 +476,7 @@
     const request = ++detailRequest, version = accountVersion;
     selectedId = m.id; loadRemote = false; detail = null;
     try {
-      const result = await api.getMessage(m.id, theme === "dark", false);
+      const result = await api.getMessage(m.id, darkMail(), false);
       if (version !== accountVersion || request !== detailRequest || selectedId !== m.id) return;
       detail = result;
       const row = m as ListRow;
@@ -539,7 +546,7 @@
     const id = selectedId, request = ++detailRequest, version = accountVersion;
     loadRemote = remote;
     try {
-      const result = await api.getMessage(id, theme === "dark", remote);
+      const result = await api.getMessage(id, darkMail(), remote);
       if (version !== accountVersion || request !== detailRequest || selectedId !== id) return;
       detail = result;
       if (!quiet && remote && result.remote_images_failed > 0)
@@ -548,7 +555,7 @@
   }
   // Only theme changes trigger this effect; selection and image actions fetch separately.
   $effect(() => {
-    void theme;
+    void theme; void lightMail;
     untrack(() => { if (selectedId !== null) void reload(loadRemote, true); });
   });
   async function composerDone(r: ComposerResult) {
@@ -726,31 +733,46 @@
       </ul>
     </section>
 
-    <section class="reader">
-      <Agenda refreshKey={agendaKey} />
+    <!-- Rendered inside the reading pane's toolbar / "More" menu; they act on the open message (or its conversation). -->
+    {#snippet messageActions()}
       {#if detail}
         {@const d = detail}
-        <div class="msgbar" role="toolbar" aria-label="Message">
-          <button class="btn sm" onclick={() => moveToRole("archive", expand([d.id]))} disabled={!roleFolder("archive") || inFolder("archive")}
-            title={roleFolder("archive") ? "Archive (A)" : "This account has no Archive folder"}><Icon name="archive" size={14} /> Archive</button>
-          <button class="btn sm" onclick={() => deleteSelected(expand([d.id]))} title={inFolder("trash") ? "Delete permanently (Del)" : "Move to Trash (Del) · Shift+Del deletes permanently"}>
-            <Icon name="trash" size={14} /> Delete</button>
-          {#if inFolder("junk")}
-            <button class="btn sm" onclick={() => moveToRole("inbox", expand([d.id]))} title="Not junk: move to Inbox (!)"><Icon name="inbox" size={14} /> Not junk</button>
-          {:else}
-            <button class="btn sm" onclick={() => moveToRole("junk", expand([d.id]))} disabled={!roleFolder("junk")} title={roleFolder("junk") ? "Mark as junk (!)" : "This account has no Junk folder"}><Icon name="junk" size={14} /> Junk</button>
-          {/if}
-          <button class="btn sm" onclick={() => setFlag("seen", !d.seen, expand([d.id]))} title="Mark read / unread (U)"><Icon name="mail" size={14} /> {d.seen ? "Mark unread" : "Mark read"}</button>
-          <button class="btn sm" class:on={d.flagged} onclick={() => setFlag("flagged", !d.flagged, expand([d.id]))} aria-pressed={d.flagged} title="Star / unstar (S)"><Icon name="star" size={14} /> {d.flagged ? "Starred" : "Star"}</button>
-          <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: false }; }} title="Move to… (V)"><Icon name="folder" size={14} /> Move to…</button>
-          <button class="btn sm" onclick={() => { pickerQuery = ""; picker = { copy: true }; }} title="Copy to… (Shift+V)">Copy to…</button>
-        </div>
+        <button class="ibtn" onclick={() => moveToRole("archive", expand([d.id]))} disabled={!roleFolder("archive") || inFolder("archive")}
+          title={roleFolder("archive") ? "Archive (A)" : "This account has no Archive folder"} aria-label="Archive"><Icon name="archive" size={16} /></button>
+        <button class="ibtn" onclick={() => deleteSelected(expand([d.id]))} aria-label="Delete"
+          title={inFolder("trash") ? "Delete permanently (Del)" : "Delete (Del) · Shift+Del deletes permanently"}><Icon name="trash" size={16} /></button>
+        {#if inFolder("junk")}
+          <button class="ibtn" onclick={() => moveToRole("inbox", expand([d.id]))} title="Not junk: move to Inbox (!)" aria-label="Not junk"><Icon name="inbox" size={16} /></button>
+        {:else}
+          <button class="ibtn" onclick={() => moveToRole("junk", expand([d.id]))} disabled={!roleFolder("junk")}
+            title={roleFolder("junk") ? "Mark as junk (!)" : "This account has no Junk folder"} aria-label="Mark as junk"><Icon name="junk" size={16} /></button>
+        {/if}
+        <button class="ibtn" onclick={() => setFlag("seen", !d.seen, expand([d.id]))} title={d.seen ? "Mark unread (U)" : "Mark read (U)"}
+          aria-label={d.seen ? "Mark unread" : "Mark read"}><Icon name="mail" size={16} /></button>
+        <button class="ibtn" class:on={d.flagged} onclick={() => setFlag("flagged", !d.flagged, expand([d.id]))} aria-pressed={d.flagged}
+          title={d.flagged ? "Remove star (S)" : "Star (S)"} aria-label={d.flagged ? "Remove star" : "Star"}><Icon name="star" size={16} /></button>
+        <button class="ibtn" onclick={() => { pickerQuery = ""; picker = { copy: false }; }} title="Move to… (V)" aria-label="Move to folder"><Icon name="folder" size={16} /></button>
       {/if}
+    {/snippet}
+    {#snippet moreActions()}
+      {#if theme === "dark"}
+        <button role="menuitemcheckbox" aria-checked={lightMail} onclick={() => setLightMail(!lightMail)}>
+          <Icon name="sun" size={15} /> Always use a light background for mail {lightMail ? "✓" : ""}</button>
+      {/if}
+      <button role="menuitem" onclick={() => { pickerQuery = ""; picker = { copy: true }; }}><Icon name="folder" size={15} /> Copy to… <kbd>Shift+V</kbd></button>
+      {#if detail && !inFolder("trash")}
+        {@const d = detail}
+        <button role="menuitem" class="danger" onclick={() => deleteSelected(expand([d.id]), true)}><Icon name="trash" size={15} /> Delete permanently…</button>
+      {/if}
+    {/snippet}
+    <section class="reader">
+      <Agenda refreshKey={agendaKey} />
       <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
         onPimChanged={() => pimKey++} onOpenNote={() => {}}
         onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
         onCalendarChanged={() => agendaKey++} onComposeTo={composeTo}
-        onOpenMessage={(id) => open(rowOf(id)?.id === id ? rowOf(id)! : ({ id, seen: true } as MessageSummary))} />
+        onOpenMessage={(id) => open(rowOf(id)?.id === id ? rowOf(id)! : ({ id, seen: true } as MessageSummary))}
+        {messageActions} {moreActions} />
     </section>
     {#if showPanel}
       <TodayPanel refreshKey={pimKey} onClose={() => (showPanel = false)} onOpenTodo={() => (appView = "todo")}
@@ -925,8 +947,14 @@
   .droproot.on, nav.rootdrop .droproot { border-color: var(--accent); background: var(--accent-soft); color: var(--text); display: block; }
   .selbar { display: flex; align-items: center; gap: 8px; margin: 0 14px 6px; padding: 6px 10px; border-radius: 10px; background: var(--accent-soft); font-size: 13px; }
   .selbar span { flex: 1; }
-  .msgbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px 0; flex: none !important; }
-  .msgbar .btn.on { color: #e3a008; border-color: #e3a00866; }
+  .ibtn { display: inline-grid; place-items: center; width: 32px; height: 30px; border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; color: var(--text); }
+  .ibtn:hover:not(:disabled) { background: var(--hover); }
+  .ibtn:disabled { opacity: .4; cursor: default; }
+  .ibtn.on { color: #e3a008; border-color: #e3a00866; }
+  /* Same narrow-pane sizing as the reading pane's own toolbar buttons. */
+  @container (max-width: 560px) { .ibtn { width: 28px; } }
+  [role="menuitem"].danger { color: #e5534b; }
+  kbd { margin-left: auto; font: 11px ui-monospace, monospace; color: var(--muted); }
   .ctx { position: fixed; z-index: 70; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px; box-shadow: 0 10px 30px #0006; min-width: 190px; display: flex; flex-direction: column; }
   .ctx button { border: 0; background: transparent; text-align: left; padding: 7px 12px; border-radius: 6px; }
   .ctx button:hover:not(:disabled) { background: var(--hover); } .ctx button:disabled { opacity: .45; }

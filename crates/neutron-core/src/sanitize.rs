@@ -243,7 +243,20 @@ pub const MESSAGE_CSP: &str = "default-src 'none'; img-src data:; style-src 'uns
 /// Mail CSS comes after our defaults, so newsletters keep their own look;
 /// in dark mode, messages that set their own colors keep them (like most
 /// mail clients) and plain ones follow the theme.
+/// Whether mail HTML chooses its own text or background colours (inline
+/// styles, `<style>`, `bgcolor`, `<font color>`). Such mail is designed for
+/// a light page: on a dark one its dark text becomes unreadable.
+pub fn sets_own_colors(html: &str) -> bool {
+    let h = html.to_ascii_lowercase();
+    let compact: String = h.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    compact.contains("color:") || compact.contains("background:") || compact.contains("color=")
+}
+
+/// `dark` renders on the dark theme's colours, except for mail that sets its
+/// own colours ([`sets_own_colors`]): that keeps a light page, like a sheet
+/// of paper inside the dark window, so it stays readable.
 pub fn wrap_document(sanitized_body: &str, dark: bool) -> String {
+    let dark = dark && !sets_own_colors(sanitized_body);
     let (bg, fg, link) = if dark {
         ("#1c1b22", "#e8e6f0", "#a995ff")
     } else {

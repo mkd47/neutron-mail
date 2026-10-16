@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, type Snippet } from "svelte";
   import { Icon } from "@neutron/ui";
   import Composer from "./Composer.svelte";
   import InviteCard from "./InviteCard.svelte";
@@ -7,16 +7,24 @@
   import { initials, shortDate, size } from "./format";
   import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type ConversationItem, type MailAddress, type MessageView, type TaskList } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {} }: {
+  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {}, messageActions, moreActions }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
     onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
     onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void; onComposeTo?: (a: MailAddress) => void;
     onOpenMessage?: (id: number) => void;
+    /** Message actions from the app (archive, delete…), shown in the toolbar. */
+    messageActions?: Snippet; moreActions?: Snippet;
   } = $props();
 
   // The whole conversation (all folders, incl. your replies in Sent).
   let conversation = $state<ConversationItem[]>([]);
-  let conversationOpen = $state(true);
+  let moreOpen = $state(false);
+  let attachmentsOpen = $state(false);
+  // The open message sits in the conversation in date order: older messages
+  // as cards above it, newer ones below.
+  const position = $derived(conversation.findIndex((c) => c.id === message?.id));
+  const earlier = $derived(position > 0 ? conversation.slice(0, position) : []);
+  const later = $derived(position >= 0 ? conversation.slice(position + 1) : []);
   let conversationRequest = 0;
   $effect(() => {
     const id = message?.id;
@@ -150,7 +158,7 @@
     if (next !== lastSelection) {
       lastSelection = next; generation++;
       source = null; sourceLoading = false; reply = null; confirmOpen = null; todo = null;
-      todoBusy = false; notesBusy = false; trustBusy = false; card = null; recipientsOpen = false;
+      todoBusy = false; notesBusy = false; trustBusy = false; card = null; recipientsOpen = false; moreOpen = false; attachmentsOpen = false;
     }
   });
 
@@ -230,7 +238,19 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} />
+<svelte:window onkeydown={onWindowKey} onclick={() => (moreOpen = false)} />
+
+<!-- Another message of the conversation, collapsed: click to read it. -->
+{#snippet convCard(c: ConversationItem)}
+  <button class="mcard" class:unread={!c.seen} onclick={() => onOpenMessage(c.id)} title="Open this message">
+    <span class="mavatar" aria-hidden="true">{initials(c.from_name, c.from_addr)}</span>
+    <span class="mfrom">{c.from_name || c.from_addr}</span>
+    {#if message && c.folder_id !== message.folder_id}<span class="mfolder">{c.folder_name}</span>{/if}
+    <span class="mprev muted">{c.preview}</span>
+    <span class="mdate muted">{shortDate(c.date)}</span>
+  </button>
+{/snippet}
+
 {#if message}
   <article class="viewer" class:composing={reply !== null} bind:this={viewerEl}>
     <div class="message">
@@ -238,12 +258,25 @@
         {#if isDraft}
           <button class="tbtn primary" onclick={() => startCompose("draft")}><Icon name="drafts" size={16} /> Edit draft</button>
         {:else}
-          <button class="tbtn" onclick={() => startCompose("reply")} aria-pressed={reply?.mode === "reply"}><Icon name="reply" size={16} /> Reply</button>
-          <button class="tbtn" onclick={() => startCompose("reply_all")} aria-pressed={reply?.mode === "reply_all"}><Icon name="replyall" size={16} /> Reply all</button>
-          <button class="tbtn" onclick={() => startCompose("forward")} aria-pressed={reply?.mode === "forward"}><Icon name="forward" size={16} /> Forward</button>
+          <button class="tbtn" onclick={() => startCompose("reply")} title="Reply" aria-label="Reply" aria-pressed={reply?.mode === "reply"}><Icon name="reply" size={16} /><span class="lbl">Reply</span></button>
+          <button class="tbtn" onclick={() => startCompose("reply_all")} title="Reply all" aria-label="Reply all" aria-pressed={reply?.mode === "reply_all"}><Icon name="replyall" size={16} /><span class="lbl">Reply all</span></button>
+          <button class="tbtn" onclick={() => startCompose("forward")} title="Forward" aria-label="Forward" aria-pressed={reply?.mode === "forward"}><Icon name="forward" size={16} /><span class="lbl">Forward</span></button>
         {/if}
-        <span class="pim">
-          <button class="tbtn" onclick={openTodo} aria-pressed={todo !== null} aria-haspopup="dialog" title="Create a task from this email"><Icon name="checkcircle" size={16} /> Add to To-do</button>
+        {#if messageActions}<span class="sep" aria-hidden="true"></span>{@render messageActions()}{/if}
+        <span class="spacer"></span>
+        <span class="more-wrap">
+          <button class="ibtn" onclick={(e) => { e.stopPropagation(); moreOpen = !moreOpen; }} aria-haspopup="menu" aria-expanded={moreOpen}
+            title="More actions" aria-label="More actions"><span class="dots" aria-hidden="true">⋯</span></button>
+          {#if moreOpen}
+            <div class="menu" role="menu" aria-label="More actions">
+              <button role="menuitem" onclick={() => { moreOpen = false; void openTodo(); }}><Icon name="checkcircle" size={15} /> Add to To-do…</button>
+              <button role="menuitem" onclick={() => { moreOpen = false; void saveToNotes(); }} disabled={notesBusy}><Icon name="note" size={15} /> Save to Notes</button>
+              <button role="menuitem" onclick={() => { moreOpen = false; void print(); }}><Icon name="external" size={15} /> Print… <kbd>Ctrl+P</kbd></button>
+              <button role="menuitem" onclick={() => { moreOpen = false; void toggleSource(); }}><Icon name="code" size={15} />
+                {source !== null || sourceLoading ? "Back to message" : "View source"}</button>
+              {#if moreActions}<hr />{@render moreActions()}{/if}
+            </div>
+          {/if}
           {#if todo}
             <div class="popover" role="dialog" aria-label="Add to To-do"><form onsubmit={(e) => { e.preventDefault(); void addTodo(); }}>
               <h3>Add to To-do</h3>
@@ -256,38 +289,16 @@
                 <select bind:value={todo.list}>{#each lists as l (l.id)}<option value={l.id}>{l.name}</option>{/each}<option value={null}>No list</option></select></label>
               <label>Priority
                 <select bind:value={todo.priority}><option value={0}>None</option><option value={1}>High</option><option value={5}>Medium</option><option value={9}>Low</option></select></label>
-              <button class="tbtn primary wide" disabled={todoBusy || !todo.title.trim()}><Icon name="plus" size={15} /> Add task</button>
+              <div class="row">
+                <button type="button" class="tbtn" onclick={() => (todo = null)}>Cancel</button>
+                <button class="tbtn primary" disabled={todoBusy || !todo.title.trim()}><Icon name="plus" size={15} /> Add task</button>
+              </div>
             </form></div>
           {/if}
         </span>
-        <button class="tbtn" onclick={saveToNotes} disabled={notesBusy} title="Save this email as a note, linked to it"><Icon name="note" size={16} /> Save to Notes</button>
-        <span class="spacer"></span>
-        <button class="tbtn" onclick={print} title="Print this message (Ctrl+P)"><Icon name="external" size={16} /> Print</button>
-        <button class="tbtn" onclick={toggleSource} aria-pressed={source !== null || sourceLoading} title="View the raw message source">
-          <Icon name="code" size={16} /> {sourceLoading ? "Cancel source" : source !== null ? "Message" : "View source"}</button>
       </div>
       <h1>{message.subject || "(no subject)"}</h1>
-      {#if conversation.length > 1}
-        <div class="conv">
-          <button class="conv-head" onclick={() => (conversationOpen = !conversationOpen)} aria-expanded={conversationOpen}>
-            <Icon name="chevron" size={13} /> Conversation · {conversation.length} messages</button>
-          {#if conversationOpen}
-            <ol class="conv-list">
-              {#each conversation as c (c.id)}
-                <li>
-                  <button class="conv-item" class:current={c.id === message.id} class:unread={!c.seen}
-                    aria-current={c.id === message.id ? "true" : undefined} onclick={() => { if (c.id !== message?.id) onOpenMessage(c.id); }}>
-                    <span class="cfrom">{c.from_name || c.from_addr}</span>
-                    {#if c.folder_id !== message.folder_id}<span class="cfolder">{c.folder_name}</span>{/if}
-                    <span class="cprev muted">{c.preview}</span>
-                    <span class="cdate muted">{shortDate(c.date)}</span>
-                  </button>
-                </li>
-              {/each}
-            </ol>
-          {/if}
-        </div>
-      {/if}
+      {#each earlier as c (c.id)}{@render convCard(c)}{/each}
       <div class="head" bind:this={headEl}>
         {#if sender}
           {@const from = sender}
@@ -355,6 +366,30 @@
             {/if}
           </div>
         {/if}
+        {#if message.attachments.length}
+          {@const n = message.attachments.length}
+          <div class="attbar">
+            <button class="attsum" onclick={() => (attachmentsOpen = !attachmentsOpen)} aria-expanded={attachmentsOpen}>
+              <Icon name="clip" size={15} />
+              <strong>{n} attachment{n === 1 ? "" : "s"}</strong>
+              <span class="muted">· {size(message.attachments.reduce((t, a) => t + a.size, 0))}</span>
+              {#if !attachmentsOpen}<span class="muted names">{message.attachments.slice(0, 2).map((a) => a.name).join(", ")}{n > 2 ? ` +${n - 2}` : ""}</span>{/if}
+              <span class="toggle">{attachmentsOpen ? "Hide" : "View attachments"}</span>
+            </button>
+            {#if attachmentsOpen}
+              <div class="attachments">
+                {#each message.attachments as a (a.index)}
+                  <div class="att" class:risky={a.risky}>
+                    <span class="aname" title={a.name}>{a.name}</span>
+                    <span class="muted small asize">{size(a.size)}{a.risky ? " · program" : ""}</span>
+                    <button class="mini" onclick={() => save(a.index)} title="Save…" aria-label={`Save ${a.name}`}>Save</button>
+                    <button class="mini" onclick={() => openAtt(a.index)} title="Open with default app" aria-label={`Open ${a.name}`}>Open</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
         {#if message.document}
           <!-- Empty sandbox: no scripts, no same-origin, no forms, no popups, no top navigation.
                Link clicks are intercepted by the app shell (navigation policy) and confirmed. -->
@@ -363,18 +398,7 @@
           <pre class="body text">{message.text}</pre>
         {/if}
       {/if}
-      {#if message.attachments.length}
-        <div class="attachments">
-          {#each message.attachments as a (a.index)}
-            <div class="att" class:risky={a.risky}>
-              <Icon name="clip" />
-              <div class="meta"><div class="aname" title={a.name}>{a.name}</div><div class="muted small">{a.mime} · {size(a.size)}{a.risky ? " · program/script" : ""}</div></div>
-              <button class="mini" onclick={() => save(a.index)} title="Save…" aria-label={`Save ${a.name}`}>Save</button>
-              <button class="mini" onclick={() => openAtt(a.index)} title="Open with default app" aria-label={`Open ${a.name}`}>Open</button>
-            </div>
-          {/each}
-        </div>
-      {/if}
+      {#each later as c (c.id)}{@render convCard(c)}{/each}
       {#if hoverUrl}<div class="hover" role="status" aria-live="off">{hoverUrl}</div>{/if}
     </div>
     {#if reply}
@@ -419,36 +443,56 @@
   .splitter::after { content: ""; position: absolute; left: 50%; top: 3px; width: 44px; height: 4px; margin-left: -22px; border-radius: 2px; background: var(--border); }
   .splitter:hover::after, .splitter:focus-visible::after { background: var(--accent); }
   .toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .pim { position: relative; }
-  .popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; width: 300px; display: flex; flex-direction: column; gap: 10px;
+  .message { container-type: inline-size; }
+  .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
+  .more-wrap { position: relative; }
+  .ibtn { display: inline-grid; place-items: center; width: 32px; height: 30px; border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; color: var(--text); }
+  .ibtn:hover { background: var(--hover); }
+  .ibtn[aria-expanded="true"] { background: var(--selected); border-color: var(--accent); }
+  .dots { font-size: 18px; line-height: 1; letter-spacing: 1px; }
+  .menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 41; min-width: 210px; display: flex; flex-direction: column; padding: 4px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px #0006; }
+  .menu :global(button) { display: flex; gap: 8px; align-items: center; border: 0; background: transparent; text-align: left; padding: 7px 10px; border-radius: 6px; font-size: 13px; color: var(--text); }
+  .menu :global(button:hover:not(:disabled)) { background: var(--hover); }
+  .menu :global(button:disabled) { opacity: .45; }
+  .menu hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; }
+  kbd { margin-left: auto; font: 11px ui-monospace, monospace; color: var(--muted); }
+  .popover .row { display: flex; justify-content: flex-end; gap: 6px; }
+  .mcard { display: flex; gap: 10px; align-items: center; width: 100%; min-width: 0; text-align: left; padding: 8px 12px; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--panel-2); color: var(--text); font-size: 13px; }
+  .mcard:hover { background: var(--hover); }
+  .mavatar { width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-size: 11px; font-weight: 600; flex: none; }
+  .mfrom { flex: 0 1 auto; max-width: 40%; min-width: 3em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcard.unread .mfrom { font-weight: 700; }
+  .mprev { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mfolder { flex: none; font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .mdate { flex: none; font-size: 12px; white-space: nowrap; }
+  .attbar { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
+  .attsum { display: flex; gap: 8px; align-items: center; width: 100%; min-width: 0; border: 0; background: transparent; padding: 8px 12px; color: var(--text); font-size: 13px; text-align: left; }
+  .attsum .names { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attsum .toggle { margin-left: auto; color: var(--unread); font-weight: 600; flex: none; }
+  .attsum[aria-expanded="true"] .toggle { margin-left: auto; }
+  .popover { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; width: 300px; display: flex; flex-direction: column; gap: 10px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; box-shadow: 0 12px 32px #0006; }
   .popover form { display: flex; flex-direction: column; gap: 10px; }
   .popover h3 { margin: 0; font-size: 15px; }
   .popover label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
   .popover input, .popover select { font-size: 13px; color: var(--text); }
-  .wide { justify-content: center; padding: 9px; }
   .tbtn { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; padding: 6px 12px; font-size: 13px; }
   .tbtn:hover { background: var(--hover); }
+  /* Narrow reading pane: Reply / Reply all / Forward as icons (labels stay as tooltips). */
+  @container (max-width: 560px) {
+    .tbtn .lbl { display: none; }
+    .tbtn { padding: 6px 8px; }
+    .toolbar { gap: 4px; }
+    .ibtn { width: 28px; }
+    .sep { margin: 0 2px; }
+  }
   .tbtn[aria-pressed="true"] { background: var(--selected); border-color: var(--accent); }
   .tbtn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .spacer { flex: 1; }
   h1 { font-size: 22px; margin: 4px 0 0; font-weight: 600; }
   .head { display: flex; gap: 12px; align-items: flex-start; position: relative; }
-  .conv { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); font-size: 13px; }
-  .conv-head { display: flex; gap: 6px; align-items: center; width: 100%; border: 0; background: transparent; padding: 6px 10px; color: var(--muted); font-size: 12px; font-weight: 600; }
-  .conv-head[aria-expanded="false"] :global(svg) { transform: rotate(-90deg); }
-  .conv-list { list-style: none; margin: 0; padding: 0 4px 4px; max-height: 190px; overflow: auto; }
-  .conv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; min-width: 0;
-    border: 0; background: transparent; text-align: left; padding: 4px 8px; border-radius: 6px; color: var(--text); }
-  .cfrom { flex: 0 1 10em; min-width: 3em; }
-  .cprev { flex: 1 1 0; min-width: 0; }
-  .cfolder, .cdate { flex: none; }
-  .conv-item:hover { background: var(--hover); }
-  .conv-item.current { background: var(--selected); }
-  .conv-item.unread .cfrom { font-weight: 700; }
-  .cfrom, .cprev { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cfolder { font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
-  .cdate { font-size: 12px; white-space: nowrap; }
   .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
   .from-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; min-width: 0; }
   .name { font-weight: 600; }
@@ -474,10 +518,11 @@
   .text { white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.55; margin: 0; min-height: 0; }
   .source { flex: 1 0 auto; margin: 0; padding: 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
     font: 12px/1.45 ui-monospace, "DejaVu Sans Mono", monospace; white-space: pre-wrap; word-break: break-all; }
-  .attachments { display: flex; flex-wrap: wrap; gap: 10px; }
-  .att { display: flex; gap: 10px; align-items: center; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; color: var(--unread); max-width: 340px; }
+  .attachments { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 4px; padding: 0 8px 8px; max-height: 260px; overflow: auto; }
+  .att { display: flex; gap: 6px; align-items: center; border: 1px solid var(--border); border-radius: 8px; padding: 4px 6px 4px 10px; background: var(--panel); min-width: 0; }
+  .att .aname { flex: 1; min-width: 0; }
+  .asize { flex: none; }
   .att.risky { border-color: #e0525e; color: #e0525e; }
-  .meta { color: var(--text); min-width: 0; flex: 1; }
   .aname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mini { border: 1px solid var(--border); background: var(--panel-2); border-radius: 6px; padding: 3px 8px; font-size: 12px; color: var(--text); }
   .mini:hover { background: var(--hover); }
