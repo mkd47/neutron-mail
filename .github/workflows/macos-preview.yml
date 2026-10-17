@@ -1,0 +1,137 @@
+name: macOS preview
+
+on:
+  pull_request:
+    paths: ['macos/**', '.github/workflows/macos-preview.yml', 'src/**', 'src-tauri/**', 'crates/**', 'Cargo.*', 'package*.json', 'vite.config.ts']
+  push:
+    branches: [main]
+    paths: ['macos/**', '.github/workflows/macos-preview.yml', 'src/**', 'src-tauri/**', 'crates/**', 'Cargo.*', 'package*.json', 'vite.config.ts']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  universal:
+    name: Universal Mac build and tests
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      NEUTRON_MACOS_TEST_KEYCHAIN: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: rustfmt,clippy
+      - name: Prepare isolated Mac source
+        run: |
+          python3 macos/prepare.py "$RUNNER_TEMP/neutron-mail-macos"
+          echo "MAC_SOURCE=$RUNNER_TEMP/neutron-mail-macos" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.MAC_SOURCE }} -> target
+          shared-key: macos-universal-preview-v1
+          cache-on-failure: true
+      - name: Install prebuilt Tauri CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/neutron-cli" '@tauri-apps/cli@^2'
+          echo "TAURI_CLI=$RUNNER_TEMP/neutron-cli/node_modules/.bin/tauri" >> "$GITHUB_ENV"
+      - name: Create disposable test keychain
+        run: |
+          security create-keychain -p '' "$RUNNER_TEMP/neutron-ci.keychain-db"
+          security unlock-keychain -p '' "$RUNNER_TEMP/neutron-ci.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/neutron-ci.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/neutron-ci.keychain-db"
+          security default-keychain -d user -s "$RUNNER_TEMP/neutron-ci.keychain-db"
+      - name: Generate Mac icon
+        run: |
+          mkdir -p "$RUNNER_TEMP/neutron.iconset"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" "$MAC_SOURCE/src-tauri/icons/icon.png" --out "$RUNNER_TEMP/neutron.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" "$MAC_SOURCE/src-tauri/icons/icon.png" --out "$RUNNER_TEMP/neutron.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$RUNNER_TEMP/neutron.iconset" -o "$MAC_SOURCE/src-tauri/icons/icon.icns"
+      - name: Frontend check, regressions and build
+        working-directory: ${{ env.MAC_SOURCE }}
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+      - name: Rust checks and Keychain regressions
+        working-directory: ${{ env.MAC_SOURCE }}
+        run: |
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Build universal app and DMG
+        working-directory: ${{ env.MAC_SOURCE }}
+        run: '"$TAURI_CLI" build --target universal-apple-darwin --bundles app,dmg'
+      - name: Verify and package colleague handoff
+        run: |
+          app="$MAC_SOURCE/target/universal-apple-darwin/release/bundle/macos/Neutron Mail.app"
+          exe="$app/Contents/MacOS/neutron-mail"
+          lipo "$exe" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if otool -L "$exe" | grep '^[[:space:]]' | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)|/Users/runner'; then
+            echo 'Unexpected build-machine runtime dependency'
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/mac-handoff"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/mac-handoff/Neutron-Mail-macOS-universal.app.zip"
+          cp "$MAC_SOURCE"/target/universal-apple-darwin/release/bundle/dmg/*.dmg "$RUNNER_TEMP/mac-handoff/Neutron-Mail-macOS-universal.dmg"
+          hdiutil verify "$RUNNER_TEMP/mac-handoff/Neutron-Mail-macOS-universal.dmg"
+          cp macos/INSTALL.txt "$RUNNER_TEMP/mac-handoff/INSTALL.txt"
+          cp "$MAC_SOURCE/Cargo.lock" "$RUNNER_TEMP/mac-handoff/Cargo.macos.lock"
+          cp "$MAC_SOURCE/MACOS-SOURCE-MANIFEST.json" "$RUNNER_TEMP/mac-handoff/"
+          printf 'Source commit: %s\nCI run: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/mac-handoff/BUILD.txt"
+          cd "$RUNNER_TEMP/mac-handoff"
+          shasum -a 256 ./*.dmg ./*.zip > SHA256SUMS.txt
+          echo 'HANDOFF_READY=1' >> "$GITHUB_ENV"
+      - name: Packaged application launch smoke test
+        run: |
+          app="$MAC_SOURCE/target/universal-apple-darwin/release/bundle/macos/Neutron Mail.app"
+          "$app/Contents/MacOS/neutron-mail" > "$RUNNER_TEMP/mac-handoff/launch.log" 2>&1 &
+          app_pid=$!
+          sleep 10
+          if ! kill -0 "$app_pid"; then
+            cat "$RUNNER_TEMP/mac-handoff/launch.log"
+            exit 1
+          fi
+          kill "$app_pid"
+          if grep -E 'panicked|in-memory only|memory fallback|mail cache kept in memory' "$RUNNER_TEMP/mac-handoff/launch.log"; then
+            exit 1
+          fi
+          grep 'mail cache: encrypted' "$RUNNER_TEMP/mac-handoff/launch.log"
+      - name: Confirm original checkout untouched
+        run: git diff --exit-code
+      - name: Preserve compiled DMG if a later packaging check fails
+        if: ${{ !cancelled() && env.HANDOFF_READY != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutron-mail-macOS-diagnostic-dmg
+          path: ${{ env.MAC_SOURCE }}/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && env.HANDOFF_READY == '1' }}
+        with:
+          name: neutron-mail-macOS-universal-preview
+          path: ${{ runner.temp }}/mac-handoff/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove temporary keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/neutron-ci.keychain-db" || true
