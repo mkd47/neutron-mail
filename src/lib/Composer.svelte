@@ -152,9 +152,10 @@
     busy = "send"; error = "";
     try {
       if (saving) await saving;
-      const id = await api.queueSend(account.id, message(), resumedId, draftMid, undoSendSeconds());
+      const delay = undoSendSeconds();
+      const id = await api.queueSend(account.id, message(), resumedId, draftMid, delay);
       closed = true;
-      onDone({ kind: "queued", id, account, draft: snapshot(), replaceDraft: resumedId });
+      onDone({ kind: "queued", id, account, draft: snapshot(), replaceDraft: resumedId, delay });
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
   async function saveDraft() {
@@ -168,7 +169,7 @@
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
   async function discard() {
-    if (busy === "send") return;
+    if (busy) return;
     closed = true;
     if (saving) await saving.catch(() => {});
     // Remove the autosaved copy too; a failure is reported but doesn't block.
@@ -236,7 +237,7 @@
     <span class="saved muted" role="status" aria-live="polite" title={saveNote}>
       {#if autosave === "saving"}Saving…{:else if saveNote}{saveNote.startsWith("Autosave paused") ? "Autosave paused" : "Not saved"}{:else if savedAt}Saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{/if}
     </span>
-    <button type="button" class="btn ghost" onclick={discard} disabled={busy === "send"}>Discard</button>
+    <button type="button" class="btn ghost" onclick={discard} disabled={busy !== ""}>Discard</button>
   </footer>
 </section>
 

@@ -47,8 +47,8 @@
   });
 
   const serverOk = $derived(support?.available ?? false);
-  const now = Math.floor(Date.now() / 1000);
   const status = $derived.by(() => {
+    const now = Math.floor(Date.now() / 1000);
     if (!saved?.enabled) return "Off";
     const where = saved.on_server ? "by the mail server" : "from this computer while Neutron Mail is running";
     if (saved.end != null && saved.end < now) return "On, but the end date has passed";
@@ -60,7 +60,7 @@
     msg = null;
     const start = fromDay(startDay, false), end = fromDay(endDay, true);
     if (enabled && !body.trim()) { msg = { text: "Write the reply text first.", error: true }; return; }
-    if (start != null && end != null && end < start) { msg = { text: "The end date is before the start date.", error: true }; return; }
+    if (enabled && start != null && end != null && end < start) { msg = { text: "The end date is before the start date.", error: true }; return; }
     if (enabled && onServer && support && !support.available) {
       msg = { text: "The mail server can't send automatic replies right now. Choose \"From this computer\".", error: true };
       return;

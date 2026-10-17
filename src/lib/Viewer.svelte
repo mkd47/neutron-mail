@@ -31,8 +31,11 @@
   const earlier = $derived(position > 0 ? conversation.slice(0, position) : []);
   const later = $derived(position >= 0 ? conversation.slice(position + 1) : []);
   let conversationRequest = 0;
+  // Keyed on the id alone: reloading the same message (theme, remote
+  // images) doesn't fetch the conversation again.
+  const messageId = $derived(message?.id);
   $effect(() => {
-    const id = message?.id;
+    const id = messageId;
     const request = ++conversationRequest;
     if (id === undefined) { conversation = []; return; }
     api.conversation(id)
@@ -248,8 +251,11 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p" && message && !reply) { e.preventDefault(); void print(); }
   }
   function done(key: number, origin: Selection, r: ComposerResult) {
-    if (!isCurrent(origin) || reply?.key !== key) return;
-    reply = null; onComposerDone(r);
+    // A queued send or saved draft is always reported, even if another
+    // message was opened meanwhile (the Undo bar and failure recovery need it).
+    if (isCurrent(origin) && reply?.key === key) reply = null;
+    else if (r.kind !== "queued" && r.kind !== "draft") return;
+    onComposerDone(r);
   }
 </script>
 

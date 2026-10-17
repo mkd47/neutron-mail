@@ -374,7 +374,7 @@ function outbox(api) {
   c.setAccount(account);
   return c;
 }
-const queued = (id) => ({ kind: 'queued', id, account, draft: { ...draft, picked: [{ token: 't', name: 'a.pdf', size: 1, mime: 'application/pdf' }] }, replaceDraft: 4 });
+const queued = (id) => ({ kind: 'queued', id, account, draft: { ...draft, picked: [{ token: 't', name: 'a.pdf', size: 1, mime: 'application/pdf' }] }, replaceDraft: 4, delay: 10 });
 
 test('Undo within the delay reopens the exact message; too late says so', async () => {
   const c = outbox({ cancelSend: async (id) => id === 1 });
@@ -388,7 +388,30 @@ test('Undo within the delay reopens the exact message; too late says so', async 
   assert.equal(c.state().composeTitle, 'Edit message');
   await c.undoSend(c.state().pendingSends[0]);
   assert.match(c.state().toast.text, /Too late to undo/);
+  // Still tracked: if this late send fails, the message must reopen.
+  assert.equal(c.state().pendingSends.length, 1);
+  assert.equal(c.state().pendingSends[0].undoing, true);
+});
+
+test('a late Undo followed by a failure still reopens the message; Undo twice is harmless', async () => {
+  let calls = 0;
+  const c = outbox({ cancelSend: async () => { calls++; return false; } });
+  await c.composerDone(queued(3));
+  const p = c.state().pendingSends[0];
+  await Promise.all([c.undoSend(p), c.undoSend(p)]);
+  assert.equal(calls, 1);
+  c.onSendResult({ id: 3, account_id: 1, status: 'failed', result: null, error: 'SMTP error: 451' });
   assert.equal(c.state().pendingSends.length, 0);
+  assert.equal(c.state().compose.subject, 'Hello');
+  assert.equal(c.state().composeTitle, 'Send failed: edit message');
+});
+
+test('a send result that arrives before its bar exists is not lost', async () => {
+  const c = outbox({});
+  c.onSendResult({ id: 8, account_id: 1, status: 'failed', result: null, error: 'connection refused' });
+  await c.composerDone({ ...queued(8), delay: 0 });
+  assert.equal(c.state().pendingSends.length, 0);
+  assert.equal(c.state().compose.subject, 'Hello');
 });
 
 test('a failed send reopens the message; a sent one just confirms', async () => {

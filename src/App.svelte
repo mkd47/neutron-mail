@@ -14,7 +14,6 @@
   import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
     type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, type SendResultEvent, pimApi } from "./lib/api";
-  import { undoSendSeconds } from "./lib/prefs";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -156,8 +155,13 @@
   let composeTitle = $state("New message");
 
   // ---- undo send ----
-  type PendingSend = { id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null; label: string; deadline: number; total: number };
+  // `undoing`: Undo was pressed and the answer is pending, or it came too
+  // late; the entry then stays until the send result arrives.
+  type PendingSend = { id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null; label: string;
+    deadline: number; total: number; undoing: boolean };
   let pendingSends = $state<PendingSend[]>([]);
+  // Results that arrived before their entry existed (no delay, fast failure).
+  const earlyResults = new Map<number, SendResultEvent>();
   let clock = $state(Date.now());
   $effect(() => {
     if (!pendingSends.length) return;
@@ -190,28 +194,39 @@
     };
   }
   async function undoSend(p: PendingSend) {
+    const current = pendingSends.find((x) => x.id === p.id);
+    if (!current || current.undoing) return;
+    pendingSends = pendingSends.map((x) => (x.id === p.id ? { ...x, undoing: true } : x));
     const stillWaiting = await api.cancelSend(p.id).catch(() => false);
-    pendingSends = pendingSends.filter((x) => x.id !== p.id);
-    if (stillWaiting) reopenMessage(p, "Edit message");
-    else showToast("Too late to undo: the message is already on its way.", true);
+    if (stillWaiting) {
+      pendingSends = pendingSends.filter((x) => x.id !== p.id);
+      reopenMessage(p, "Edit message");
+    } else if (pendingSends.some((x) => x.id === p.id)) {
+      // Already sending: keep the entry so a failure still reopens it.
+      showToast("Too late to undo: the message is already on its way.", true);
+    }
   }
   function sendNow(p: PendingSend) {
-    void api.sendNow(p.id);
+    api.sendNow(p.id).catch((e) => showToast(`Couldn't send now: ${errorText(e)}`, true));
     pendingSends = pendingSends.map((x) => (x.id === p.id ? { ...x, deadline: Date.now() } : x));
   }
   function onSendResult(e: SendResultEvent) {
     const p = pendingSends.find((x) => x.id === e.id);
+    if (!p) {
+      if (e.status !== "cancelled") earlyResults.set(e.id, e);
+      return;
+    }
     pendingSends = pendingSends.filter((x) => x.id !== e.id);
     if (e.status === "sent" && e.result) {
       const r = e.result;
       const warn = r.sent_copy === "failed" ? `Sent, but the copy could not be saved to Sent: ${r.sent_copy_error}`
         : r.sent_copy === "no_sent_folder" ? "Sent. This account has no Sent folder, so no copy was saved."
         : r.draft_cleanup_error ? `Sent, but the draft could not be removed: ${r.draft_cleanup_error}` : null;
-      showToast(warn ?? `Message sent${p ? ` to ${p.label}` : ""}`, warn !== null);
+      showToast(warn ?? `Message sent${p.label ? ` to ${p.label}` : ""}`, warn !== null);
       void sync();
     } else if (e.status === "failed") {
       showToast(`Couldn't send: ${e.error}. The message is open again, nothing was lost.`, true);
-      if (p) reopenMessage(p, "Send failed: edit message");
+      reopenMessage(p, "Send failed: edit message");
     }
   }
 
@@ -527,7 +542,10 @@
   function onKey(e: KeyboardEvent) {
     const t = e.target as HTMLElement;
     if (t.closest("input, textarea, select, [contenteditable], .modal") || compose || showSettings || showRules) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && pendingSends.length) { e.preventDefault(); void undoSend(pendingSends[pendingSends.length - 1]); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      const last = [...pendingSends].reverse().find((p) => !p.undoing && p.deadline > Date.now());
+      if (last) { e.preventDefault(); void undoSend(last); }
+    }
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && lastTransfer) { e.preventDefault(); void undo(); }
     else if (e.key.toLowerCase() === "v" && !e.ctrlKey && !e.metaKey && selection().length) { e.preventDefault(); pickerQuery = ""; picker = { copy: e.shiftKey }; }
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && t.closest(".list")) { e.preventDefault(); picked = list.map((m) => m.id); }
@@ -629,9 +647,11 @@
   });
   async function composerDone(r: ComposerResult) {
     if (r.kind === "queued") {
-      const delay = undoSendSeconds();
+      const delay = r.delay;
       pendingSends = [...pendingSends, { id: r.id, account: r.account, draft: r.draft, replaceDraft: r.replaceDraft,
-        label: recipientsLabel(r.draft), deadline: Date.now() + delay * 1000, total: Math.max(delay, 0.001) * 1000 }];
+        label: recipientsLabel(r.draft), deadline: Date.now() + delay * 1000, total: Math.max(delay, 0.001) * 1000, undoing: false }];
+      const early = earlyResults.get(r.id);
+      if (early) { earlyResults.delete(r.id); onSendResult(early); }
       return;
     }
     if (r.kind === "sent") { showToast(r.warning ?? "Message sent", r.warning !== null); await sync(); }
@@ -957,12 +977,12 @@
     </div>
   {/if}
   {#if pendingSends.length}
-    <div class="sendbar-stack" aria-live="polite">
+    <div class="sendbar-stack">
       {#each pendingSends as p (p.id)}
-        {@const left = Math.max(0, p.deadline - clock)}
-        <div class="sendbar" role="status">
+        {@const left = p.undoing ? 0 : Math.max(0, p.deadline - clock)}
+        <div class="sendbar" role="group" aria-label={`Sending to ${p.label || "recipients"}, Undo available`}>
           <div class="sendtext">
-            <strong>{left > 0 ? `Sending in ${Math.ceil(left / 1000)} s` : "Sending…"}</strong>
+            <strong aria-hidden="true">{left > 0 ? `Sending in ${Math.ceil(left / 1000)} s` : "Sending…"}</strong>
             <span class="muted">to {p.label || "recipients"}{p.draft.subject ? ` · ${p.draft.subject}` : ""}</span>
           </div>
           {#if left > 0}

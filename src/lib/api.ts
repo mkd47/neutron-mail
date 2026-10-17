@@ -235,7 +235,7 @@ export function errorText(e: unknown): string {
 }
 
 export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" }
-  | { kind: "queued"; id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null };
+  | { kind: "queued"; id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null; delay: number };
 export interface SendResultEvent { id: number; account_id: number; status: "sent" | "failed" | "cancelled"; result: SendResult | null; error: string | null }
 export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [], from: null });
 
