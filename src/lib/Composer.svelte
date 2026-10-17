@@ -293,9 +293,11 @@
 </script>
 
 <svelte:window onclick={(e) => {
-  const t = e.target as Element;
-  if (templatesOpen && !t.closest?.(".tpl-wrap")) templatesOpen = false;
-  if (laterOpen && !t.closest?.(".send-split")) laterOpen = false;
+  // The path is fixed when the click starts, so a button the click itself
+  // removed (e.g. "Save this message as a template…") still counts as inside.
+  const inside = (cls: string) => e.composedPath().some((n) => (n as Element).classList?.contains(cls));
+  if (templatesOpen && !inside("tpl-wrap")) templatesOpen = false;
+  if (laterOpen && !inside("send-split")) laterOpen = false;
 }} />
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->

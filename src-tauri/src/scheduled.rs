@@ -25,8 +25,9 @@ use crate::AppState;
 
 /// How often due messages are looked for.
 const TICK: Duration = Duration::from_secs(20);
-/// Tries before a message is marked failed; waits double each time.
-const MAX_ATTEMPTS: i64 = 5;
+/// Tries before a message is marked failed (waits 2, 4 … 30 minutes:
+/// about 12 hours in all).
+const MAX_ATTEMPTS: i64 = 28;
 /// Furthest a message can be scheduled.
 const MAX_AHEAD_SECS: i64 = 366 * 86_400;
 
@@ -82,7 +83,7 @@ fn recipients_label(m: &OutgoingMessage) -> String {
 }
 
 #[tauri::command]
-pub fn schedule_send(
+pub async fn schedule_send(
     app: AppHandle,
     state: State<'_, AppState>,
     account_id: i64,
@@ -128,6 +129,26 @@ pub fn schedule_send(
         }
     }
     tracing::info!(account = account_id, "message scheduled");
+    // The draft it was written from goes now, so it can't also be sent from
+    // Drafts while this waits ("Edit" puts the message back there). If that
+    // fails, it is tried again after sending.
+    if replace_draft.is_some() || replace_message_id.is_some() {
+        let cleaned = async {
+            let password = crate::providers::credential(&state, account_id).await?;
+            if let Some(d) = replace_draft {
+                delete_draft(&state, &account, &password, d).await?;
+            }
+            if let Some(mid) = replace_message_id.as_deref().filter(|m| !m.is_empty()) {
+                delete_drafts_by_message_id(&state, &account, &password, mid).await?;
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        match cleaned {
+            Ok(()) => state.store.clear_scheduled_drafts(id)?,
+            Err(e) => tracing::warn!("scheduled; the draft stays until it is sent: {e}"),
+        }
+    }
     changed(&app, id);
     state
         .store
@@ -228,6 +249,8 @@ pub fn start(app: &AppHandle) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Give the network a moment after startup or login.
+        tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
             let now = chrono::Utc::now().timestamp();
             let due = app.state::<AppState>().store.claim_due_scheduled(now);
@@ -254,23 +277,12 @@ async fn send_one(app: &AppHandle, id: i64) {
             return;
         }
     };
-    let res = async {
+    let sent = async {
         let account = state.store.account(p.account_id)?;
         let password = crate::providers::credential(&state, account.id).await?;
         let raw = smtp::for_sending_at(&p.raw, chrono::Utc::now().timestamp());
         smtp::send_raw(&account.config, &password, &p.env_from, &p.env_to, &raw).await?;
-        // Sent: from here on, never send it again.
-        state.store.delete_scheduled(id)?;
-        tracing::info!(account = account.id, "scheduled message sent");
-        after_send(
-            &state,
-            &account,
-            &password,
-            &raw,
-            p.replace_draft,
-            p.replace_message_id.as_deref(),
-        )
-        .await
+        Ok::<_, Error>((account, password, raw))
     }
     .await;
     let event = |status, error, result| ScheduledEvent {
@@ -281,12 +293,39 @@ async fn send_one(app: &AppHandle, id: i64) {
         error,
         result,
     };
-    match res {
-        Ok(r) => emit(app, event("sent", None, Some(r))),
+    match sent {
+        Ok((account, password, raw)) => {
+            // It went out: whatever happens next, it is never sent again.
+            if let Err(e) = state.store.delete_scheduled(id) {
+                tracing::error!("scheduled message {id} sent, but not removed: {e}");
+                if let Err(e) = state.store.mark_scheduled_sent(id) {
+                    tracing::error!("scheduled message {id}: {e}");
+                }
+            }
+            tracing::info!(account = account.id, "scheduled message sent");
+            let result = after_send(
+                &state,
+                &account,
+                &password,
+                &raw,
+                p.replace_draft,
+                p.replace_message_id.as_deref(),
+            )
+            .await
+            .unwrap_or_else(|e| SendResult {
+                sent_copy: "failed",
+                sent_copy_error: Some(e.to_string()),
+                draft_cleanup_error: None,
+            });
+            emit(app, event("sent", None, Some(result)));
+        }
         Err(e) => {
+            // Offline or a server hiccup must not lose the message: retry
+            // with growing waits (at most 30 min) for about half a day.
             let attempts = p.attempts + 1;
-            let retry = (attempts < MAX_ATTEMPTS)
-                .then(|| chrono::Utc::now().timestamp() + 60 * (1 << attempts));
+            let wait_min = (1i64 << attempts.min(5)).min(30);
+            let retry =
+                (attempts < MAX_ATTEMPTS).then(|| chrono::Utc::now().timestamp() + 60 * wait_min);
             tracing::warn!(attempts, "scheduled message failed: {e}");
             if let Err(db) = state.store.scheduled_failed(id, &e.to_string(), retry) {
                 tracing::warn!("scheduled message {id}: {db}");

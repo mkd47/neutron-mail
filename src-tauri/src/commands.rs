@@ -48,10 +48,10 @@ pub struct MessageView {
 #[derive(Clone, Serialize)]
 pub struct SendResult {
     /// "saved", "no_sent_folder" or "failed".
-    sent_copy: &'static str,
-    sent_copy_error: Option<String>,
+    pub(crate) sent_copy: &'static str,
+    pub(crate) sent_copy_error: Option<String>,
     /// Set when a resumed draft could not be removed from Drafts.
-    draft_cleanup_error: Option<String>,
+    pub(crate) draft_cleanup_error: Option<String>,
 }
 
 #[tauri::command]

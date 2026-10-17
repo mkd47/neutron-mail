@@ -509,7 +509,18 @@ fn scheduled_messages_are_claimed_once_retried_and_released() {
     );
     assert!(store.claim_scheduled(later).unwrap());
     assert_eq!(store.reset_sending_scheduled().unwrap(), 1);
-    store.delete_scheduled(later).unwrap();
+    store.mark_scheduled_sent(later).unwrap();
+    assert!(
+        !store.claim_scheduled(later).unwrap(),
+        "a sent one is never claimed again"
+    );
+    assert!(store
+        .claim_due_scheduled(i64::MAX)
+        .unwrap()
+        .iter()
+        .all(|&i| i != later));
+    store.reset_sending_scheduled().unwrap();
+    store.release_scheduled(soon, None).unwrap();
     let left = store.scheduled().unwrap();
     assert_eq!(
         (left.len(), left[0].send_at, left[0].attempts),

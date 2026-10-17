@@ -867,7 +867,7 @@ impl Store {
         let db = self.db();
         let mut st = db.prepare(
             "SELECT id, account_id, send_at, state, attempts, last_error, subject, recipients
-             FROM scheduled_sends ORDER BY send_at, id",
+             FROM scheduled_sends WHERE state != 'sent' ORDER BY send_at, id",
         )?;
         let rows = st.query_map([], |r| {
             Ok(Scheduled {
@@ -907,7 +907,7 @@ impl Store {
     /// being sent or gone.
     pub fn claim_scheduled(&self, id: i64) -> Result<bool> {
         Ok(self.db().execute(
-            "UPDATE scheduled_sends SET state = 'sending' WHERE id = ?1 AND state != 'sending'",
+            "UPDATE scheduled_sends SET state = 'sending' WHERE id = ?1 AND state IN ('waiting', 'failed')",
             [id],
         )? == 1)
     }
@@ -961,6 +961,25 @@ impl Store {
         Ok(())
     }
 
+    /// Its source drafts are already gone: nothing to remove after sending.
+    pub fn clear_scheduled_drafts(&self, id: i64) -> Result<()> {
+        self.db().execute(
+            "UPDATE scheduled_sends SET replace_draft = NULL, replace_message_id = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Sent, but the row couldn't be deleted: never send or show it again
+    /// (removed at the next start).
+    pub fn mark_scheduled_sent(&self, id: i64) -> Result<()> {
+        self.db().execute(
+            "UPDATE scheduled_sends SET state = 'sent' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_scheduled(&self, id: i64) -> Result<()> {
         self.db()
             .execute("DELETE FROM scheduled_sends WHERE id = ?1", [id])?;
@@ -971,7 +990,9 @@ impl Store {
     /// actually went out just before may be sent twice; losing it would be
     /// worse.)
     pub fn reset_sending_scheduled(&self) -> Result<usize> {
-        Ok(self.db().execute(
+        let db = self.db();
+        db.execute("DELETE FROM scheduled_sends WHERE state = 'sent'", [])?;
+        Ok(db.execute(
             "UPDATE scheduled_sends SET state = 'waiting' WHERE state = 'sending'",
             [],
         )?)

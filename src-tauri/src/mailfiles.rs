@@ -97,6 +97,7 @@ pub async fn import_messages(
         skipped: 0,
         error: None,
     };
+    let mut failures = 0;
     let outcome = async {
         for path in &paths {
             // Read in a blocking thread, hand messages over one by one.
@@ -133,9 +134,18 @@ pub async fn import_messages(
                 match item.map_err(Error::from)? {
                     None => result.skipped += 1,
                     Some(raw) => {
-                        match imap::append(&mut session, &folder.name, &raw, true).await {
+                        let mut res = imap::append(&mut session, &folder.name, &raw, true).await;
+                        if res.is_err() {
+                            // The connection may have dropped: reconnect once, try again.
+                            if let Ok(fresh) = imap::connect(&account.config, &password).await {
+                                session = fresh;
+                                res = imap::append(&mut session, &folder.name, &raw, true).await;
+                            }
+                        }
+                        match res {
                             Ok(()) => {
                                 result.imported += 1;
+                                failures = 0;
                                 if result.imported.is_multiple_of(25) {
                                     let _ = app.emit(
                                         "mail://import-progress",
@@ -148,10 +158,14 @@ pub async fn import_messages(
                             }
                             Err(e) => {
                                 result.skipped += 1;
+                                failures += 1;
                                 result.error.get_or_insert(e.to_string());
-                                // A dropped connection fails everything after it.
-                                if result.skipped > 20 && result.imported == 0 {
-                                    return Err(e);
+                                // Several in a row: the server is gone or refusing.
+                                if failures >= 5 {
+                                    return Err(Error::Invalid(format!(
+                                        "import stopped after {} messages: {e}",
+                                        result.imported
+                                    )));
                                 }
                             }
                         }
