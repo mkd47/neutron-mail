@@ -18,6 +18,11 @@ Severity scale: **High** (exploitable by a remote sender/server with real impact
 | `svelte-check --fail-on-warnings` | 0 errors, 0 warnings · `vite build` OK |
 | Tests | **83 pass** (`cargo test --workspace`, v0.4; adds `sync_large`, `imap_timeout`, 6 `ical` unit tests, `invite`, `eds_calendar`; `testserver/eds-test.sh` runs the 4 EDS tests live) with the live local server (`NEUTRON_IT=1`) and real evolution-data-server (`testserver/eds-test.sh`): 17 unit (attachments, links, remote images, vCard/sexp), 6 IMAP sync, 4 SMTP, 11 sanitizer, 9 store/search/TLS, 6 feature integration tests (remote-image fetch + SSRF, reply-all headers + Bcc envelope, forward attachments byte-for-byte, drafts save/resume/delete, hostile attachment names, address history), 2 EDS (live add + any-field search; graceful failure without a session bus). Without the server/EDS the network tests return early (counted as "passed" but *skipped*). |
 
+> **Update 2026-10-17:** RUSTSEC-2026-0373 (ammonia < 4.2.4: CSS `url()` matched case-sensitively) fixed by
+> updating to ammonia 4.2.4. RUSTSEC-2026-0370/0371/0372 (`zvariant`, `zbus_names`, `zvariant_derive`
+> unmaintained: merged into zbus 6) are ignored in `deny.toml`: not vulnerabilities, and they also come in
+> through Tauri's own plugins, which still use zbus 5. Revisit when Tauri moves to zbus 6.
+
 ## 2. Review by area
 
 ### 2.1 HTML rendering (remote sender → viewer) — defence in depth
