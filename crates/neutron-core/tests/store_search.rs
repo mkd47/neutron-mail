@@ -60,19 +60,19 @@ fn setup() -> (Store, i64, i64) {
 #[test]
 fn search_by_subject_body_sender_prefix_and_diacritics() {
     let (s, a, _) = setup();
-    assert_eq!(s.search(a, "invoice", 10).unwrap().len(), 1);
-    assert_eq!(s.search(a, "ram", 10).unwrap().len(), 1, "prefix");
+    assert_eq!(s.search(a, "invoice", None, 10).unwrap().len(), 1);
+    assert_eq!(s.search(a, "ram", None, 10).unwrap().len(), 1, "prefix");
     assert_eq!(
-        s.search(a, "ayse", 10).unwrap().len(),
+        s.search(a, "ayse", None, 10).unwrap().len(),
         1,
         "sender + diacritics"
     );
     assert_eq!(
-        s.search(a, "cafe", 10).unwrap().len(),
+        s.search(a, "cafe", None, 10).unwrap().len(),
         1,
         "diacritics folding"
     );
-    assert_eq!(s.search(a, "nothingmatches", 10).unwrap().len(), 0);
+    assert_eq!(s.search(a, "nothingmatches", None, 10).unwrap().len(), 0);
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn search_input_cannot_inject_fts_syntax() {
         "' OR 1=1 --",
         "\u{0}",
     ] {
-        assert!(s.search(a, q, 10).is_ok(), "query {q:?} errored");
+        assert!(s.search(a, q, None, 10).is_ok(), "query {q:?} errored");
     }
 }
 
@@ -96,7 +96,7 @@ fn search_input_cannot_inject_fts_syntax() {
 fn search_is_scoped_to_account() {
     let (s, _, _) = setup();
     let other = s.add_account(&cfg()).unwrap();
-    assert!(s.search(other, "invoice", 10).unwrap().is_empty());
+    assert!(s.search(other, "invoice", None, 10).unwrap().is_empty());
 }
 
 #[test]
@@ -160,12 +160,12 @@ fn duplicate_insert_is_idempotent_and_removal_updates_index() {
     assert_eq!(inserted, original);
     assert_eq!(s.raw(original).unwrap(), original_raw);
     assert_eq!(s.messages(f, 0, 50).unwrap().len(), 2);
-    assert_eq!(s.search(a, "billing", 10).unwrap().len(), 1);
-    assert_eq!(s.search(a, "pay", 10).unwrap().len(), 1);
-    assert!(s.search(a, "dup", 10).unwrap().is_empty());
+    assert_eq!(s.search(a, "billing", None, 10).unwrap().len(), 1);
+    assert_eq!(s.search(a, "pay", None, 10).unwrap().len(), 1);
+    assert!(s.search(a, "dup", None, 10).unwrap().is_empty());
     assert!(s.address_history(a, "x@y.z", 10).unwrap().is_empty());
     assert_eq!(s.remove_uids(f, &[1]).unwrap(), 1);
-    assert!(s.search(a, "invoice", 10).unwrap().is_empty());
+    assert!(s.search(a, "invoice", None, 10).unwrap().is_empty());
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn decoding_upgrade_repairs_cached_text_and_search_without_redownloading() {
     assert_eq!(row.preview, text);
     assert!(row.seen && row.flagged);
     assert_eq!(store.raw(id).unwrap(), raw);
-    assert_eq!(store.search(account, text, 10).unwrap().len(), 1);
+    assert_eq!(store.search(account, text, None, 10).unwrap().len(), 1);
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
     let after: i64 = db
@@ -416,7 +416,7 @@ fn decoding_repair_runs_in_resumable_batches() {
     // Opening does not do the work; the explicit call resumes after the checkpoint.
     assert_eq!(store.repair_text_decoding().unwrap(), 70);
     assert_eq!(store.repair_text_decoding().unwrap(), 0);
-    assert_eq!(store.search(account, "s120", 10).unwrap().len(), 1);
+    assert_eq!(store.search(account, "s120", None, 10).unwrap().len(), 1);
 }
 
 fn mail(mid: &str, refs: &str, irt: &str, subject: &str, date: &str) -> Vec<u8> {
@@ -592,4 +592,32 @@ fn threads_of_older_caches_are_backfilled_in_the_background() {
     let rows = store.threads(inbox, 0, 50).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].thread_ids.contains(&a));
+}
+
+#[test]
+fn search_filters_work_with_and_without_text() {
+    let (s, a, f) = setup();
+    let other = s.upsert_folder(a, "Archive", Some("archive")).unwrap();
+    s.insert_message(
+        other,
+        &NewMessage {
+            uid: 1,
+            seen: true,
+            flagged: true,
+            raw: &raw("Old invoice", "Billing <billing@example.test>", "Paid."),
+        },
+    )
+    .unwrap();
+    let n = |q: &str, folder: Option<i64>| s.search(a, q, folder, 50).unwrap().len();
+    assert_eq!(n("from:billing", None), 2);
+    assert_eq!(n("from:billing", Some(f)), 1, "this folder only");
+    assert_eq!(n("from:Ayşe", None), 1, "display name");
+    assert_eq!(n("is:unread", None), 1);
+    assert_eq!(n("is:starred invoice", None), 1);
+    assert_eq!(n("subject:lunch ramen", None), 1);
+    assert_eq!(n("subject:lunch invoice", None), 0);
+    assert_eq!(n("to:me@example", None), 3);
+    assert_eq!(n("from:%", None), 0, "LIKE wildcards are literal");
+    assert_eq!(n("after:2026-10-15", None), 0);
+    assert_eq!(n("before:2026-10-15 after:2026-10-13", None), 3);
 }

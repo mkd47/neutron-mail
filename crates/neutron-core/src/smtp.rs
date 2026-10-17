@@ -242,6 +242,69 @@ pub async fn send(
     Ok(built.raw)
 }
 
+/// Send an already built message (scheduled mail) to an explicit envelope.
+pub async fn send_raw(
+    cfg: &AccountConfig,
+    password: &str,
+    from: &str,
+    to: &[String],
+    raw: &[u8],
+) -> Result<()> {
+    let parse = |a: &str| {
+        a.parse::<lettre::Address>()
+            .map_err(|e| Error::Invalid(format!("address {a}: {e}")))
+    };
+    let rcpts = to.iter().map(|a| parse(a)).collect::<Result<Vec<_>>>()?;
+    let envelope = Envelope::new(Some(parse(from)?), rcpts)
+        .map_err(|e| Error::Invalid(format!("envelope: {e}")))?;
+    transport(cfg, password)?.send_raw(&envelope, raw).await?;
+    Ok(())
+}
+
+/// Prepare a stored draft-style message (built with Bcc kept) for sending
+/// at `ts`: the Bcc header is removed and the Date header set to `ts`.
+pub fn for_sending_at(raw: &[u8], ts: i64) -> Vec<u8> {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw.len(), |p| p + 2);
+    let (head, body) = raw.split_at(split);
+    let date = chrono::DateTime::from_timestamp(ts, 0)
+        .unwrap_or_default()
+        .to_rfc2822();
+    let mut out = Vec::with_capacity(raw.len() + 40);
+    let mut skipping = false;
+    let mut dated = false;
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        let folded = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
+        if folded {
+            if !skipping {
+                out.extend_from_slice(line);
+            }
+            continue;
+        }
+        let name = line
+            .iter()
+            .position(|&b| b == b':')
+            .map(|i| line[..i].to_ascii_lowercase());
+        skipping = matches!(name.as_deref(), Some(b"bcc") | Some(b"date"));
+        if name.as_deref() == Some(b"date") && !dated {
+            out.extend_from_slice(format!("Date: {date}\r\n").as_bytes());
+            dated = true;
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    if !dated {
+        let mut with_date = format!("Date: {date}\r\n").into_bytes();
+        with_date.extend_from_slice(&out);
+        out = with_date;
+    }
+    out.extend_from_slice(body);
+    out
+}
+
 /// An iMIP message (RFC 6047): multipart/alternative with a human-readable
 /// text part and the iTIP object as `text/calendar; method=…`.
 pub fn build_imip(
@@ -544,4 +607,17 @@ pub fn build_auto_forward(
         envelope,
         message_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scheduled_mail_drops_bcc_and_gets_the_send_date() {
+        let raw = b"From: a@x.test\r\nBcc: secret@x.test,\r\n other@x.test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nTo: b@x.test\r\nSubject: Hi\r\n\r\nBcc: in the body stays\r\n";
+        let out = String::from_utf8(super::for_sending_at(raw, 1_767_225_600)).unwrap();
+        assert!(!out.contains("secret@") && !out.contains("other@x.test"));
+        assert!(out.contains("Date: Thu, 1 Jan 2026 00:00:00 +0000\r\nTo: b@x.test"));
+        assert!(out.ends_with("\r\n\r\nBcc: in the body stays\r\n"));
+        assert_eq!(out.matches("Date:").count(), 1);
+    }
 }

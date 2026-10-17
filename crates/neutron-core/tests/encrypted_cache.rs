@@ -63,7 +63,7 @@ fn assert_no_plaintext(dir: &Path) {
 
 fn hits(s: &Store) -> usize {
     let a = s.accounts().unwrap()[0].id;
-    s.search(a, "bananas", 500).unwrap().len()
+    s.search(a, "bananas", None, 500).unwrap().len()
 }
 
 #[test]

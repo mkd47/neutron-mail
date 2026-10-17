@@ -104,6 +104,35 @@ export interface AccountSettings {
   sync_days: number;
   /** Extra sender addresses (aliases). */
   identities: MailAddress[];
+  /** Alias signatures (lowercase address → HTML); missing = account signature. */
+  identity_signatures?: Record<string, string>;
+}
+
+export interface Scheduled {
+  id: number;
+  account_id: number;
+  /** Unix seconds. */
+  send_at: number;
+  state: "waiting" | "sending" | "failed";
+  attempts: number;
+  last_error: string | null;
+  subject: string;
+  recipients: string;
+}
+export interface ScheduledEvent {
+  id: number;
+  status: "changed" | "sent" | "retry" | "failed";
+  subject: string;
+  recipients: string;
+  error: string | null;
+  result: SendResult | null;
+}
+
+export interface Template {
+  id: number;
+  name: string;
+  /** Compose-sanitized HTML. */
+  html: string;
 }
 
 export interface AutoReply {
@@ -143,6 +172,9 @@ export const api = {
   getAccountSettings: (accountId: number) => invoke<AccountSettings>("get_account_settings", { accountId }),
   setAccountSettings: (accountId: number, settings: AccountSettings) =>
     invoke<AccountSettings>("set_account_settings", { accountId, settings }),
+  listTemplates: () => invoke<Template[]>("list_templates"),
+  saveTemplate: (id: number | null, name: string, html: string) => invoke<Template>("save_template", { id, name, html }),
+  deleteTemplate: (id: number) => invoke<void>("delete_template", { id }),
   getAutoReply: (accountId: number) => invoke<AutoReply>("get_auto_reply", { accountId }),
   autoReplyServerSupport: (accountId: number) =>
     invoke<AutoReplyServerSupport>("auto_reply_server_support", { accountId }),
@@ -159,7 +191,8 @@ export const api = {
   setImageSenderTrust: (accountId: number, email: string, trusted: boolean) =>
     invoke<void>("set_image_sender_trust", { accountId, email, trusted }),
   messageSource: (messageId: number) => invoke<string>("message_source", { messageId }),
-  search: (accountId: number, query: string) => invoke<SearchHit[]>("search", { accountId, query }),
+  search: (accountId: number, query: string, folderId: number | null = null) =>
+    invoke<SearchHit[]>("search", { accountId, query, folderId }),
   composePrefill: (messageId: number, mode: ComposeMode) => invoke<ComposeDraft>("compose_prefill", { messageId, mode }),
   send: (accountId: number, message: Outgoing, replaceDraft: number | null = null, replaceMessageId: string | null = null) =>
     invoke<SendResult>("send_message", { accountId, message, replaceDraft, replaceMessageId }),
@@ -168,6 +201,13 @@ export const api = {
     invoke<number>("queue_send", { accountId, message, replaceDraft, replaceMessageId, delaySecs }),
   cancelSend: (id: number) => invoke<boolean>("cancel_send", { id }),
   sendNow: (id: number) => invoke<boolean>("send_now", { id }),
+  scheduleSend: (accountId: number, message: Outgoing, replaceDraft: number | null, replaceMessageId: string | null, sendAt: number) =>
+    invoke<Scheduled>("schedule_send", { accountId, message, replaceDraft, replaceMessageId, sendAt }),
+  listScheduled: () => invoke<Scheduled[]>("list_scheduled"),
+  sendScheduledNow: (id: number) => invoke<void>("send_scheduled_now", { id }),
+  reschedule: (id: number, sendAt: number) => invoke<void>("reschedule", { id, sendAt }),
+  cancelScheduled: (id: number, keep: boolean) => invoke<void>("cancel_scheduled", { id, keep }),
+  onScheduled: (cb: (e: ScheduledEvent) => void): Promise<UnlistenFn> => listen<ScheduledEvent>("mail://scheduled", (e) => cb(e.payload)),
   onSendResult: (cb: (e: SendResultEvent) => void): Promise<UnlistenFn> => listen<SendResultEvent>("mail://send-result", (e) => cb(e.payload)),
   saveDraft: (accountId: number, message: Outgoing, replaceDraft: number | null = null, replaceMessageId: string | null = null) =>
     invoke<{ message_id: string; replace_error: string | null }>("save_draft", { accountId, message, replaceDraft, replaceMessageId }),
@@ -235,6 +275,7 @@ export function errorText(e: unknown): string {
 }
 
 export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" }
+  | { kind: "scheduled"; item: Scheduled }
   | { kind: "queued"; id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null; delay: number };
 export interface SendResultEvent { id: number; account_id: number; status: "sent" | "failed" | "cancelled"; result: SendResult | null; error: string | null }
 export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [], from: null });

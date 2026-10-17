@@ -30,7 +30,25 @@
   });
 
   function changed() { if (el) onInput(el.innerHTML); refresh(); }
+  // Where the caret last was, so text inserted from outside (templates)
+  // lands there even after a button took the focus.
+  let caret: Range | null = null;
+  function remember() {
+    const sel = window.getSelection();
+    if (el && sel?.rangeCount && el.contains(sel.getRangeAt(0).startContainer)) caret = sel.getRangeAt(0).cloneRange();
+  }
+  /** Insert sanitized HTML at the caret (or at the start). */
+  export function insertHtml(h: string) {
+    if (!el) return;
+    el.focus();
+    const sel = window.getSelection();
+    const r = caret ?? (() => { const x = document.createRange(); x.setStart(el!, 0); x.collapse(true); return x; })();
+    sel?.removeAllRanges(); sel?.addRange(r);
+    document.execCommand("insertHTML", false, h);
+    changed(); remember();
+  }
   function refresh() {
+    remember();
     const q = (c: string) => { try { return document.queryCommandState(c); } catch { return false; } };
     active = { bold: q("bold"), italic: q("italic"), underline: q("underline"),
       insertUnorderedList: q("insertUnorderedList"), insertOrderedList: q("insertOrderedList") };

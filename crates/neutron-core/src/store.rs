@@ -89,6 +89,29 @@ CREATE TABLE IF NOT EXISTS auto_reply_log (
   sent_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, email)
 );
+CREATE TABLE IF NOT EXISTS scheduled_sends (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  send_at INTEGER NOT NULL,
+  next_try INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'waiting',
+  last_error TEXT,
+  subject TEXT NOT NULL,
+  recipients TEXT NOT NULL,
+  env_from TEXT NOT NULL,
+  env_to TEXT NOT NULL,
+  raw BLOB NOT NULL,
+  replace_draft INTEGER,
+  replace_message_id TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS templates (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  html TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rules (
   id INTEGER PRIMARY KEY,
   position INTEGER NOT NULL,
@@ -156,6 +179,57 @@ pub struct Store {
 /// Sync windows offered in settings (days; 0 = all mail).
 pub const SYNC_WINDOWS: [u32; 5] = [0, 30, 90, 365, 730];
 const MAX_SIGNATURE_BYTES: usize = 256 * 1024;
+const MAX_TEMPLATES: i64 = 100;
+
+/// A message waiting to be sent at a set time ("Send later").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Scheduled {
+    pub id: i64,
+    pub account_id: i64,
+    pub send_at: i64,
+    /// "waiting", "sending" or "failed" (gave up after several tries).
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub subject: String,
+    /// Display list of recipients.
+    pub recipients: String,
+}
+
+/// What the scheduler needs to send one message.
+pub struct ScheduledPayload {
+    pub account_id: i64,
+    pub attempts: i64,
+    pub subject: String,
+    pub recipients: String,
+    pub env_from: String,
+    pub env_to: Vec<String>,
+    /// Built with the Bcc header kept (see `smtp::for_sending_at`).
+    pub raw: Vec<u8>,
+    pub replace_draft: Option<i64>,
+    pub replace_message_id: Option<String>,
+}
+
+pub struct NewScheduled<'a> {
+    pub account_id: i64,
+    pub send_at: i64,
+    pub subject: &'a str,
+    pub recipients: &'a str,
+    pub env_from: &'a str,
+    pub env_to: &'a [String],
+    pub raw: &'a [u8],
+    pub replace_draft: Option<i64>,
+    pub replace_message_id: Option<&'a str>,
+}
+
+/// A saved snippet for the composer ("quick reply").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Template {
+    pub id: i64,
+    pub name: String,
+    /// Compose-sanitized HTML.
+    pub html: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccountSettings {
@@ -166,6 +240,19 @@ pub struct AccountSettings {
     /// Extra sender addresses (aliases) besides the account's own.
     #[serde(default)]
     pub identities: Vec<crate::model::MailAddress>,
+    /// Signatures for aliases (lowercase address → HTML); an alias without
+    /// one uses the account's signature.
+    #[serde(default)]
+    pub identity_signatures: std::collections::BTreeMap<String, String>,
+}
+
+impl AccountSettings {
+    /// The signature for mail sent from `from` (None: the account address).
+    pub fn signature_for(&self, from: Option<&str>) -> &str {
+        from.and_then(|f| self.identity_signatures.get(&f.trim().to_ascii_lowercase()))
+            .filter(|s| !s.trim().is_empty())
+            .map_or(self.signature_html.as_str(), String::as_str)
+    }
 }
 
 /// Most aliases one account can have.
@@ -328,6 +415,16 @@ impl Store {
         if !has_identities {
             conn.execute_batch(
                 "ALTER TABLE account_settings ADD COLUMN identities TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        let has_identity_signatures = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'identity_signatures'",
+            )?
+            .exists([])?;
+        if !has_identity_signatures {
+            conn.execute_batch(
+                "ALTER TABLE account_settings ADD COLUMN identity_signatures TEXT NOT NULL DEFAULT '{}';",
             )?;
         }
         let has_sieve = conn
@@ -570,14 +667,16 @@ impl Store {
         Ok(self
             .db()
             .query_row(
-                "SELECT signature_html, sync_days, identities FROM account_settings WHERE account_id = ?1",
+                "SELECT signature_html, sync_days, identities, identity_signatures FROM account_settings WHERE account_id = ?1",
                 [id],
                 |r| {
                     let identities: String = r.get(2)?;
+                    let signatures: String = r.get(3)?;
                     Ok(AccountSettings {
                         signature_html: r.get(0)?,
                         sync_days: r.get(1)?,
                         identities: serde_json::from_str(&identities).unwrap_or_default(),
+                        identity_signatures: serde_json::from_str(&signatures).unwrap_or_default(),
                     })
                 },
             )
@@ -587,7 +686,11 @@ impl Store {
 
     /// Store settings; the signature is sanitized with the compose policy.
     pub fn set_account_settings(&self, id: i64, s: &AccountSettings) -> Result<AccountSettings> {
-        if s.signature_html.len() > MAX_SIGNATURE_BYTES {
+        if s.signature_html.len() > MAX_SIGNATURE_BYTES
+            || s.identity_signatures
+                .values()
+                .any(|v| v.len() > MAX_SIGNATURE_BYTES)
+        {
             return Err(Error::Invalid(
                 "the signature is too large (max 256 KB)".into(),
             ));
@@ -596,20 +699,40 @@ impl Store {
             return Err(Error::Invalid("unsupported sync window".into()));
         }
         let account = self.account(id)?;
+        let identities = clean_identities(&account.config.email, &s.identities)?;
+        // Only aliases that still exist keep a signature; empty ones are dropped.
+        let identity_signatures = s
+            .identity_signatures
+            .iter()
+            .filter_map(|(email, html)| {
+                let email = email.trim().to_ascii_lowercase();
+                let html = crate::sanitize::sanitize_compose_html(html)
+                    .trim()
+                    .to_string();
+                (!html.is_empty()
+                    && identities
+                        .iter()
+                        .any(|i| i.email.eq_ignore_ascii_case(&email)))
+                .then_some((email, html))
+            })
+            .collect();
         let clean = AccountSettings {
             signature_html: crate::sanitize::sanitize_compose_html(&s.signature_html)
                 .trim()
                 .to_string(),
             sync_days: s.sync_days,
-            identities: clean_identities(&account.config.email, &s.identities)?,
+            identities,
+            identity_signatures,
         };
         let identities = serde_json::to_string(&clean.identities)
             .map_err(|e| Error::Invalid(format!("sender addresses: {e}")))?;
+        let signatures = serde_json::to_string(&clean.identity_signatures)
+            .map_err(|e| Error::Invalid(format!("signatures: {e}")))?;
         self.db().execute(
-            "INSERT INTO account_settings (account_id, signature_html, sync_days, identities) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO account_settings (account_id, signature_html, sync_days, identities, identity_signatures) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(account_id) DO UPDATE SET signature_html = excluded.signature_html, sync_days = excluded.sync_days,
-               identities = excluded.identities",
-            params![id, clean.signature_html, clean.sync_days, identities],
+               identities = excluded.identities, identity_signatures = excluded.identity_signatures",
+            params![id, clean.signature_html, clean.sync_days, identities, signatures],
         )?;
         Ok(clean)
     }
@@ -712,6 +835,220 @@ impl Store {
             "UPDATE account_settings SET auto_reply = ?2 WHERE account_id = ?1",
             params![account_id, json],
         )?;
+        Ok(())
+    }
+
+    pub fn add_scheduled(&self, n: &NewScheduled<'_>) -> Result<i64> {
+        let env_to = serde_json::to_string(n.env_to)
+            .map_err(|e| Error::Invalid(format!("recipients: {e}")))?;
+        let db = self.db();
+        db.execute(
+            "INSERT INTO scheduled_sends (account_id, send_at, next_try, subject, recipients, env_from, env_to, raw,
+               replace_draft, replace_message_id, created_at)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                n.account_id,
+                n.send_at,
+                n.subject,
+                n.recipients,
+                n.env_from,
+                env_to,
+                n.raw,
+                n.replace_draft,
+                n.replace_message_id,
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(db.last_insert_rowid())
+    }
+
+    /// All scheduled messages, soonest first.
+    pub fn scheduled(&self) -> Result<Vec<Scheduled>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT id, account_id, send_at, state, attempts, last_error, subject, recipients
+             FROM scheduled_sends ORDER BY send_at, id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(Scheduled {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                send_at: r.get(2)?,
+                state: r.get(3)?,
+                attempts: r.get(4)?,
+                last_error: r.get(5)?,
+                subject: r.get(6)?,
+                recipients: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Mark messages that are due as being sent and return their ids; a
+    /// message is only ever claimed once.
+    pub fn claim_due_scheduled(&self, now: i64) -> Result<Vec<i64>> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let ids: Vec<i64> = tx
+            .prepare("SELECT id FROM scheduled_sends WHERE state = 'waiting' AND next_try <= ?1 ORDER BY send_at")?
+            .query_map([now], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &ids {
+            tx.execute(
+                "UPDATE scheduled_sends SET state = 'sending' WHERE id = ?1",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Claim one message now ("Send now", "Cancel"): false if it is already
+    /// being sent or gone.
+    pub fn claim_scheduled(&self, id: i64) -> Result<bool> {
+        Ok(self.db().execute(
+            "UPDATE scheduled_sends SET state = 'sending' WHERE id = ?1 AND state != 'sending'",
+            [id],
+        )? == 1)
+    }
+
+    pub fn scheduled_payload(&self, id: i64) -> Result<ScheduledPayload> {
+        self.db()
+            .query_row(
+                "SELECT account_id, env_from, env_to, raw, replace_draft, replace_message_id, attempts, subject, recipients
+                 FROM scheduled_sends WHERE id = ?1",
+                [id],
+                |r| {
+                    let env_to: String = r.get(2)?;
+                    Ok(ScheduledPayload {
+                        account_id: r.get(0)?,
+                        env_from: r.get(1)?,
+                        env_to: serde_json::from_str(&env_to).unwrap_or_default(),
+                        raw: r.get(3)?,
+                        replace_draft: r.get(4)?,
+                        replace_message_id: r.get(5)?,
+                        attempts: r.get(6)?,
+                        subject: r.get(7)?,
+                        recipients: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("scheduled message {id}")))
+    }
+
+    /// A send failed: try again at `retry_at`, or give up (state "failed").
+    pub fn scheduled_failed(&self, id: i64, error: &str, retry_at: Option<i64>) -> Result<()> {
+        self.db().execute(
+            "UPDATE scheduled_sends SET attempts = attempts + 1, last_error = ?2,
+               state = CASE WHEN ?3 IS NULL THEN 'failed' ELSE 'waiting' END,
+               next_try = COALESCE(?3, next_try)
+             WHERE id = ?1",
+            params![id, error, retry_at],
+        )?;
+        Ok(())
+    }
+
+    /// Back to waiting (a claim that didn't lead to sending, e.g. a failed
+    /// cancel), optionally at a new time.
+    pub fn release_scheduled(&self, id: i64, send_at: Option<i64>) -> Result<()> {
+        self.db().execute(
+            "UPDATE scheduled_sends SET state = 'waiting', attempts = 0, last_error = NULL,
+               send_at = COALESCE(?2, send_at), next_try = COALESCE(?2, next_try)
+             WHERE id = ?1",
+            params![id, send_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_scheduled(&self, id: i64) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM scheduled_sends WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// After a crash or quit mid-send: those messages wait again. (One that
+    /// actually went out just before may be sent twice; losing it would be
+    /// worse.)
+    pub fn reset_sending_scheduled(&self) -> Result<usize> {
+        Ok(self.db().execute(
+            "UPDATE scheduled_sends SET state = 'waiting' WHERE state = 'sending'",
+            [],
+        )?)
+    }
+
+    /// Saved text snippets for the composer (all accounts), by name.
+    pub fn templates(&self) -> Result<Vec<Template>> {
+        let db = self.db();
+        let mut st =
+            db.prepare("SELECT id, name, html FROM templates ORDER BY name COLLATE NOCASE, id")?;
+        let rows = st.query_map([], |r| {
+            Ok(Template {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                html: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Create (id None) or replace a template; the HTML is compose-sanitized.
+    pub fn save_template(&self, id: Option<i64>, name: &str, html: &str) -> Result<Template> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 100 || name.contains(['\r', '\n']) {
+            return Err(Error::Invalid(
+                "give the template a one-line name (up to 100 characters)".into(),
+            ));
+        }
+        if html.len() > MAX_SIGNATURE_BYTES {
+            return Err(Error::Invalid(
+                "the template is too large (max 256 KB)".into(),
+            ));
+        }
+        let html = crate::sanitize::sanitize_compose_html(html)
+            .trim()
+            .to_string();
+        if crate::sanitize::html_to_text(&html).trim().is_empty() && !html.contains("<img") {
+            return Err(Error::Invalid("the template is empty".into()));
+        }
+        let now = chrono::Utc::now().timestamp();
+        let db = self.db();
+        let id = match id {
+            Some(id) => {
+                let n = db.execute(
+                    "UPDATE templates SET name = ?2, html = ?3, updated_at = ?4 WHERE id = ?1",
+                    params![id, name, html, now],
+                )?;
+                if n == 0 {
+                    return Err(Error::NotFound(format!("template {id}")));
+                }
+                id
+            }
+            None => {
+                let count: i64 =
+                    db.query_row("SELECT COUNT(*) FROM templates", [], |r| r.get(0))?;
+                if count >= MAX_TEMPLATES {
+                    return Err(Error::Invalid(format!(
+                        "you can keep up to {MAX_TEMPLATES} templates"
+                    )));
+                }
+                db.execute(
+                    "INSERT INTO templates (name, html, updated_at) VALUES (?1, ?2, ?3)",
+                    params![name, html, now],
+                )?;
+                db.last_insert_rowid()
+            }
+        };
+        Ok(Template {
+            id,
+            name: name.to_string(),
+            html,
+        })
+    }
+
+    pub fn delete_template(&self, id: i64) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM templates WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -1300,19 +1637,86 @@ impl Store {
         Ok((summary, parse::parse(&raw)))
     }
 
-    pub fn search(&self, account_id: i64, input: &str, limit: i64) -> Result<Vec<SearchHit>> {
-        let Some(q) = crate::search::fts_query(input) else {
+    /// Search one account, optionally one folder. Free text goes through
+    /// the full-text index; filters are plain conditions on the cache.
+    pub fn search(
+        &self,
+        account_id: i64,
+        input: &str,
+        folder_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>> {
+        use rusqlite::types::Value;
+        let q = crate::search::parse(input);
+        let fts = crate::search::fts_query(&q.text);
+        if fts.is_none() && !q.has_filters() {
             return Ok(Vec::new());
+        }
+        let like = |s: &str| {
+            let esc = s
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            Value::Text(format!("%{esc}%"))
         };
+        let mut cond = vec!["f.account_id = ?".to_string()];
+        let mut args: Vec<Value> = vec![Value::Integer(account_id)];
+        if let Some(f) = folder_id {
+            cond.push("m.folder_id = ?".into());
+            args.push(Value::Integer(f));
+        }
+        for v in &q.from {
+            cond.push("(m.from_addr LIKE ? ESCAPE '\\' OR m.from_name LIKE ? ESCAPE '\\')".into());
+            args.extend([like(v), like(v)]);
+        }
+        for v in &q.to {
+            cond.push("(m.to_addrs LIKE ? ESCAPE '\\' OR m.cc_addrs LIKE ? ESCAPE '\\')".into());
+            args.extend([like(v), like(v)]);
+        }
+        for v in &q.subject {
+            cond.push("m.subject LIKE ? ESCAPE '\\'".into());
+            args.push(like(v));
+        }
+        if q.has_attachment {
+            cond.push("m.has_attachments = 1".into());
+        }
+        if let Some(u) = q.unread {
+            cond.push(format!("m.seen = {}", if u { 0 } else { 1 }));
+        }
+        if q.starred == Some(true) {
+            cond.push("m.flagged = 1".into());
+        }
+        if let Some(t) = q.after {
+            cond.push("m.date >= ?".into());
+            args.push(Value::Integer(t));
+        }
+        if let Some(t) = q.before {
+            cond.push("m.date < ?".into());
+            args.push(Value::Integer(t));
+        }
+        let sql = match &fts {
+            Some(m) => {
+                cond.insert(0, "messages_fts MATCH ?".into());
+                args.insert(0, Value::Text(m.clone()));
+                format!(
+                    "SELECT {SUMMARY_COLS}, snippet(messages_fts, -1, char(2), char(3), '…', 12)
+                     FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid
+                     JOIN folders f ON f.id = m.folder_id
+                     WHERE {} ORDER BY bm25(messages_fts), m.date DESC LIMIT ?",
+                    cond.join(" AND ")
+                )
+            }
+            None => format!(
+                "SELECT {SUMMARY_COLS}, m.preview FROM messages m
+                 JOIN folders f ON f.id = m.folder_id
+                 WHERE {} ORDER BY m.date DESC LIMIT ?",
+                cond.join(" AND ")
+            ),
+        };
+        args.push(Value::Integer(limit.clamp(1, 500)));
         let db = self.db();
-        let mut st = db.prepare(&format!(
-            "SELECT {SUMMARY_COLS}, snippet(messages_fts, -1, char(2), char(3), '…', 12)
-             FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid
-             JOIN folders f ON f.id = m.folder_id
-             WHERE messages_fts MATCH ?1 AND f.account_id = ?2
-             ORDER BY bm25(messages_fts), m.date DESC LIMIT ?3"
-        ))?;
-        let rows = st.query_map(params![q, account_id, limit.clamp(1, 200)], |r| {
+        let mut st = db.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| {
             Ok(SearchHit {
                 summary: summary_from_row(r)?,
                 snippet: r.get(11)?,

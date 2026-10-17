@@ -24,6 +24,7 @@ fn settings_default_roundtrip_and_sanitize() {
             id,
             &AccountSettings {
                 identities: vec![],
+                identity_signatures: Default::default(),
                 signature_html: "<p onclick=\"x()\"><b>Kaan</b></p><script>alert(1)</script><img src=\"https://t.example/p.gif\">".into(),
                 sync_days: 90,
             },
@@ -45,6 +46,7 @@ fn settings_rejects_bad_window_unknown_account_and_huge_signature() {
     let (store, id) = store_with_account();
     let s = |d| AccountSettings {
         identities: vec![],
+        identity_signatures: Default::default(),
         signature_html: String::new(),
         sync_days: d,
     };
@@ -52,6 +54,7 @@ fn settings_rejects_bad_window_unknown_account_and_huge_signature() {
     assert!(store.set_account_settings(id + 99, &s(30)).is_err());
     let huge = AccountSettings {
         identities: vec![],
+        identity_signatures: Default::default(),
         signature_html: "a".repeat(300 * 1024),
         sync_days: 0,
     };
@@ -84,6 +87,7 @@ fn update_account_and_cascade_on_delete() {
             id,
             &AccountSettings {
                 identities: vec![],
+                identity_signatures: Default::default(),
                 signature_html: "x".into(),
                 sync_days: 30,
             },
@@ -375,4 +379,140 @@ fn automatic_replies_store_settings_and_answer_each_sender_once_per_period() {
     assert!(store
         .auto_reply_due(id, "bob@example.test", t + 1, 2)
         .unwrap());
+}
+
+#[test]
+fn aliases_can_have_their_own_signature() {
+    let (store, id) = store_with_account();
+    let mut sigs = std::collections::BTreeMap::new();
+    sigs.insert(
+        "Sales@Example.test".to_string(),
+        "<b>Sales team</b><script>x()</script>".to_string(),
+    );
+    sigs.insert("gone@example.test".to_string(), "<b>Old</b>".to_string());
+    sigs.insert("info@example.test".to_string(), "  ".to_string());
+    let saved = store
+        .set_account_settings(
+            id,
+            &AccountSettings {
+                signature_html: "<b>Kaan</b>".into(),
+                identities: vec![
+                    alias("Sales", "sales@example.test"),
+                    alias("", "info@example.test"),
+                ],
+                identity_signatures: sigs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        saved.identity_signatures.keys().collect::<Vec<_>>(),
+        vec!["sales@example.test"],
+        "unknown aliases and empty signatures are dropped"
+    );
+    let stored = store.account_settings(id).unwrap();
+    assert_eq!(stored, saved);
+    assert_eq!(
+        stored.signature_for(Some("SALES@example.test")),
+        "<b>Sales team</b>"
+    );
+    assert_eq!(
+        stored.signature_for(Some("info@example.test")),
+        "<b>Kaan</b>"
+    );
+    assert_eq!(stored.signature_for(None), "<b>Kaan</b>");
+}
+
+#[test]
+fn templates_are_sanitized_named_and_editable() {
+    let (store, _) = store_with_account();
+    let t = store
+        .save_template(
+            None,
+            " Thanks ",
+            "<p onclick=\"x()\">Thanks, <b>got it</b></p><script>y()</script>",
+        )
+        .unwrap();
+    assert_eq!(t.name, "Thanks");
+    assert!(!t.html.contains("onclick") && !t.html.contains("script"));
+    assert!(store.save_template(None, "", "<p>x</p>").is_err());
+    assert!(store.save_template(None, "Empty", "<p> </p>").is_err());
+    let a = store
+        .save_template(None, "away", "<p>I'm away</p>")
+        .unwrap();
+    let names: Vec<_> = store
+        .templates()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["away", "Thanks"],
+        "sorted by name, case-insensitive"
+    );
+    store
+        .save_template(Some(a.id), "Away", "<p>Back Monday</p>")
+        .unwrap();
+    assert!(store.templates().unwrap()[0].html.contains("Back Monday"));
+    store.delete_template(t.id).unwrap();
+    assert_eq!(store.templates().unwrap().len(), 1);
+    assert!(store.save_template(Some(999), "x", "<p>x</p>").is_err());
+}
+
+#[test]
+fn scheduled_messages_are_claimed_once_retried_and_released() {
+    use neutron_core::store::NewScheduled;
+    let (store, id) = store_with_account();
+    let to = vec!["b@example.test".to_string()];
+    let add = |at| {
+        store
+            .add_scheduled(&NewScheduled {
+                account_id: id,
+                send_at: at,
+                subject: "Hi",
+                recipients: "Bob",
+                env_from: "me@example.test",
+                env_to: &to,
+                raw: b"Subject: Hi\r\n\r\nx",
+                replace_draft: None,
+                replace_message_id: Some("<d1@x>"),
+            })
+            .unwrap()
+    };
+    let soon = add(1_000);
+    let later = add(5_000);
+    assert_eq!(store.claim_due_scheduled(2_000).unwrap(), vec![soon]);
+    assert!(
+        store.claim_due_scheduled(2_000).unwrap().is_empty(),
+        "claimed once"
+    );
+    assert!(!store.claim_scheduled(soon).unwrap(), "already sending");
+    store
+        .scheduled_failed(soon, "421 try later", Some(3_000))
+        .unwrap();
+    let s = &store.scheduled().unwrap()[0];
+    assert_eq!((s.state.as_str(), s.attempts), ("waiting", 1));
+    assert_eq!(store.claim_due_scheduled(2_500).unwrap(), Vec::<i64>::new());
+    assert_eq!(store.claim_due_scheduled(3_000).unwrap(), vec![soon]);
+    store.scheduled_failed(soon, "gave up", None).unwrap();
+    assert_eq!(store.scheduled().unwrap()[0].state, "failed");
+    assert!(
+        store.claim_scheduled(soon).unwrap(),
+        "a failed one can be sent now"
+    );
+    store.release_scheduled(soon, Some(9_000)).unwrap();
+    let p = store.scheduled_payload(soon).unwrap();
+    assert_eq!(
+        (p.env_to, p.replace_message_id.as_deref()),
+        (to.clone(), Some("<d1@x>"))
+    );
+    assert!(store.claim_scheduled(later).unwrap());
+    assert_eq!(store.reset_sending_scheduled().unwrap(), 1);
+    store.delete_scheduled(later).unwrap();
+    let left = store.scheduled().unwrap();
+    assert_eq!(
+        (left.len(), left[0].send_at, left[0].attempts),
+        (1, 9_000, 0)
+    );
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-schedule-send"
+description = "Enables the schedule_send command without any pre-configured scope."
+commands.allow = ["schedule_send"]
+
+[[permission]]
+identifier = "deny-schedule-send"
+description = "Denies the schedule_send command without any pre-configured scope."
+commands.deny = ["schedule_send"]

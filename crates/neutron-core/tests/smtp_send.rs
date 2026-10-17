@@ -38,7 +38,7 @@ async fn send_then_receive_and_search() {
     sync::sync_folder(&store, inbox, "INBOX", &mut s)
         .await
         .unwrap();
-    let hits = store.search(acc, &subject, 10).unwrap();
+    let hits = store.search(acc, &subject, None, 10).unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
     let d = store.message_detail(hits[0].summary.id).unwrap();
     assert!(d.text.contains("quokkas"));

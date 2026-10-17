@@ -12,8 +12,10 @@
   import Todo from "./lib/Todo.svelte";
   import Calendar from "./lib/Calendar.svelte";
   import TodayPanel from "./lib/TodayPanel.svelte";
+  import ScheduledList from "./lib/ScheduledList.svelte";
+  import { whenLabel } from "./lib/sendLater";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, type SendResultEvent, pimApi } from "./lib/api";
+    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, type SendResultEvent, type Scheduled, type ScheduledEvent, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -58,6 +60,26 @@
   }
   let query = $state("");
   let hits = $state<SearchHit[] | null>(null);
+  // Search everywhere in the account, or only in the open folder.
+  let searchScope = $state<"all" | "folder">("all");
+  let searchHelp = $state(false);
+  const SEARCH_FILTERS = [
+    { insert: "from:", label: "from:", hint: "sender name or address" },
+    { insert: "to:", label: "to:", hint: "recipient (To or Cc)" },
+    { insert: "subject:", label: "subject:", hint: "word in the subject" },
+    { insert: "has:attachment", label: "has:attachment", hint: "" },
+    { insert: "is:unread", label: "is:unread", hint: "or is:read" },
+    { insert: "is:starred", label: "is:starred", hint: "" },
+    { insert: "after:", label: "after:", hint: "YYYY-MM-DD" },
+    { insert: "before:", label: "before:", hint: "YYYY-MM-DD" },
+  ];
+  function addFilter(f: string) {
+    query = `${query.trimEnd()}${query.trim() ? " " : ""}${f}`;
+    searchHelp = false;
+    document.querySelector<HTMLInputElement>(".search input")?.focus();
+    if (!f.endsWith(":")) onSearch();
+  }
+  function setScope(s: "all" | "folder") { searchScope = s; onSearch(); }
   let syncing = $state(false);
   let status = $state("");
   let showSetup = $state(false);
@@ -227,6 +249,25 @@
     } else if (e.status === "failed") {
       showToast(`Couldn't send: ${e.error}. The message is open again, nothing was lost.`, true);
       reopenMessage(p, "Send failed: edit message");
+    }
+  }
+
+  // ---- send later ----
+  let scheduled = $state<Scheduled[]>([]);
+  let showScheduled = $state(false);
+  async function refreshScheduled() {
+    try { scheduled = await api.listScheduled(); } catch { /* shown when opened */ }
+  }
+  function onScheduled(e: ScheduledEvent) {
+    void refreshScheduled();
+    const to = e.recipients ? ` to ${e.recipients}` : "";
+    if (e.status === "sent") {
+      const r = e.result;
+      const warn = r?.sent_copy === "failed" ? ` (the copy could not be saved to Sent: ${r.sent_copy_error})` : "";
+      showToast(`Scheduled message sent${to}${warn}`, warn !== "");
+      void sync();
+    } else if (e.status === "failed") {
+      showToast(`Couldn't send the scheduled message${to}: ${e.error}. It's kept under Scheduled.`, true);
     }
   }
 
@@ -462,12 +503,14 @@
 
   const MSG_TYPE = "application/x-neutron-messages", FOLDER_TYPE = "application/x-neutron-folder";
   function dragMessages(e: DragEvent, m: MessageSummary) {
-    const ids = picked.includes(m.id) ? picked : [m.id];
+    // A conversation row carries the whole conversation, like the toolbar.
+    const rows = picked.includes(m.id) ? picked : [m.id];
     if (!picked.includes(m.id)) picked = [m.id];
+    const ids = expand(rows);
     e.dataTransfer!.setData(MSG_TYPE, JSON.stringify(ids));
     e.dataTransfer!.effectAllowed = "copyMove";
     const ghost = document.createElement("div");
-    ghost.className = "drag-ghost"; ghost.textContent = ids.length === 1 ? (m.subject || "(no subject)") : `${ids.length} messages`;
+    ghost.className = "drag-ghost"; ghost.textContent = rows.length === 1 ? (m.subject || "(no subject)") + (ids.length > 1 ? ` (${ids.length})` : "") : `${ids.length} messages`;
     document.body.appendChild(ghost); e.dataTransfer!.setDragImage(ghost, 10, 10);
     setTimeout(() => ghost.remove(), 0);
   }
@@ -620,10 +663,11 @@
   function onSearch() {
     clearTimeout(searchTimer);
     const request = ++searchRequest, version = accountVersion, id = account?.id, text = query;
+    const folderId = searchScope === "folder" ? folder?.id ?? null : null;
     if (!id || !text.trim()) { hits = null; return; }
     searchTimer = setTimeout(async () => {
       try {
-        const result = await api.search(id, text);
+        const result = await api.search(id, text, folderId);
         if (version === accountVersion && request === searchRequest && query === text) hits = result;
       } catch (e) { if (version === accountVersion && request === searchRequest) status = errorText(e); }
     }, 200);
@@ -646,6 +690,11 @@
     untrack(() => { if (selectedId !== null) void reload(loadRemote, true); });
   });
   async function composerDone(r: ComposerResult) {
+    if (r.kind === "scheduled") {
+      scheduled = [...scheduled.filter((s) => s.id !== r.item.id), r.item].sort((a, b) => a.send_at - b.send_at);
+      showToast(`Scheduled for ${whenLabel(new Date(r.item.send_at * 1000))}${r.item.recipients ? ` to ${r.item.recipients}` : ""}`);
+      return;
+    }
     if (r.kind === "queued") {
       const delay = r.delay;
       pendingSends = [...pendingSends, { id: r.id, account: r.account, draft: r.draft, replaceDraft: r.replaceDraft,
@@ -689,7 +738,9 @@
         // A clicked new-mail notification opens its message.
         const u6 = await api.onOpenMessage((e) => { void openMessageById(e.message_id); });
         const u7 = await api.onSendResult(onSendResult);
-        unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); };
+        const u8 = await api.onScheduled(onScheduled);
+        unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); };
+        void refreshScheduled();
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
       } catch (e) { status = errorText(e); }
     })();
@@ -697,7 +748,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onKey} onclick={() => { menu = null; msgMenu = null; }} />
+<svelte:window onkeydown={onKey} onclick={() => { menu = null; msgMenu = null; searchHelp = false; }} />
 {#if showRules && account}
   <main class="setup-wrap">
     <Rules {account} {folders} testMessage={detail ? { id: detail.id, subject: detail.subject } : null}
@@ -757,6 +808,10 @@
           ondragover={(e) => over(e, null)} ondragleave={() => (dropTarget = null)} ondrop={(e) => drop(e, null)} role="presentation">Drop here for top level</div>
       </nav>
       <div class="spacer"></div>
+      {#if scheduled.length}
+        <button class="scheduled-btn" class:failed={scheduled.some((s) => s.state === "failed")} onclick={() => { showScheduled = true; void refreshScheduled(); }}>
+          <Icon name="calendar" size={15} /> Scheduled <span class="badge">{scheduled.length}</span></button>
+      {/if}
       <div class="accounts">
         {#each accounts as a (a.id)}
           <button class="acct" class:active={a.id === account.id} onclick={() => selectAccount(a)} title={a.email}>{a.email}</button>
@@ -786,7 +841,25 @@
       <div class="search">
         <Icon name="search" />
         <input placeholder="Search messages…" bind:value={query} oninput={onSearch} aria-label="Search messages" />
+        <button class="filters-btn" class:on={searchHelp} onclick={(e) => { e.stopPropagation(); searchHelp = !searchHelp; }}
+          aria-expanded={searchHelp} aria-label="Search filters" title="Search filters">
+          <Icon name="filter" size={15} /></button>
+        {#if searchHelp}
+          <div class="filters-pop" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === "Escape") searchHelp = false; }}>
+            <p class="muted">Add a filter, then type its value. Combine as many as you like.</p>
+            {#each SEARCH_FILTERS as f (f.insert)}
+              <button role="menuitem" onclick={() => addFilter(f.insert)}><code>{f.label}</code>{#if f.hint}<span class="muted">{f.hint}</span>{/if}</button>
+            {/each}
+          </div>
+        {/if}
       </div>
+      {#if query.trim()}
+        <div class="scope" role="radiogroup" aria-label="Where to search">
+          <button role="radio" aria-checked={searchScope === "all"} class:on={searchScope === "all"} onclick={() => setScope("all")}>All folders</button>
+          <button role="radio" aria-checked={searchScope === "folder"} class:on={searchScope === "folder"} onclick={() => setScope("folder")}
+            disabled={!folder}>{folder ? `Only ${leafName(folder)}` : "This folder"}</button>
+        </div>
+      {/if}
       <div class="meta muted">
         {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length).toLocaleString()} message${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length) === 1 ? "" : "s"}`}
         <span class="status" title={status}>{status}</span>
@@ -900,6 +973,10 @@
       <button role="menuitem" class="danger" onclick={() => askDelete(f)} disabled={isProtected(f)}>Delete…</button>
       {#if isProtected(f)}<div class="muted small pad">Special folder: protected</div>{/if}
     </div>
+  {/if}
+  {#if showScheduled}
+    <ScheduledList items={scheduled} {accounts} onClose={() => (showScheduled = false)} onChanged={refreshScheduled}
+      onStatus={(t, w) => { showToast(t, w); if (t.startsWith("Moved back")) void sync(); }} />
   {/if}
   {#if ask}
     <div class="modal" role="dialog" aria-modal="true" aria-label={ask.title}>
@@ -1017,6 +1094,11 @@
   .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .badge { background: var(--accent); color: #fff; border-radius: 10px; font-size: 12px; padding: 1px 8px; }
   .spacer { flex: 1; }
+  .scheduled-btn { border: 0; background: transparent; text-align: left; padding: 7px 12px; border-radius: 8px; font-size: 13px;
+    display: flex; gap: 8px; align-items: center; color: inherit; cursor: pointer; margin-bottom: 4px; }
+  .scheduled-btn:hover { background: var(--hover); }
+  .scheduled-btn .badge { margin-left: auto; }
+  .scheduled-btn.failed { color: #e5534b; }
   .accounts { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--border); padding-top: 8px; }
   .acct { border: 0; background: transparent; text-align: left; padding: 6px 12px; border-radius: 8px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; gap: 6px; align-items: center; }
   .acct.active { color: var(--text); } .acct:hover { background: var(--hover); }
@@ -1026,7 +1108,21 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .list { background: var(--panel-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
   .search { display: flex; align-items: center; gap: 8px; margin: 14px 14px 6px; padding: 0 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); }
-  .search input { border: 0; background: transparent; flex: 1; padding: 10px 0; outline: none; }
+  .search input { border: 0; background: transparent; flex: 1; padding: 10px 0; outline: none; min-width: 0; }
+  .search { position: relative; }
+  .filters-btn { border: 0; background: transparent; color: var(--muted); padding: 4px; border-radius: 6px; display: flex; cursor: pointer; }
+  .filters-btn:hover, .filters-btn.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .filters-pop { position: absolute; top: calc(100% + 4px); right: 0; left: 0; z-index: 30; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.18); display: flex; flex-direction: column; gap: 2px; color: var(--text); }
+  .filters-pop p { margin: 2px 6px 6px; font-size: 12px; }
+  .filters-pop button { display: flex; justify-content: space-between; gap: 8px; border: 0; background: transparent; text-align: left;
+    padding: 5px 8px; border-radius: 6px; cursor: pointer; color: inherit; font-size: 13px; }
+  .filters-pop button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .filters-pop code { font-size: 12px; }
+  .scope { display: flex; gap: 4px; margin: 0 14px 4px; }
+  .scope button { border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 999px; padding: 2px 10px;
+    font-size: 12px; cursor: pointer; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scope button.on { border-color: var(--accent); color: var(--accent); }
   .meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 4px 18px 8px; }
   .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
   .threads { border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); border-radius: 999px; padding: 0 8px; font-size: 11px; flex: none; }

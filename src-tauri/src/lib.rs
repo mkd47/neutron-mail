@@ -11,6 +11,8 @@ mod outbox;
 mod pim;
 mod print;
 mod providers;
+mod scheduled;
+mod templates;
 mod vacation;
 mod watcher;
 
@@ -182,6 +184,7 @@ pub fn run() {
                 watcher::start(app.handle(), a.id);
             }
             pim::start_reminders(app.handle());
+            scheduled::start(app.handle());
             watcher::open_on_notification_click(app.handle());
             Ok(())
         })
@@ -216,6 +219,14 @@ pub fn run() {
             outbox::queue_send,
             outbox::cancel_send,
             outbox::send_now,
+            scheduled::schedule_send,
+            scheduled::list_scheduled,
+            scheduled::send_scheduled_now,
+            scheduled::reschedule,
+            scheduled::cancel_scheduled,
+            templates::list_templates,
+            templates::save_template,
+            templates::delete_template,
             vacation::get_auto_reply,
             vacation::auto_reply_server_support,
             vacation::set_auto_reply,

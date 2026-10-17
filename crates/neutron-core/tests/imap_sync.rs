@@ -71,7 +71,7 @@ async fn sync_over_implicit_tls() {
     assert_eq!(d.attachments[0].name, "report.pdf");
 
     // Search over synced content.
-    let hits = store.search(acc, "zeppel", 20).unwrap();
+    let hits = store.search(acc, "zeppel", None, 20).unwrap();
     assert_eq!(hits.len(), 3, "{hits:?}");
     assert!(hits.iter().any(|h| h.snippet.contains('\u{2}')));
 

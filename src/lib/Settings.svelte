@@ -17,6 +17,9 @@
   let signature = $state("");
   let syncDays = $state(0);
   let identities = $state<MailAddress[]>([]);
+  let aliasSigs = $state<Record<string, string>>({});
+  // Which alias has its signature editor open (by row index).
+  let sigOpen = $state<number | null>(null);
   let undoDelay = $state(undoSendSeconds());
   let senders = $state<string[]>([]);
   let prefsBusy = $state(false);
@@ -37,15 +40,21 @@
       const [s, list] = await Promise.all([api.getAccountSettings(account.id), api.listImageSenders(account.id)]);
       settings = s; signature = s.signature_html; syncDays = s.sync_days; senders = list;
       identities = (s.identities ?? []).map((i) => ({ ...i }));
+      aliasSigs = { ...(s.identity_signatures ?? {}) };
     } catch (e) { loadError = errorText(e); }
   });
 
   async function savePrefs() {
     prefsBusy = true; prefsMsg = null;
     try {
+      const kept = identities.filter((i) => i.email.trim());
+      const identity_signatures = Object.fromEntries(kept
+        .map((i) => [i.email.trim().toLowerCase(), aliasSigs[i.email.trim().toLowerCase()] ?? ""] as const)
+        .filter(([, h]) => h.replace(/<[^>]*>|&nbsp;/g, "").trim() || h.includes("<img")));
       const saved = await api.setAccountSettings(account.id, { signature_html: signature, sync_days: syncDays,
-        identities: identities.filter((i) => i.email.trim()) });
+        identities: kept, identity_signatures });
       identities = saved.identities.map((i) => ({ ...i }));
+      aliasSigs = { ...(saved.identity_signatures ?? {}) };
       const narrowed = settings !== null && saved.sync_days !== 0 && (settings.sync_days === 0 || saved.sync_days < settings.sync_days);
       settings = saved;
       prefsMsg = { text: narrowed ? "Saved. Older mail will be dropped from the local cache at the next sync (it stays on the server)." : "Saved.", error: false };
@@ -91,11 +100,23 @@
         sending as these addresses. Replies use the alias the message was sent to.</p>
       <div class="ids">
         {#each identities as id, i (i)}
+          {@const key = id.email.trim().toLowerCase()}
           <div class="id-row">
             <input placeholder="Name (optional)" bind:value={id.name} maxlength="200" aria-label={`Alias ${i + 1} name`} />
             <input placeholder="alias@example.com" type="email" bind:value={id.email} maxlength="320" aria-label={`Alias ${i + 1} address`} />
-            <button class="btn sm" onclick={() => (identities = identities.filter((_, j) => j !== i))} aria-label={`Remove alias ${i + 1}`}>Remove</button>
+            <button class="btn sm" onclick={() => (sigOpen = sigOpen === i ? null : i)} disabled={!key} aria-expanded={sigOpen === i}
+              title="Signature for mail sent from this address">{aliasSigs[key] ? "Signature ✓" : "Signature"}</button>
+            <button class="btn sm" onclick={() => { identities = identities.filter((_, j) => j !== i); sigOpen = null; }} aria-label={`Remove alias ${i + 1}`}>Remove</button>
           </div>
+          {#if sigOpen === i && key}
+            <div class="alias-sig">
+              <p class="muted">Signature for mail from {key}. Leave empty to use the account signature above.</p>
+              {#key key}
+                <div class="sig"><RichEditor html={aliasSigs[key] ?? ""} onInput={(h) => (aliasSigs = { ...aliasSigs, [key]: h })}
+                  onError={(m) => (prefsMsg = { text: m, error: true })} /></div>
+              {/key}
+            </div>
+          {/if}
         {/each}
         {#if identities.length < 20}
           <button class="btn sm add" onclick={() => (identities = [...identities, { name: "", email: "" }])}>+ Add sender address</button>
@@ -165,6 +186,7 @@
   .ids { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
   .id-row { display: flex; gap: 6px; width: 100%; }
   .id-row input { flex: 1; min-width: 0; }
+  .alias-sig { width: 100%; display: flex; flex-direction: column; gap: 6px; padding: 8px 0 4px 12px; border-left: 2px solid var(--border); }
   .sig { border: 1px solid var(--border); border-radius: 10px; min-height: 120px; display: flex; flex-direction: column; padding: 0 10px; }
   select { align-self: flex-start; }
   .actions button { white-space: nowrap; }

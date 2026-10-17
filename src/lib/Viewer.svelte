@@ -254,7 +254,7 @@
     // A queued send or saved draft is always reported, even if another
     // message was opened meanwhile (the Undo bar and failure recovery need it).
     if (isCurrent(origin) && reply?.key === key) reply = null;
-    else if (r.kind !== "queued" && r.kind !== "draft") return;
+    else if (r.kind !== "queued" && r.kind !== "draft" && r.kind !== "scheduled") return;
     onComposerDone(r);
   }
 </script>

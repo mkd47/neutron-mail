@@ -7,7 +7,8 @@
   import RichEditor from "./RichEditor.svelte";
   import { size } from "./format";
   import { undoSendSeconds } from "./prefs";
-  import { api, errorText, type Account, type ComposeDraft, type ComposerResult, type ForwardedAttachment, type MailAddress, type PickedAttachment } from "./api";
+  import { fromLocalInput, laterChoices, toLocalInput, type LaterChoice } from "./sendLater";
+  import { api, errorText, type Account, type ComposeDraft, type ComposerResult, type ForwardedAttachment, type MailAddress, type PickedAttachment, type Template } from "./api";
 
   let { account, draft, title, inline = false, replaceDraft = null, onDone }:
     { account: Account; draft: ComposeDraft; title: string; inline?: boolean; replaceDraft?: number | null;
@@ -35,9 +36,96 @@
   let identities = $state<MailAddress[]>([]);
   // svelte-ignore state_referenced_locally
   let from = $state<string>(init.from ?? account.email);
+  // Signatures by sender: switching From swaps the signature in the text.
+  let signatures = { base: "", ids: {} as Record<string, string> };
   onMount(() => {
-    api.getAccountSettings(account.id).then((s) => { identities = s.identities ?? []; }).catch(() => {});
+    api.getAccountSettings(account.id).then((s) => {
+      identities = s.identities ?? [];
+      signatures = { base: s.signature_html ?? "", ids: s.identity_signatures ?? {} };
+    }).catch(() => {});
   });
+  const sigFor = (addr: string) => {
+    const own = signatures.ids[addr.trim().toLowerCase()];
+    return own?.trim() ? own : signatures.base;
+  };
+  /** Replace the "-- " signature block (or add one); null if nothing to do. */
+  function swapSignatureHtml(h: string, next: string): string | null {
+    const doc = new DOMParser().parseFromString(h, "text/html"); // inert
+    const kids = [...doc.body.children];
+    const dash = kids.find((k) => k.textContent?.trim() === "--" && k.nextElementSibling);
+    if (dash) {
+      const sig = dash.nextElementSibling!;
+      if (next.trim()) sig.innerHTML = next;
+      else { sig.remove(); dash.remove(); }
+      return doc.body.innerHTML;
+    }
+    if (!next.trim()) return null;
+    const first = kids[0];
+    const block = `<div>-- </div><div>${next}</div>`;
+    if (first && first.tagName === "P" && !first.textContent?.trim()) {
+      first.insertAdjacentHTML("afterend", block + (kids.length > 1 ? "<p><br></p>" : ""));
+      return doc.body.innerHTML;
+    }
+    return `<p><br></p>${block}${h.trim() ? `<p><br></p>${h}` : ""}`;
+  }
+  function swapSignatureText(t: string, prev: string, next: string): string | null {
+    const prevText = prev.trim() ? htmlToText(prev).trim() : "";
+    const nextText = next.trim() ? htmlToText(next).trim() : "";
+    if (prevText) {
+      const at = t.indexOf(`-- \n${prevText}`);
+      if (at < 0) return null;
+      const end = at + 4 + prevText.length;
+      return t.slice(0, at) + (nextText ? `-- \n${nextText}` : "") + t.slice(end + (nextText ? 0 : 1));
+    }
+    return nextText ? `\n\n-- \n${nextText}\n${t.replace(/^\n+/, "")}` : null;
+  }
+  // ---- templates ----
+  let editor: RichEditor | undefined = $state();
+  let templates = $state<Template[] | null>(null);
+  let templatesOpen = $state(false);
+  let templateName = $state<string | null>(null);
+  let templateError = $state("");
+  async function openTemplates() {
+    templatesOpen = !templatesOpen; templateName = null; templateError = "";
+    if (templatesOpen) {
+      try { templates = await api.listTemplates(); } catch (e) { templateError = errorText(e); }
+    }
+  }
+  function useTemplate(t: Template) {
+    templatesOpen = false;
+    if (rich && editor) { editor.insertHtml(t.html); return; }
+    const text = htmlToText(t.html).trim();
+    const at = bodyEl?.selectionStart ?? 0;
+    body = body.slice(0, at) + text + body.slice(at);
+  }
+  async function saveTemplate() {
+    const name = templateName?.trim() ?? "";
+    if (!name) { templateError = "Give the template a name."; return; }
+    try {
+      const t = await api.saveTemplate(null, name, rich ? html : textToHtml(body));
+      templates = [...(templates ?? []), t].sort((a, b) => a.name.localeCompare(b.name));
+      templateName = null; templateError = "";
+      notice = `Saved template “${t.name}”.`;
+    } catch (e) { templateError = errorText(e); }
+  }
+  async function deleteTemplate(t: Template) {
+    try { await api.deleteTemplate(t.id); templates = (templates ?? []).filter((x) => x.id !== t.id); }
+    catch (e) { templateError = errorText(e); }
+  }
+
+  function changeFrom(next: string) {
+    const prev = sigFor(from);
+    const sig = sigFor(next);
+    from = next;
+    if (prev === sig) return;
+    if (rich) {
+      const h = swapSignatureHtml(html, sig);
+      if (h !== null) { html = h; editorKey++; }
+    } else {
+      const t = swapSignatureText(body, prev, sig);
+      if (t !== null) body = t;
+    }
+  }
 
   // ---- automatic draft saving ----
   // Every 30 s, if anything changed, the draft is stored in Drafts; each save
@@ -158,6 +246,29 @@
       onDone({ kind: "queued", id, account, draft: snapshot(), replaceDraft: resumedId, delay });
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
+  // ---- send later ----
+  let laterOpen = $state(false);
+  let laterList = $state<LaterChoice[]>([]);
+  let laterCustom = $state("");
+  function openLater() {
+    laterOpen = !laterOpen;
+    if (laterOpen) {
+      laterList = laterChoices();
+      laterCustom = toLocalInput(laterList.find((c) => c.label.startsWith("Tomorrow morning"))?.at ?? new Date(Date.now() + 3_600_000));
+    }
+  }
+  async function sendLater(when: Date | null) {
+    if (busy) return;
+    if (!when || when.getTime() < Date.now() + 30_000) { error = "Pick a time in the future."; return; }
+    if (!to.length && !cc.length && !bcc.length) { error = "Add at least one recipient."; return; }
+    laterOpen = false; busy = "send"; error = "";
+    try {
+      if (saving) await saving;
+      const item = await api.scheduleSend(account.id, message(), resumedId, draftMid, Math.floor(when.getTime() / 1000));
+      closed = true;
+      onDone({ kind: "scheduled", item });
+    } catch (e) { error = errorText(e); } finally { busy = ""; }
+  }
   async function saveDraft() {
     if (busy) return;
     busy = "draft"; error = "";
@@ -181,13 +292,19 @@
   }
 </script>
 
+<svelte:window onclick={(e) => {
+  const t = e.target as Element;
+  if (templatesOpen && !t.closest?.(".tpl-wrap")) templatesOpen = false;
+  if (laterOpen && !t.closest?.(".send-split")) laterOpen = false;
+}} />
+
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <section class="composer" class:inline aria-label={title} onkeydown={onKey} role="form">
   <header>
     <strong>{title}</strong>
     {#if identities.length}
       <label class="from muted">from
-        <select bind:value={from} aria-label="From">
+        <select value={from} onchange={(e) => changeFrom((e.currentTarget as HTMLSelectElement).value)} aria-label="From">
           <option value={account.email}>{account.display_name || account.email} &lt;{account.email}&gt;</option>
           {#each identities as i (i.email)}<option value={i.email}>{i.name || account.display_name || i.email} &lt;{i.email}&gt;</option>{/each}
           {#if from.toLowerCase() !== account.email.toLowerCase() && !identities.some((i) => i.email.toLowerCase() === from.toLowerCase())}
@@ -207,7 +324,7 @@
   <label class="subject"><span>Subject</span><input bind:value={subject} aria-label="Subject" /></label>
   {#if rich}
     {#key editorKey}
-      <RichEditor {html} focusStart={inline && init.to.length > 0} onInput={(h) => (html = h)} onError={(m) => (notice = m)} />
+      <RichEditor bind:this={editor} {html} focusStart={inline && init.to.length > 0} onInput={(h) => (html = h)} onError={(m) => (notice = m)} />
     {/key}
   {:else}
     <textarea bind:this={bodyEl} bind:value={body} placeholder="Write your message…" aria-label="Message body"></textarea>
@@ -228,11 +345,56 @@
   {#if notice}<p class="notice" role="status">{notice}</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   <footer>
-    <button type="button" class="btn primary" onclick={send} disabled={busy !== ""}>{busy === "send" ? "Sending…" : "Send"}</button>
+    <span class="send-split">
+      <button type="button" class="btn primary send-main" onclick={send} disabled={busy !== ""}>{busy === "send" ? "Sending…" : "Send"}</button>
+      <button type="button" class="btn primary send-more" onclick={openLater} disabled={busy !== ""} aria-expanded={laterOpen}
+        aria-label="Send later" title="Send later"><Icon name="chevron" size={12} /></button>
+      {#if laterOpen}
+        <div class="later-pop" role="menu" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); laterOpen = false; } }}>
+          <p class="muted">Send later</p>
+          {#each laterList as c (c.label)}
+            <button type="button" role="menuitem" onclick={() => sendLater(c.at)}>{c.label}</button>
+          {/each}
+          <div class="later-custom">
+            <input type="datetime-local" bind:value={laterCustom} aria-label="Send at" />
+            <button type="button" class="btn small primary" onclick={() => sendLater(fromLocalInput(laterCustom))}>Schedule</button>
+          </div>
+          <p class="muted hint">Sent by Neutron Mail: if it's closed at that time, the message goes out when you next open it.</p>
+        </div>
+      {/if}
+    </span>
     <button type="button" class="btn" onclick={pick} disabled={busy !== ""} title="Attach files"><Icon name="clip" size={15} /> Attach</button>
     <button type="button" class="btn ghost small" onclick={toggleRich} disabled={busy !== ""}
       title={rich ? "Send as plain text only" : "Use rich text (HTML)"}>{rich ? "Plain text" : "Rich text"}</button>
     <button type="button" class="btn" onclick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "Saving…" : "Save draft"}</button>
+    <span class="tpl-wrap">
+      <button type="button" class="btn ghost small" onclick={openTemplates} aria-expanded={templatesOpen} disabled={busy !== ""}
+        title="Insert a saved text, or save this one">Templates</button>
+      {#if templatesOpen}
+        <div class="tpl-pop" role="dialog" aria-label="Templates" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); templatesOpen = false; } }}>
+          {#if templates === null}<p class="muted">Loading…</p>
+          {:else if !templates.length}<p class="muted">No templates yet. Write a text you use often, then save it here.</p>
+          {:else}
+            <ul>
+              {#each templates as t (t.id)}
+                <li><button type="button" class="tpl-use" onclick={() => useTemplate(t)} title={htmlToText(t.html).slice(0, 200)}>{t.name}</button>
+                  <button type="button" class="tpl-del" onclick={() => deleteTemplate(t)} aria-label={`Delete template ${t.name}`}>×</button></li>
+              {/each}
+            </ul>
+          {/if}
+          {#if templateName === null}
+            <button type="button" class="link" onclick={() => (templateName = subject.trim().slice(0, 100))}>Save this message as a template…</button>
+          {:else}
+            <div class="tpl-save">
+              <input bind:value={templateName} maxlength="100" placeholder="Template name" aria-label="Template name"
+                onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); void saveTemplate(); } }} />
+              <button type="button" class="btn small primary" onclick={saveTemplate}>Save</button>
+            </div>
+          {/if}
+          {#if templateError}<p class="error" role="alert">{templateError}</p>{/if}
+        </div>
+      {/if}
+    </span>
     <span class="spacer"></span>
     <span class="saved muted" role="status" aria-live="polite" title={saveNote}>
       {#if autosave === "saving"}Saving…{:else if saveNote}{saveNote.startsWith("Autosave paused") ? "Autosave paused" : "Not saved"}{:else if savedAt}Saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{/if}
@@ -242,6 +404,34 @@
 </section>
 
 <style>
+  .send-split { position: relative; display: inline-flex; }
+  .send-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .send-more { border-top-left-radius: 0; border-bottom-left-radius: 0; padding-left: 6px; padding-right: 6px;
+    border-left: 1px solid color-mix(in srgb, #fff 35%, transparent); display: flex; align-items: center; }
+  .send-more :global(svg) { transform: rotate(90deg); }
+  .later-pop { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; width: 290px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.2);
+    display: flex; flex-direction: column; gap: 2px; }
+  .later-pop p { margin: 2px 6px 4px; font-size: 12px; }
+  .later-pop .hint { margin-top: 6px; font-size: 11px; }
+  .later-pop > button { border: 0; background: transparent; text-align: left; padding: 7px 8px; border-radius: 6px; cursor: pointer; color: inherit; }
+  .later-pop > button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .later-custom { display: flex; gap: 6px; padding: 6px 4px 0; border-top: 1px solid var(--border); margin-top: 4px; }
+  .later-custom input { flex: 1; min-width: 0; }
+  .tpl-wrap { position: relative; }
+  .tpl-pop { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; width: 280px; max-height: 320px; overflow: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.2);
+    display: flex; flex-direction: column; gap: 6px; }
+  .tpl-pop p { margin: 2px 4px; font-size: 12px; }
+  .tpl-pop ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+  .tpl-pop li { display: flex; align-items: center; }
+  .tpl-use { flex: 1; text-align: left; border: 0; background: transparent; padding: 6px 8px; border-radius: 6px; cursor: pointer; color: inherit;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tpl-use:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .tpl-del { border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 2px 8px; font-size: 16px; }
+  .tpl-save { display: flex; gap: 6px; }
+  .tpl-save input { flex: 1; min-width: 0; }
+  .tpl-pop .link { align-self: flex-start; }
   .composer { display: flex; flex-direction: column; gap: 4px; background: var(--panel); min-height: 0; height: 100%; }
   .composer.inline { border: 1px solid var(--border); border-radius: 14px; padding: 12px 16px; box-shadow: 0 -6px 24px #0003; }
   header { display: flex; align-items: baseline; gap: 10px; padding-bottom: 4px; }

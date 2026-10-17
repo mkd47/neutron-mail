@@ -356,8 +356,13 @@ pub fn message_source(state: State<'_, AppState>, message_id: i64) -> Res<String
 }
 
 #[tauri::command]
-pub fn search(state: State<'_, AppState>, account_id: i64, query: String) -> Res<Vec<SearchHit>> {
-    state.store.search(account_id, &query, 100)
+pub fn search(
+    state: State<'_, AppState>,
+    account_id: i64,
+    query: String,
+    folder_id: Option<i64>,
+) -> Res<Vec<SearchHit>> {
+    state.store.search(account_id, &query, folder_id, 200)
 }
 
 #[tauri::command]
@@ -378,7 +383,9 @@ pub fn compose_prefill(
     if matches!(mode, compose::Mode::Draft) {
         return Ok(draft); // a resumed draft already has whatever signature it had
     }
-    Ok(compose::with_signature(draft, &settings.signature_html))
+    // Replies use the alias the message was sent to, and its signature.
+    let sig = settings.signature_for(draft.from.as_deref()).to_string();
+    Ok(compose::with_signature(draft, &sig))
 }
 
 /// An empty draft for new mail, with the account's signature.
@@ -396,7 +403,7 @@ pub fn analyze_link(url: String) -> Res<links::LinkInfo> {
 /// Resolve composer attachment references to content. File tokens come
 /// from the native picker; message attachments must belong to the same
 /// account.
-fn resolve_attachments(
+pub(crate) fn resolve_attachments(
     state: &AppState,
     account_id: i64,
     refs: &[AttachmentRef],
@@ -423,7 +430,7 @@ fn resolve_attachments(
 }
 
 /// Remove a resumed draft from the server and the cache.
-async fn delete_draft(
+pub(crate) async fn delete_draft(
     state: &AppState,
     account: &Account,
     password: &str,
@@ -444,7 +451,7 @@ async fn delete_draft(
 /// Remove earlier autosaved copies of a draft (same Message-ID) from the
 /// Drafts folder, on the server and in the cache. Needs UIDPLUS, like any
 /// single-message delete.
-async fn delete_drafts_by_message_id(
+pub(crate) async fn delete_drafts_by_message_id(
     state: &AppState,
     account: &Account,
     password: &str,
@@ -493,6 +500,34 @@ pub(crate) async fn deliver(
         attachments = files.len(),
         "message sent"
     );
+    let result = after_send(
+        state,
+        &account,
+        &password,
+        &raw,
+        replace_draft,
+        replace_message_id,
+    )
+    .await?;
+    for t in message.attachments.iter() {
+        if let AttachmentRef::File { token } = t {
+            attachments::forget(state, token);
+        }
+    }
+    Ok(result)
+}
+
+/// After a message went out: APPEND the copy to Sent and remove the drafts
+/// it replaces. Failures here are reported, not raised: the mail is sent.
+pub(crate) async fn after_send(
+    state: &AppState,
+    account: &Account,
+    password: &str,
+    raw: &[u8],
+    replace_draft: Option<i64>,
+    replace_message_id: Option<&str>,
+) -> Res<SendResult> {
+    let account_id = account.id;
     let mut result = SendResult {
         sent_copy: "no_sent_folder",
         sent_copy_error: None,
@@ -500,8 +535,8 @@ pub(crate) async fn deliver(
     };
     if let Some(sent) = state.store.folder_by_role(account_id, "sent")? {
         let res = async {
-            let mut s = imap::connect(&account.config, &password).await?;
-            imap::append(&mut s, &sent.name, &raw, true).await?;
+            let mut s = imap::connect(&account.config, password).await?;
+            imap::append(&mut s, &sent.name, raw, true).await?;
             drop(s.logout().await);
             Ok::<_, Error>(())
         }
@@ -516,18 +551,13 @@ pub(crate) async fn deliver(
         }
     }
     if let Some(draft) = replace_draft {
-        if let Err(e) = delete_draft(state, &account, &password, draft).await {
+        if let Err(e) = delete_draft(state, account, password, draft).await {
             result.draft_cleanup_error = Some(e.to_string());
         }
     }
     if let Some(mid) = replace_message_id.filter(|m| !m.is_empty()) {
-        if let Err(e) = delete_drafts_by_message_id(state, &account, &password, mid).await {
+        if let Err(e) = delete_drafts_by_message_id(state, account, password, mid).await {
             result.draft_cleanup_error.get_or_insert(e.to_string());
-        }
-    }
-    for t in message.attachments.iter() {
-        if let AttachmentRef::File { token } = t {
-            attachments::forget(state, token);
         }
     }
     Ok(result)
