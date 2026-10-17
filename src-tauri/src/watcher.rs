@@ -112,9 +112,21 @@ async fn notify_new(
                 .join("\n"),
         )
     };
-    match neutron_core::gnome::notify(&summary, &body, *last_id).await {
+    match neutron_core::gnome::notify_clickable(&summary, &body, *last_id).await {
         Ok(id) => {
             *last_id = id;
+            // Clicking it opens the newest of the new messages.
+            let mut map = state.notified.lock().unwrap_or_else(|p| p.into_inner());
+            if map.len() > 200 {
+                map.clear();
+            }
+            map.insert(
+                id,
+                (
+                    state.store.message_account(first.id).unwrap_or_default(),
+                    first.id,
+                ),
+            );
             tracing::info!(count = new.len(), "new-mail notification shown");
         }
         Err(e) => tracing::info!("desktop notification failed: {e}"),
@@ -177,4 +189,49 @@ async fn wait_for_change(state: &AppState, account_id: i64) -> neutron_core::Res
     tracing::debug!(account = account_id, changed, "IDLE returned");
     drop(session.logout().await);
     Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct OpenMessage {
+    account_id: i64,
+    message_id: i64,
+}
+
+/// Bring the window forward and open the message when a new-mail
+/// notification is clicked. Without a session bus this just does nothing.
+pub fn open_on_notification_click(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let handle = app.clone();
+        let res = neutron_core::gnome::watch_notification_clicks(move |id| {
+            let state = handle.state::<AppState>();
+            let target = state
+                .notified
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .copied();
+            let Some((account_id, message_id)) = target else {
+                return;
+            };
+            if let Some(w) = handle.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            if let Err(e) = handle.emit(
+                "mail://open-message",
+                OpenMessage {
+                    account_id,
+                    message_id,
+                },
+            ) {
+                tracing::warn!("emit failed: {e}");
+            }
+        })
+        .await;
+        if let Err(e) = res {
+            tracing::info!("notification clicks unavailable: {e}");
+        }
+    });
 }

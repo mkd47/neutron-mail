@@ -649,6 +649,48 @@ pub fn notification_escape(s: &str) -> String {
 /// Show a desktop notification via `org.freedesktop.Notifications`
 /// (GNOME Shell). `replaces` lets one bubble be updated instead of stacking.
 pub async fn notify(summary: &str, body: &str, replaces: u32) -> Result<u32> {
+    send_notification(summary, body, replaces, false).await
+}
+
+/// Like [`notify`], but clicking the notification invokes its default
+/// action; [`watch_notification_clicks`] reports the click with the id
+/// returned here.
+pub async fn notify_clickable(summary: &str, body: &str, replaces: u32) -> Result<u32> {
+    send_notification(summary, body, replaces, true).await
+}
+
+/// Call `on_click(id)` whenever the user clicks one of our notifications
+/// (its "default" action). Runs until the session bus goes away.
+pub async fn watch_notification_clicks(mut on_click: impl FnMut(u32) + Send) -> Result<()> {
+    use futures::StreamExt;
+    let conn = timed(zbus::Connection::session()).await?;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.Notifications")
+        .map_err(dbus_err)?
+        .member("ActionInvoked")
+        .map_err(dbus_err)?
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, Some(16))
+        .await
+        .map_err(dbus_err)?;
+    while let Some(msg) = stream.next().await {
+        let Ok(msg) = msg else { continue };
+        if let Ok((id, action)) = msg.body().deserialize::<(u32, String)>() {
+            if action == "default" {
+                on_click(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_notification(
+    summary: &str,
+    body: &str,
+    replaces: u32,
+    clickable: bool,
+) -> Result<u32> {
     let conn = timed(zbus::Connection::session()).await?;
     let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
     hints.insert("desktop-entry", zbus::zvariant::Value::from("Neutron Mail"));
@@ -664,7 +706,11 @@ pub async fn notify(summary: &str, body: &str, replaces: u32) -> Result<u32> {
             "mail-unread",
             notification_escape(summary),
             notification_escape(body),
-            Vec::<&str>::new(),
+            if clickable {
+                vec!["default", "Open"]
+            } else {
+                Vec::new()
+            },
             hints,
             -1i32,
         ),

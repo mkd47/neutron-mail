@@ -34,6 +34,7 @@ fn main() {
             "analyze_link",
             "pick_attachments",
             "save_attachment",
+            "save_all_attachments",
             "open_attachment",
             "suggest_contacts",
             "contacts_status",

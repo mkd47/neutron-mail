@@ -171,6 +171,9 @@ pub struct AttachmentInfo {
     pub size: usize,
     /// Executable/script type: the UI must confirm before opening.
     pub risky: bool,
+    /// An image already shown inside the message body (e.g. a signature
+    /// logo); the UI lists it separately from real attachments.
+    pub inline: bool,
 }
 
 /// One mailbox from an address header (name may be empty).

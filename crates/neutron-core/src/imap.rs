@@ -148,6 +148,7 @@ fn role_of(name: &str, attrs: &[NameAttribute<'_>]) -> Option<&'static str> {
 async fn checked_names(
     session: &mut Session,
     command: &str,
+    utf8: bool,
 ) -> std::result::Result<Vec<RemoteFolder>, async_imap::error::Error> {
     use async_imap::error::Error as ImapError;
     use async_imap::imap_proto::{MailboxDatum, Response, Status};
@@ -175,7 +176,7 @@ async fn checked_names(
             Response::MailboxData(MailboxDatum::List(data)) => {
                 folders.push(RemoteFolder {
                     name: data.name.to_string(),
-                    display: crate::mutf7::decode(&data.name),
+                    display: display_name(&data.name, utf8),
                     role: role_of(&data.name, &data.name_attributes),
                     selectable: !data
                         .name_attributes
@@ -191,9 +192,11 @@ async fn checked_names(
 }
 
 pub async fn list_folders(session: &mut Session) -> Result<Vec<RemoteFolder>> {
-    let mut folders = cmd(checked_names(session, "LIST \"\" \"*\"")).await?;
+    // connect() enables UTF8=ACCEPT whenever the server offers it.
+    let utf8 = has_capability(session, "UTF8=ACCEPT").await?;
+    let mut folders = cmd(checked_names(session, "LIST \"\" \"*\"", utf8)).await?;
     let subscribed: Option<HashSet<String>> = cmd(async {
-        match checked_names(session, "LSUB \"\" \"*\"").await {
+        match checked_names(session, "LSUB \"\" \"*\"", utf8).await {
             Ok(names) => Ok(Some(names.into_iter().map(|n| n.name).collect())),
             Err(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_)) => {
                 tracing::warn!("LSUB rejected; displaying all discovered folders");
@@ -225,6 +228,17 @@ pub async fn enable_utf8(session: &mut Session) -> Result<bool> {
     }
     cmd(session.run_command_and_check_ok("ENABLE UTF8=ACCEPT")).await?;
     Ok(true)
+}
+
+/// Display form of a mailbox name as sent by the server: modified UTF-7
+/// unless UTF8=ACCEPT is in effect, when it already is plain UTF-8 (and a
+/// literal `&`, as in "R&D", must be left alone).
+pub fn display_name(wire: &str, utf8: bool) -> String {
+    if utf8 {
+        wire.to_string()
+    } else {
+        crate::mutf7::decode(wire)
+    }
 }
 
 /// Wire form of a Unicode mailbox name.

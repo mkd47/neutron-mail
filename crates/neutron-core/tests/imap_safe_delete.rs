@@ -558,3 +558,36 @@ async fn flags_and_permanent_delete_touch_only_the_selected_messages() {
     assert!(commands.iter().any(|c| c == "UID EXPUNGE 7,8"));
     assert!(!commands.iter().any(|c| c == "EXPUNGE"));
 }
+
+async fn listed_names(capabilities: &'static str, wire: &'static str) -> Vec<(String, String)> {
+    let (mut session, server) = mock_server_with(capabilities, move |command| {
+        if command.starts_with("LIST ") || command.starts_with("LSUB ") {
+            format!("* LIST () \"/\" INBOX\r\n* LIST () \"/\" \"{wire}\"\r\n")
+        } else {
+            String::new()
+        }
+    })
+    .await;
+    let folders = tokio::time::timeout(Duration::from_secs(5), imap::list_folders(&mut session))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(commands_after_drop(session, server).await);
+    folders.into_iter().map(|f| (f.name, f.display)).collect()
+}
+
+#[tokio::test]
+async fn folder_names_with_ampersands_display_correctly_in_both_encodings() {
+    // UTF8=ACCEPT: names are plain UTF-8, "&" is literal.
+    let utf8 = listed_names("UTF8=ACCEPT", "R&D Team").await;
+    assert!(
+        utf8.contains(&("R&D Team".into(), "R&D Team".into())),
+        "{utf8:?}"
+    );
+    // Modified UTF-7: "&-" is an escaped "&".
+    let mutf7 = listed_names("", "R&-D Team").await;
+    assert!(
+        mutf7.contains(&("R&-D Team".into(), "R&D Team".into())),
+        "{mutf7:?}"
+    );
+}

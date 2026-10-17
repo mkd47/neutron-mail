@@ -5,7 +5,7 @@
   import InviteCard from "./InviteCard.svelte";
   import AddressCard from "./AddressCard.svelte";
   import { initials, shortDate, size } from "./format";
-  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type ConversationItem, type MailAddress, type MessageView, type TaskList } from "./api";
+  import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type Attachment, type ConversationItem, type MailAddress, type MessageView, type TaskList } from "./api";
 
   let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {}, messageActions, moreActions }: {
     message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
@@ -20,6 +20,11 @@
   let conversation = $state<ConversationItem[]>([]);
   let moreOpen = $state(false);
   let attachmentsOpen = $state(false);
+  let inlineOpen = $state(false);
+  let savingAll = $state(false);
+  // Images already shown in the body (signature logos…) are kept apart.
+  const realAttachments = $derived(message?.attachments?.filter((a) => !a.inline) ?? []);
+  const inlineImages = $derived(message?.attachments?.filter((a) => a.inline) ?? []);
   // The open message sits in the conversation in date order: older messages
   // as cards above it, newer ones below.
   const position = $derived(conversation.findIndex((c) => c.id === message?.id));
@@ -158,7 +163,7 @@
     if (next !== lastSelection) {
       lastSelection = next; generation++;
       source = null; sourceLoading = false; reply = null; confirmOpen = null; todo = null;
-      todoBusy = false; notesBusy = false; trustBusy = false; card = null; recipientsOpen = false; moreOpen = false; attachmentsOpen = false;
+      todoBusy = false; notesBusy = false; trustBusy = false; card = null; recipientsOpen = false; moreOpen = false; attachmentsOpen = false; inlineOpen = false; savingAll = false;
     }
   });
 
@@ -206,6 +211,16 @@
     try { const p = await api.saveAttachment(origin.messageId, index); if (p && isCurrent(origin)) onStatus(`Saved to ${p}`); }
     catch (e) { if (isCurrent(origin)) onStatus(errorText(e)); }
   }
+  async function saveAll() {
+    const origin = selection();
+    if (!origin || savingAll) return;
+    savingAll = true;
+    try {
+      const r = await api.saveAllAttachments(origin.messageId);
+      if (r && isCurrent(origin)) onStatus(`Saved ${r.saved} attachment${r.saved === 1 ? "" : "s"} to ${r.folder}`);
+    } catch (e) { if (isCurrent(origin)) onStatus(errorText(e), true); }
+    finally { if (isCurrent(origin)) savingAll = false; }
+  }
   async function openAtt(index: number, confirmed = false, origin = selection()) {
     if (!origin || !isCurrent(origin)) return;
     const request = ++attachmentRequest;
@@ -239,6 +254,15 @@
 </script>
 
 <svelte:window onkeydown={onWindowKey} onclick={() => (moreOpen = false)} />
+
+{#snippet attRow(a: Attachment)}
+  <div class="att" class:risky={a.risky}>
+    <span class="aname" title={a.name}>{a.name}</span>
+    <span class="muted small asize">{size(a.size)}{a.risky ? " · program" : ""}</span>
+    <button class="mini" onclick={() => save(a.index)} title="Save…" aria-label={`Save ${a.name}`}>Save</button>
+    <button class="mini" onclick={() => openAtt(a.index)} title="Open with default app" aria-label={`Open ${a.name}`}>Open</button>
+  </div>
+{/snippet}
 
 <!-- Another message of the conversation, collapsed: click to read it. -->
 {#snippet convCard(c: ConversationItem)}
@@ -366,26 +390,29 @@
             {/if}
           </div>
         {/if}
-        {#if message.attachments.length}
-          {@const n = message.attachments.length}
+        {#if realAttachments.length || inlineImages.length}
+          {@const n = realAttachments.length}
           <div class="attbar">
-            <button class="attsum" onclick={() => (attachmentsOpen = !attachmentsOpen)} aria-expanded={attachmentsOpen}>
-              <Icon name="clip" size={15} />
-              <strong>{n} attachment{n === 1 ? "" : "s"}</strong>
-              <span class="muted">· {size(message.attachments.reduce((t, a) => t + a.size, 0))}</span>
-              {#if !attachmentsOpen}<span class="muted names">{message.attachments.slice(0, 2).map((a) => a.name).join(", ")}{n > 2 ? ` +${n - 2}` : ""}</span>{/if}
-              <span class="toggle">{attachmentsOpen ? "Hide" : "View attachments"}</span>
-            </button>
-            {#if attachmentsOpen}
+            {#if n}
+              <div class="attsum-row">
+                <button class="attsum" onclick={() => (attachmentsOpen = !attachmentsOpen)} aria-expanded={attachmentsOpen}>
+                  <Icon name="clip" size={15} />
+                  <strong>{n} attachment{n === 1 ? "" : "s"}</strong>
+                  <span class="muted">· {size(realAttachments.reduce((t, a) => t + a.size, 0))}</span>
+                  {#if !attachmentsOpen}<span class="muted names">{realAttachments.slice(0, 2).map((a) => a.name).join(", ")}{n > 2 ? ` +${n - 2}` : ""}</span>{/if}
+                  <span class="toggle">{attachmentsOpen ? "Hide" : "Show"}</span>
+                </button>
+                {#if n > 1}<button class="mini saveall" onclick={saveAll} disabled={savingAll} title="Save every attachment into a folder">{savingAll ? "Saving…" : "Save all"}</button>{/if}
+              </div>
+            {/if}
+            {#if attachmentsOpen || !n}
               <div class="attachments">
-                {#each message.attachments as a (a.index)}
-                  <div class="att" class:risky={a.risky}>
-                    <span class="aname" title={a.name}>{a.name}</span>
-                    <span class="muted small asize">{size(a.size)}{a.risky ? " · program" : ""}</span>
-                    <button class="mini" onclick={() => save(a.index)} title="Save…" aria-label={`Save ${a.name}`}>Save</button>
-                    <button class="mini" onclick={() => openAtt(a.index)} title="Open with default app" aria-label={`Open ${a.name}`}>Open</button>
-                  </div>
-                {/each}
+                {#each attachmentsOpen ? realAttachments : [] as a (a.index)}{@render attRow(a)}{/each}
+                {#if inlineImages.length}
+                  <button class="inline-toggle" onclick={() => (inlineOpen = !inlineOpen)} aria-expanded={inlineOpen}>
+                    {inlineOpen ? "Hide" : "Show"} {inlineImages.length} image{inlineImages.length === 1 ? "" : "s"} from the message body</button>
+                  {#if inlineOpen}{#each inlineImages as a (a.index)}{@render attRow(a)}{/each}{/if}
+                {/if}
               </div>
             {/if}
           </div>
@@ -468,8 +495,12 @@
   .mfolder { flex: none; font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
   .mdate { flex: none; font-size: 12px; white-space: nowrap; }
   .attbar { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
-  .attsum { display: flex; gap: 8px; align-items: center; width: 100%; min-width: 0; border: 0; background: transparent; padding: 8px 12px; color: var(--text); font-size: 13px; text-align: left; }
-  .attsum .names { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attsum-row { display: flex; align-items: center; gap: 6px; padding-right: 8px; }
+  .saveall { flex: none; }
+  .inline-toggle { grid-column: 1 / -1; justify-self: start; border: 0; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 2px; text-decoration: underline; }
+  .attsum { flex: 1; display: flex; gap: 8px; align-items: center; width: 100%; min-width: 0; border: 0; background: transparent; padding: 8px 12px; color: var(--text); font-size: 13px; text-align: left; }
+  .attsum > :global(*) { white-space: nowrap; flex: none; }
+  .attsum .names { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .attsum .toggle { margin-left: auto; color: var(--unread); font-weight: 600; flex: none; }
   .attsum[aria-expanded="true"] .toggle { margin-left: auto; }
   .popover { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; width: 300px; display: flex; flex-direction: column; gap: 10px;

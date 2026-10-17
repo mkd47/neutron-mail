@@ -31,6 +31,8 @@ pub struct AppState {
     pub calendar: calendar::Calendar,
     pub cache: CacheStatus,
     pub print: print::PrintJobs,
+    /// New-mail notification id -> (account id, message id) it opens when clicked.
+    pub notified: std::sync::Mutex<HashMap<u32, (i64, i64)>>,
 }
 
 impl AppState {
@@ -165,6 +167,7 @@ pub fn run() {
                 calendar: calendar::Calendar::default(),
                 cache,
                 print: print::PrintJobs::default(),
+                notified: std::sync::Mutex::new(HashMap::new()),
             };
             let accounts = state.store.accounts()?;
             app.manage(state);
@@ -174,6 +177,7 @@ pub fn run() {
                 watcher::start(app.handle(), a.id);
             }
             pim::start_reminders(app.handle());
+            watcher::open_on_notification_click(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -207,6 +211,7 @@ pub fn run() {
             commands::analyze_link,
             attachments::pick_attachments,
             attachments::save_attachment,
+            attachments::save_all_attachments,
             attachments::open_attachment,
             contacts::suggest_contacts,
             contacts::contacts_status,

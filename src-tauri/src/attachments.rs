@@ -170,6 +170,51 @@ pub async fn save_attachment(
 }
 
 #[derive(Serialize)]
+pub struct SaveAllResult {
+    folder: String,
+    saved: usize,
+}
+
+/// "Save all": every real attachment (not images shown in the body) into
+/// a folder the user picks. Existing files are never replaced.
+#[tauri::command]
+pub async fn save_all_attachments(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Res<Option<SaveAllResult>> {
+    let raw = state.store.raw(message_id)?;
+    let files = parse::saveable_attachments(&raw);
+    if files.is_empty() {
+        return Err(Error::NotFound("attachments".into()));
+    }
+    let dialog_app = app.clone();
+    let folder = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_title("Save all attachments to…")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| Error::Invalid(format!("folder dialog failed: {e}")))?;
+    let Some(folder) = folder else {
+        return Ok(None);
+    };
+    let dir = folder
+        .into_path()
+        .map_err(|e| Error::Invalid(format!("bad path: {e}")))?;
+    for f in &files {
+        neutron_core::attachments::write_new_file(&dir, &safe_filename(&f.name), &f.data)?;
+    }
+    tracing::info!(count = files.len(), "attachments saved");
+    Ok(Some(SaveAllResult {
+        folder: dir.to_string_lossy().into_owned(),
+        saved: files.len(),
+    }))
+}
+
+#[derive(Serialize)]
 pub struct OpenResult {
     /// "opened" or "needs_confirmation".
     status: &'static str,

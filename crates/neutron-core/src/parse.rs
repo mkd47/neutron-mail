@@ -174,7 +174,10 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
         Some(html_parts.join("<hr>"))
     };
 
-    // Resolve cid: references to data: URLs for inline images.
+    // Resolve cid: references to data: URLs for inline images, remembering
+    // which ones the body actually shows (so they aren't listed again as
+    // attachments, e.g. logos in a signature).
+    let mut shown_cids: Vec<String> = Vec::new();
     if let Some(html) = html_raw.as_mut() {
         for part in msg.parts.iter() {
             let (Some(cid), Some(ct)) = (part.content_id(), part.content_type()) else {
@@ -194,7 +197,11 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
             }
             let url = format!("data:image/{sub};base64,{}", base64(data));
             let cid = cid.trim_matches(|c| c == '<' || c == '>');
-            *html = html.replace(&format!("cid:{cid}"), &url);
+            let reference = format!("cid:{cid}");
+            if html.contains(&reference) {
+                *html = html.replace(&reference, &url);
+                shown_cids.push(cid.to_string());
+            }
         }
     }
 
@@ -203,8 +210,13 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
         .map(|(index, p)| {
             let name = safe_filename(p.attachment_name().unwrap_or("attachment"));
             let mime = mime_of(p);
+            let inline = p
+                .content_id()
+                .map(|c| c.trim_matches(|c| c == '<' || c == '>'))
+                .is_some_and(|c| shown_cids.iter().any(|s| s == c));
             AttachmentInfo {
                 index,
+                inline,
                 risky: is_risky(&name, &mime, p.contents()),
                 name,
                 mime,
@@ -348,6 +360,25 @@ pub fn attachment_content(raw: &[u8], index: usize) -> Option<OutgoingAttachment
     })
 }
 
+/// Every real attachment (not images already shown in the body), parsed
+/// once, for "Save all". Names are already made safe.
+pub fn saveable_attachments(raw: &[u8]) -> Vec<OutgoingAttachment> {
+    let info = parse(raw).attachments;
+    let normalized = legacy_headers(raw);
+    let Some(msg) = MessageParser::default().parse(normalized.as_ref()) else {
+        return Vec::new();
+    };
+    listed_attachments(&msg)
+        .zip(info.iter())
+        .filter(|(_, a)| !a.inline)
+        .map(|(p, a)| OutgoingAttachment {
+            name: a.name.clone(),
+            mime: a.mime.clone(),
+            data: p.contents().to_vec(),
+        })
+        .collect()
+}
+
 /// Sanitize the HTML part (if any) of a parsed message.
 pub fn sanitized_html(p: &ParsedMessage) -> Option<Sanitized> {
     p.html_raw.as_deref().map(sanitize_html)
@@ -400,6 +431,33 @@ pub fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn images_shown_in_the_body_are_marked_inline_not_listed_as_attachments() {
+        let png = super::base64(b"\x89PNG\r\n\x1a\n0000");
+        let raw = format!(
+            "From: a@example.test\r\nSubject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
+--R\r\nContent-Type: text/html\r\n\r\n<p>Hi</p><img src=\"cid:logo@x\">\r\n\
+--R\r\nContent-Type: image/png; name=\"image.png\"\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=\"image.png\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{png}\r\n\
+--R\r\nContent-Type: image/png; name=\"unused.png\"\r\nContent-ID: <other@x>\r\nContent-Disposition: inline; filename=\"unused.png\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{png}\r\n\
+--R--\r\n\
+--M\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{png}\r\n\
+--M--\r\n"
+        );
+        let p = super::parse(raw.as_bytes());
+        let by_name = |n: &str| p.attachments.iter().find(|a| a.name == n).unwrap();
+        assert!(by_name("image.png").inline, "logo shown in the body");
+        assert!(
+            !by_name("unused.png").inline,
+            "not referenced: a real attachment"
+        );
+        assert!(!by_name("report.pdf").inline);
+        assert!(p.html_raw.unwrap().contains("data:image/png;base64,"));
+        // Indexes stay stable for save/open/forward.
+        let idx: Vec<usize> = p.attachments.iter().map(|a| a.index).collect();
+        assert_eq!(idx, (0..p.attachments.len()).collect::<Vec<_>>());
+    }
+
     #[test]
     fn recipients_are_listed_one_per_address() {
         let raw = b"From: A <a@example.test>\r\nTo: \"Doe, Jane\" <jane@example.test>, bob@example.test\r\nCc: Team: x@example.test, y@example.test;\r\nSubject: s\r\n\r\nbody";

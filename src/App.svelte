@@ -591,7 +591,9 @@
         });
         const u4 = await pimApi.onReminder((t) => { showToast(`⏰ Reminder: ${t.title}`); pimKey++; });
         const u5 = await api.onSyncProgress(onSyncProgress);
-        unlisten = () => { u1(); u2(); u3(); u4(); u5(); };
+        // A clicked new-mail notification opens its message.
+        const u6 = await api.onOpenMessage((e) => { void openMessageById(e.message_id); });
+        unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); };
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
       } catch (e) { status = errorText(e); }
     })();

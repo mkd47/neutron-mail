@@ -1255,7 +1255,7 @@ fn insert_in_tx(tx: &rusqlite::Transaction<'_>, folder_id: i64, m: &NewMessage<'
             "INSERT INTO messages (folder_id, uid, message_id, subject, from_name, from_addr, to_addrs, cc_addrs, date, preview, seen, flagged, has_attachments, raw, thread_key)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![folder_id, m.uid, p.message_id, p.subject, p.from_name, p.from_addr, p.to, p.cc, p.date, p.preview,
-                    m.seen, m.flagged, !p.attachments.is_empty(), m.raw, p.thread_key],
+                    m.seen, m.flagged, p.attachments.iter().any(|a| !a.inline), m.raw, p.thread_key],
         )?;
     let id = tx.last_insert_rowid();
     for (name, email) in &p.addresses {
@@ -1455,6 +1455,7 @@ impl Store {
         old_wire: &str,
         new_wire: &str,
         delimiter: Option<&str>,
+        utf8: bool,
     ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
@@ -1477,7 +1478,7 @@ impl Store {
             if let Some(n) = renamed {
                 tx.execute(
                     "UPDATE folders SET name = ?2, display = ?3 WHERE id = ?1",
-                    params![id, n, crate::mutf7::decode(&n)],
+                    params![id, n, crate::imap::display_name(&n, utf8)],
                 )?;
             }
         }

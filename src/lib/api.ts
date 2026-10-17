@@ -46,7 +46,9 @@ export interface MessageSummary {
 }
 export interface ThreadSummary extends MessageSummary { thread_size: number; thread_unread: number; thread_flagged: boolean; thread_ids: number[] }
 export interface ConversationItem extends MessageSummary { folder_name: string; folder_role: string | null }
-export interface Attachment { index: number; name: string; mime: string; size: number; risky: boolean }
+export interface Attachment { index: number; name: string; mime: string; size: number; risky: boolean;
+  /** An image already shown inside the message body (e.g. a signature logo). */
+  inline: boolean }
 export interface MailAddress { name: string; email: string }
 export interface AddressInfo { contacts_available: boolean; in_contacts: boolean; trusted: boolean }
 export interface MessageDetail extends MessageSummary {
@@ -137,6 +139,7 @@ export const api = {
   analyzeLink: (url: string) => invoke<LinkInfo>("analyze_link", { url }),
   pickAttachments: () => invoke<{ files: PickedAttachment[]; rejected: string[] }>("pick_attachments"),
   saveAttachment: (messageId: number, index: number) => invoke<string | null>("save_attachment", { messageId, index }),
+  saveAllAttachments: (messageId: number) => invoke<{ folder: string; saved: number } | null>("save_all_attachments", { messageId }),
   openAttachment: (messageId: number, index: number, confirmed: boolean) =>
     invoke<{ status: "opened" | "needs_confirmation"; reason: string | null }>("open_attachment", { messageId, index, confirmed }),
   suggestContacts: (accountId: number, query: string) => invoke<ContactSuggestion[]>("suggest_contacts", { accountId, query }),
@@ -162,6 +165,8 @@ export const api = {
   listThreads: (folderId: number, offset: number, limit: number) => invoke<ThreadSummary[]>("list_threads", { folderId, offset, limit }),
   conversation: (messageId: number) => invoke<ConversationItem[]>("conversation", { messageId }),
   onSync: (cb: (e: SyncEvent) => void): Promise<UnlistenFn> => listen<SyncEvent>("mail://synced", (e) => cb(e.payload)),
+  onOpenMessage: (cb: (e: { account_id: number; message_id: number }) => void): Promise<UnlistenFn> =>
+    listen<{ account_id: number; message_id: number }>("mail://open-message", (e) => cb(e.payload)),
   onSyncProgress: (cb: (e: SyncProgress) => void): Promise<UnlistenFn> => listen<SyncProgress>("mail://sync-progress", (e) => cb(e.payload)),
   onLink: (cb: (l: LinkInfo | { error: string; original: string }) => void): Promise<UnlistenFn> =>
     listen<LinkInfo | { error: string; original: string }>("mail://link", (e) => cb(e.payload)),

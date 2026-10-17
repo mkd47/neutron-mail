@@ -12,6 +12,45 @@ const MAX_NAME_CHARS: usize = 120;
 // Linux filesystems limit each path component by bytes, not Unicode chars.
 const MAX_NAME_BYTES: usize = 255;
 
+/// Create `name` in `dir` without ever replacing an existing file: if the
+/// name is taken, "name (2).ext", "name (3).ext"… is used instead. `name`
+/// must already be a [`safe_filename`]. Returns the path written.
+pub fn write_new_file(
+    dir: &std::path::Path,
+    name: &str,
+    data: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..=999 {
+        let candidate = if n == 1 {
+            name.to_string()
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = dir.join(&candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(data)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many files with this name",
+    ))
+}
+
 /// Turn an attacker-controlled attachment name into a safe single path
 /// component: strips directories (`/`, `\`), `..`, control and bidi
 /// override characters, characters invalid on common filesystems and
@@ -229,6 +268,21 @@ mod tests {
             "text/plain",
             b""
         ));
+    }
+
+    #[test]
+    fn saving_never_overwrites_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_new_file(dir.path(), "report.pdf", b"one").unwrap();
+        let b = write_new_file(dir.path(), "report.pdf", b"two").unwrap();
+        let c = write_new_file(dir.path(), "README", b"x").unwrap();
+        let d = write_new_file(dir.path(), "README", b"y").unwrap();
+        assert_eq!(a.file_name().unwrap(), "report.pdf");
+        assert_eq!(b.file_name().unwrap(), "report (2).pdf");
+        assert_eq!(d.file_name().unwrap(), "README (2)");
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        assert_eq!(std::fs::read(&b).unwrap(), b"two");
+        assert_eq!(std::fs::read(&c).unwrap(), b"x");
     }
 
     #[test]

@@ -23,7 +23,8 @@
   });
 </script>
 
-{#if agenda?.available}
+<!-- Only when something is coming up: an empty strip would just take a row. -->
+{#if agenda?.available && shown.length}
   <div class="agenda" role="region" aria-label="Upcoming events"
     onwheel={(ev) => { if (Math.abs(ev.deltaY) > Math.abs(ev.deltaX)) { ev.currentTarget.scrollLeft += ev.deltaY; ev.preventDefault(); } }}>
     <span class="head"><Icon name="calendar" size={16} /> Next 7 days</span>
@@ -33,8 +34,6 @@
         <span class="when">{agendaWhen(e.start, e.all_day)}</span>
         <span class="what">{e.summary || "(untitled)"}</span>
       </span>
-    {:else}
-      <span class="muted none">Nothing scheduled</span>
     {/each}
   </div>
 {/if}
@@ -49,5 +48,4 @@
   .bar { width: 3px; align-self: stretch; border-radius: 2px; }
   .when { color: var(--muted); }
   .what { overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
-  .none { font-size: 13px; }
 </style>

@@ -38,6 +38,7 @@
     "allow-analyze-link",
     "allow-pick-attachments",
     "allow-save-attachment",
+    "allow-save-all-attachments",
     "allow-open-attachment",
     "allow-suggest-contacts",
     "allow-sanitize-compose-html",

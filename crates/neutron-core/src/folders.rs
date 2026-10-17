@@ -159,7 +159,8 @@ pub async fn rename(
         ));
     }
     imap::rename_folder(session, &f.name, &wire, delim.as_deref()).await?;
-    store.rename_folder_local(f.account_id, &f.name, &wire, delim.as_deref())?;
+    let utf8 = utf8(session).await?;
+    store.rename_folder_local(f.account_id, &f.name, &wire, delim.as_deref(), utf8)?;
     Ok(wire)
 }
 

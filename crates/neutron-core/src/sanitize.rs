@@ -312,14 +312,11 @@ pub fn print_document(
         Some(h) => h.to_string(),
         None => format!("<pre class=\"text\">{}</pre>", escape_html(&detail.text)),
     };
-    let attachments = if detail.attachments.is_empty() {
+    let real: Vec<_> = detail.attachments.iter().filter(|a| !a.inline).collect();
+    let attachments = if real.is_empty() {
         String::new()
     } else {
-        let names: Vec<String> = detail
-            .attachments
-            .iter()
-            .map(|a| escape_html(&a.name))
-            .collect();
+        let names: Vec<String> = real.iter().map(|a| escape_html(&a.name)).collect();
         format!("<p class=\"att\">Attachments: {}</p>", names.join(", "))
     };
     format!(
@@ -704,6 +701,7 @@ mod print_tests {
                 mime: "application/pdf".into(),
                 size: 1,
                 risky: false,
+                inline: false,
             }],
         }
     }

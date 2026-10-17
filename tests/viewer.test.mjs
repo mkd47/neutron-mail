@@ -19,7 +19,7 @@ function viewer(api = {}, pimApi = {}) {
     }),
   }, `({
     startCompose, toggleSource, openAtt, confirmAttachment, openTodo, addTodo, saveToNotes, trustSender, done,
-    openCard, trustChanged, setRecipientsOpen(value) { recipientsOpen = value; },
+    openCard, trustChanged, saveAll, setRecipientsOpen(value) { recipientsOpen = value; },
     setMessage(value) { message = value; }, setAccount(value) { account = value; },
     setTodo(value) { todo = value; },
     state: () => ({ reply, source, sourceLoading, confirmOpen, todo, todoBusy, notesBusy, trustBusy, card, recipientsOpen })
@@ -210,4 +210,21 @@ test('trusting the sender from its card re-renders the message; other addresses 
   c.trustChanged('SENDER1@example.test', true);
   c.trustChanged('sender1@example.test', false);
   assert.deepEqual(c.events.reloads, [[true], [false]]);
+});
+
+test('Save all reports where the attachments went, and only for the open message', async () => {
+  const pending = deferred();
+  const c = viewer({ saveAllAttachments: () => pending.promise });
+  const saving = c.saveAll();
+  pending.resolve({ folder: '/home/me/Downloads', saved: 3 });
+  await saving;
+  assert.equal(JSON.stringify(c.events.statuses.at(-1)), JSON.stringify(['Saved 3 attachments to /home/me/Downloads']));
+
+  const late = deferred();
+  const d = viewer({ saveAllAttachments: () => late.promise });
+  const run = d.saveAll();
+  select(d, 2);
+  late.resolve({ folder: '/tmp', saved: 1 });
+  await run;
+  assert.equal(d.events.statuses.length, 0, 'no status for a message no longer open');
 });
