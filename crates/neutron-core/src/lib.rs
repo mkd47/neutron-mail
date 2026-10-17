@@ -14,6 +14,7 @@ pub mod ical;
 pub mod imap;
 pub mod links;
 pub mod managesieve;
+pub mod mbox;
 pub mod model;
 pub mod mutf7;
 pub mod oauth;
@@ -30,5 +31,6 @@ pub mod smtp;
 pub mod store;
 pub mod sync;
 pub mod tls;
+pub mod update;
 
 pub use error::{Error, Result};

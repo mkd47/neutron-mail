@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-messages"
+description = "Enables the import_messages command without any pre-configured scope."
+commands.allow = ["import_messages"]
+
+[[permission]]
+identifier = "deny-import-messages"
+description = "Denies the import_messages command without any pre-configured scope."
+commands.deny = ["import_messages"]

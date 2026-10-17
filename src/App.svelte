@@ -14,6 +14,7 @@
   import TodayPanel from "./lib/TodayPanel.svelte";
   import ScheduledList from "./lib/ScheduledList.svelte";
   import { whenLabel } from "./lib/sendLater";
+  import { INSTALL_COMMAND, compactList, mailZoom, setCompactList, setMailZoom, stepZoom, updateChecks } from "./lib/prefs";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
     type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, type SendResultEvent, type Scheduled, type ScheduledEvent, pimApi } from "./lib/api";
   import { shortDate, snippetParts } from "./lib/format";
@@ -39,6 +40,16 @@
     lightMail = on;
     try { localStorage.setItem("lightMail", on ? "1" : "0"); } catch { /* ignore */ }
   }
+  // Reading-pane text size (Ctrl +/−/0) and list density, per device.
+  let zoom = $state(mailZoom());
+  function zoomBy(dir: -1 | 0 | 1) {
+    const z = stepZoom(zoom, dir);
+    if (z === zoom) return;
+    zoom = z; setMailZoom(z);
+    showToast(`Message text size ${Math.round(z * 100)}%`);
+  }
+  let compact = $state(compactList());
+  function setCompact(on: boolean) { compact = on; setCompactList(on); }
   let threaded = $state(((): boolean => { try { return localStorage.getItem("threaded") !== "0"; } catch { return true; } })());
   let listEnd = false;
   let selectedId = $state<number | null>(null);
@@ -547,6 +558,41 @@
     } catch (err) { showToast(errorText(err), true); }
   }
 
+  // ---- update notice ----
+  let update = $state<{ version: string; url: string } | null>(null);
+  let showUpdate = $state(false);
+  let copied = $state(false);
+  async function checkForUpdate() {
+    if (!updateChecks()) return;
+    try { update = await api.checkUpdate(); } catch { /* offline or rate-limited: try again later */ }
+  }
+  async function copyInstall() {
+    try { await navigator.clipboard.writeText(INSTALL_COMMAND); copied = true; }
+    catch { showToast("Couldn't copy: select the command and copy it.", true); }
+  }
+
+  // ---- messages as files ----
+  async function saveEml(id: number) {
+    try { const p = await api.saveEml(id); if (p) showToast(`Saved to ${p}`); }
+    catch (e) { showToast(errorText(e), true); }
+  }
+  let importing = $state(false);
+  async function importInto(f: Folder) {
+    menu = null;
+    if (importing) { showToast("An import is already running.", true); return; }
+    importing = true;
+    const stop = await api.onImportProgress((e) => { if (e.folder_id === f.id) status = `Importing… ${e.imported} messages`; }).catch(() => null);
+    try {
+      const r = await api.importMessages(f.id);
+      if (!r) return;
+      const skipped = r.skipped ? ` · ${r.skipped} skipped${r.error ? ` (${r.error})` : " (too large)"}` : "";
+      showToast(`Imported ${r.imported} message${r.imported === 1 ? "" : "s"} into ${leafName(f)}${skipped}`, r.skipped > 0);
+      status = "";
+      await sync();
+    } catch (e) { showToast(`Import failed: ${errorText(e)}`, true); }
+    finally { importing = false; stop?.(); }
+  }
+
   // ---- folder management ----
   function newFolder(parent: Folder | null) {
     menu = null; askError = "";
@@ -583,6 +629,11 @@
   }
   const pickerFolders = $derived(sortedFolders.filter(({ f }) => f.id !== folder?.id && (!pickerQuery || f.display.toLowerCase().includes(pickerQuery.toLowerCase()))));
   function onKey(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !compose && !showSettings && !showRules && appView === "mail"
+      && !(e.target as Element).closest?.("input, textarea, [contenteditable]")) {
+      const dir = e.key === "+" || e.key === "=" ? 1 : e.key === "-" ? -1 : e.key === "0" ? 0 : null;
+      if (dir !== null) { e.preventDefault(); zoomBy(dir as -1 | 0 | 1); return; }
+    }
     const t = e.target as HTMLElement;
     if (t.closest("input, textarea, select, [contenteditable], .modal") || compose || showSettings || showRules) return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
@@ -741,6 +792,11 @@
         const u8 = await api.onScheduled(onScheduled);
         unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); };
         void refreshScheduled();
+        // Update notice: shortly after start, then twice a day.
+        const first = setTimeout(checkForUpdate, 20_000);
+        const daily = setInterval(checkForUpdate, 12 * 3_600_000);
+        const prev = unlisten;
+        unlisten = () => { prev?.(); clearTimeout(first); clearInterval(daily); };
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
       } catch (e) { status = errorText(e); }
     })();
@@ -808,6 +864,10 @@
           ondragover={(e) => over(e, null)} ondragleave={() => (dropTarget = null)} ondrop={(e) => drop(e, null)} role="presentation">Drop here for top level</div>
       </nav>
       <div class="spacer"></div>
+      {#if update}
+        <button class="scheduled-btn update-btn" onclick={() => { copied = false; showUpdate = true; }}>
+          <Icon name="sync" size={15} /> Update available <span class="badge">{update.version}</span></button>
+      {/if}
       {#if scheduled.length}
         <button class="scheduled-btn" class:failed={scheduled.some((s) => s.state === "failed")} onclick={() => { showScheduled = true; void refreshScheduled(); }}>
           <Icon name="calendar" size={15} /> Scheduled <span class="badge">{scheduled.length}</span></button>
@@ -863,6 +923,8 @@
       <div class="meta muted">
         {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length).toLocaleString()} message${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length) === 1 ? "" : "s"}`}
         <span class="status" title={status}>{status}</span>
+        <button class="threads" onclick={() => setCompact(!compact)} aria-pressed={compact}
+          title={compact ? "Compact list: click for two-line rows with a preview" : "Show more messages: one line per message"}>{compact ? "Compact" : "Comfortable"}</button>
         {#if !hits}
           <button class="threads" onclick={() => setThreaded(!threaded)} aria-pressed={threaded}
             title={threaded ? "Showing conversations: click to list every message" : "Group messages into conversations"}>
@@ -881,7 +943,7 @@
           <button class="icon-btn sm" aria-label="Clear selection" onclick={() => (picked = [])}><Icon name="close" size={13} /></button>
         </div>
       {/if}
-      <ul onscroll={onListScroll}>
+      <ul onscroll={onListScroll} class:compact>
         {#each list as m (m.id)}
           <li>
             <button class="item" class:selected={selectedId === m.id || picked.includes(m.id) || (selectedId !== null && !!m.thread_ids?.includes(selectedId))}
@@ -930,7 +992,17 @@
         <button role="menuitemcheckbox" aria-checked={lightMail} onclick={() => setLightMail(!lightMail)}>
           <Icon name="sun" size={15} /> Always use a light background for mail {lightMail ? "✓" : ""}</button>
       {/if}
+      <div class="zoomrow" role="group" aria-label="Message text size">
+        <span>Text size</span>
+        <button class="zb" onclick={(e) => { e.stopPropagation(); zoomBy(-1); }} aria-label="Smaller (Ctrl −)" title="Smaller (Ctrl −)">−</button>
+        <button class="zb pct" onclick={(e) => { e.stopPropagation(); zoomBy(0); }} title="Reset (Ctrl 0)">{Math.round(zoom * 100)}%</button>
+        <button class="zb" onclick={(e) => { e.stopPropagation(); zoomBy(1); }} aria-label="Larger (Ctrl +)" title="Larger (Ctrl +)">+</button>
+      </div>
       <button role="menuitem" onclick={() => { pickerQuery = ""; picker = { copy: true }; }}><Icon name="folder" size={15} /> Copy to… <kbd>Shift+V</kbd></button>
+      {#if detail}
+        {@const id = detail.id}
+        <button role="menuitem" onclick={() => saveEml(id)}><Icon name="external" size={15} /> Save as .eml file…</button>
+      {/if}
       {#if detail && !inFolder("trash")}
         {@const d = detail}
         <button role="menuitem" class="danger" onclick={() => deleteSelected(expand([d.id]), true)}><Icon name="trash" size={15} /> Delete permanently…</button>
@@ -938,7 +1010,7 @@
     {/snippet}
     <section class="reader">
       <Agenda refreshKey={agendaKey} />
-      <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl}
+      <Viewer message={detail} {account} isDraft={folder?.role === "drafts"} {hoverUrl} {zoom}
         onPimChanged={() => pimKey++} onOpenNote={() => {}}
         onReload={reload} onStatus={(t, w) => showToast(t, w)} onComposerDone={composerDone}
         onCalendarChanged={() => agendaKey++} onComposeTo={composeTo}
@@ -969,9 +1041,26 @@
       {/if}
       <button role="menuitem" onclick={() => toggleSubscribed(f)} disabled={isProtected(f)}>{f.subscribed ? "Unsubscribe" : "Subscribe"}</button>
       <button role="menuitem" onclick={() => { menu = null; showRules = true; }}>Rules…</button>
+      <button role="menuitem" onclick={() => importInto(f)} title="Add messages from .eml or mbox files (Thunderbird, Apple Mail, Gmail Takeout)">Import messages…</button>
       <hr />
       <button role="menuitem" class="danger" onclick={() => askDelete(f)} disabled={isProtected(f)}>Delete…</button>
       {#if isProtected(f)}<div class="muted small pad">Special folder: protected</div>{/if}
+    </div>
+  {/if}
+  {#if showUpdate && update}
+    {@const u = update}
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Update available" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") showUpdate = false; }}>
+      <div class="card">
+        <h3>Neutron Mail {u.version} is available</h3>
+        <p class="muted small">You have {info?.version ?? "an older version"}. To update, run this in a terminal. It downloads the new
+          version, checks it, and installs it with dnf; your accounts and settings are kept.</p>
+        <code class="cmd">{INSTALL_COMMAND}</code>
+        <div class="row">
+          <button class="btn" onclick={() => api.openReleasePage(u.url).catch((e) => showToast(errorText(e), true))}>What's new</button>
+          <button class="btn" onclick={() => (showUpdate = false)}>Later</button>
+          <button class="btn primary" onclick={copyInstall}>{copied ? "Copied ✓" : "Copy command"}</button>
+        </div>
+      </div>
     </div>
   {/if}
   {#if showScheduled}
@@ -1099,6 +1188,9 @@
   .scheduled-btn:hover { background: var(--hover); }
   .scheduled-btn .badge { margin-left: auto; }
   .scheduled-btn.failed { color: #e5534b; }
+  .update-btn { color: var(--accent); }
+  .cmd { display: block; padding: 10px 12px; border-radius: 8px; background: var(--panel-2, var(--hover)); font-size: 12px;
+    word-break: break-all; user-select: all; }
   .accounts { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--border); padding-top: 8px; }
   .acct { border: 0; background: transparent; text-align: left; padding: 6px 12px; border-radius: 8px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; gap: 6px; align-items: center; }
   .acct.active { color: var(--text); } .acct:hover { background: var(--hover); }
@@ -1132,6 +1224,12 @@
   ul { list-style: none; margin: 0; padding: 0 8px 8px; overflow: auto; flex: 1; }
   .item { width: 100%; display: grid; grid-template-columns: 14px 1fr; column-gap: 6px; text-align: left; border: 0; background: transparent; padding: 10px 10px; border-radius: 10px; border-bottom: 1px solid var(--border); }
   .item:hover { background: var(--hover); }
+  ul.compact .item { padding: 4px 10px; border-radius: 6px; }
+  ul.compact .item .preview { display: none; }
+  .zoomrow { display: flex; align-items: center; gap: 4px; padding: 6px 10px; font-size: 13px; }
+  .zoomrow span { flex: 1; }
+  .zb { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 6px; min-width: 26px; height: 24px; padding: 0 6px; cursor: pointer; }
+  .zb.pct { min-width: 48px; font-size: 12px; }
   .item.selected { background: var(--selected); }
   .dot { grid-row: 1; width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; }
   .unread .dot { background: var(--unread); }

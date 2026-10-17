@@ -9,9 +9,21 @@ A free, open-source desktop mail client inspired by modern privacy-focused webma
 
 > **Not affiliated with Proton AG.** Neutron Mail uses **no Proton code, name, logos, or assets**. "Proton" is a trademark of Proton AG; it is mentioned in the docs only to describe design inspiration and prior-art research.
 
+## Install (Fedora 44, x86_64)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mkd47/neutron-mail/main/scripts/install.sh | bash
+```
+
+[`scripts/install.sh`](scripts/install.sh) downloads the latest release's RPM and `SHA256SUMS`, checks the
+checksum and installs with `dnf` (an existing install is upgraded; accounts and settings are kept). Run it
+again to update; the app also tells you when a new version is out (Account settings → Updates).
+To install a specific version: `scripts/install.sh 0.5.0`. Or download the RPM from
+[Releases](https://github.com/mkd47/neutron-mail/releases) and run `sudo dnf install ./neutron-mail-*.rpm`.
+
 ## Status
 
-**Working prototype (v0.3.0).** Verified in the real GUI against a local Dovecot + SMTP test server:
+**Working prototype (v0.5.0).** Verified in the real GUI against a local Dovecot + SMTP test server:
 add an account (IMAP/SMTP over TLS or STARTTLS, certificate always verified), folder list,
 message list from a local SQLite cache, full-text search, IMAP IDLE push with a polling fallback, and:
 

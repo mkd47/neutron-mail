@@ -172,6 +172,13 @@ export const api = {
   getAccountSettings: (accountId: number) => invoke<AccountSettings>("get_account_settings", { accountId }),
   setAccountSettings: (accountId: number, settings: AccountSettings) =>
     invoke<AccountSettings>("set_account_settings", { accountId, settings }),
+  checkUpdate: () => invoke<{ version: string; url: string } | null>("check_update"),
+  openReleasePage: (url: string) => invoke<void>("open_release_page", { url }),
+  saveEml: (messageId: number) => invoke<string | null>("save_eml", { messageId }),
+  importMessages: (folderId: number) =>
+    invoke<{ imported: number; skipped: number; error: string | null } | null>("import_messages", { folderId }),
+  onImportProgress: (cb: (e: { folder_id: number; imported: number }) => void): Promise<UnlistenFn> =>
+    listen<{ folder_id: number; imported: number }>("mail://import-progress", (e) => cb(e.payload)),
   listTemplates: () => invoke<Template[]>("list_templates"),
   saveTemplate: (id: number | null, name: string, html: string) => invoke<Template>("save_template", { id, name, html }),
   deleteTemplate: (id: number) => invoke<void>("delete_template", { id }),

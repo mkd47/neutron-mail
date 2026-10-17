@@ -38,6 +38,9 @@ export function componentScript(path, bindings = {}, expose = '({})') {
     errorText: (error) => String(error),
     // src/lib/prefs.ts defaults (imports are stripped from components).
     undoSendSeconds: () => 10, UNDO_SEND_CHOICES: [0, 5, 10, 20, 30], setUndoSendSeconds: () => {},
+    mailZoom: () => 1, setMailZoom: () => {}, stepZoom: (z, d) => (d === 0 ? 1 : z), compactList: () => false, setCompactList: () => {},
+    updateChecks: () => false, setUpdateChecks: () => {}, INSTALL_COMMAND: 'install',
+    whenLabel: (d) => d.toISOString(), laterChoices: () => [], toLocalInput: () => '', fromLocalInput: () => null,
     ...bindings,
   };
   const { outputText } = ts.transpileModule(`${source}\n;globalThis.__handlers = ${expose};`, {

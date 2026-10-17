@@ -7,8 +7,8 @@
   import { initials, shortDate, size } from "./format";
   import { api, dayAt, errorText, pimApi, type Account, type ComposeDraft, type ComposeMode, type ComposerResult, type Attachment, type ConversationItem, type MailAddress, type MessageView, type TaskList } from "./api";
 
-  let { message, account, isDraft, hoverUrl, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {}, messageActions, moreActions }: {
-    message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null;
+  let { message, account, isDraft, hoverUrl, zoom = 1, onReload, onStatus, onComposerDone, onCalendarChanged = () => {}, onPimChanged = () => {}, onOpenNote = () => {}, onComposeTo = () => {}, onOpenMessage = () => {}, messageActions, moreActions }: {
+    message: MessageView | null; account: Account; isDraft: boolean; hoverUrl: string | null; zoom?: number;
     onReload: (loadRemote: boolean) => void; onStatus: (s: string, warn?: boolean) => void; onComposerDone: (r: ComposerResult) => void;
     onCalendarChanged?: () => void; onPimChanged?: () => void; onOpenNote?: (id: number) => void; onComposeTo?: (a: MailAddress) => void;
     onOpenMessage?: (id: number) => void;
@@ -426,9 +426,9 @@
         {#if message.document}
           <!-- Empty sandbox: no scripts, no same-origin, no forms, no popups, no top navigation.
                Link clicks are intercepted by the app shell (navigation policy) and confirmed. -->
-          <iframe class="body" title="Message content" sandbox="" referrerpolicy="no-referrer" srcdoc={message.document}></iframe>
+          <iframe class="body" style:zoom={zoom === 1 ? null : zoom} title="Message content" sandbox="" referrerpolicy="no-referrer" srcdoc={message.document}></iframe>
         {:else}
-          <pre class="body text">{message.text}</pre>
+          <pre class="body text" style:zoom={zoom === 1 ? null : zoom}>{message.text}</pre>
         {/if}
       {/if}
       {#each later as c (c.id)}{@render convCard(c)}{/each}

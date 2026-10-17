@@ -8,7 +8,7 @@
   import AutoReply from "./AutoReply.svelte";
   import { Icon } from "@neutron/ui";
   import { api, errorText, type Account, type AccountSettings, type MailAddress } from "./api";
-  import { UNDO_SEND_CHOICES, setUndoSendSeconds, undoSendSeconds } from "./prefs";
+  import { INSTALL_COMMAND, UNDO_SEND_CHOICES, setUndoSendSeconds, setUpdateChecks, undoSendSeconds, updateChecks } from "./prefs";
 
   let { account, onClose, onUpdated, onRemoved }:
     { account: Account; onClose: () => void; onUpdated: (a: Account) => void; onRemoved: (id: number) => void } = $props();
@@ -21,6 +21,7 @@
   // Which alias has its signature editor open (by row index).
   let sigOpen = $state<number | null>(null);
   let undoDelay = $state(undoSendSeconds());
+  let checkUpdates = $state(updateChecks());
   let senders = $state<string[]>([]);
   let prefsBusy = $state(false);
   let prefsMsg = $state<{ text: string; error: boolean } | null>(null);
@@ -145,6 +146,15 @@
     {#key account.id}<AutoReply {account} />{/key}
 
     <section class="card">
+      <h3>Updates</h3>
+      <label class="check"><input type="checkbox" checked={checkUpdates}
+        onchange={(e) => { checkUpdates = (e.currentTarget as HTMLInputElement).checked; setUpdateChecks(checkUpdates); }} />
+        Tell me when a new version is available (asks GitHub twice a day; nothing is installed automatically)</label>
+      <p class="muted">To install or update by hand, run this in a terminal:</p>
+      <code class="cmd">{INSTALL_COMMAND}</code>
+    </section>
+
+    <section class="card">
       <h3>Remote images</h3>
       <p class="muted">Senders whose remote images load automatically. Everyone else's are blocked until you allow them.</p>
       {#if senders.length}
@@ -183,6 +193,8 @@
   p { margin: 0; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px;
     display: flex; flex-direction: column; gap: 10px; }
+  .check { display: flex; gap: 8px; align-items: flex-start; }
+  .cmd { display: block; padding: 8px 10px; border-radius: 8px; background: var(--panel-2, var(--hover)); font-size: 12px; word-break: break-all; user-select: all; }
   .ids { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
   .id-row { display: flex; gap: 6px; width: 100%; }
   .id-row input { flex: 1; min-width: 0; }

@@ -6,6 +6,7 @@ mod attachments;
 mod calendar;
 mod commands;
 mod contacts;
+mod mailfiles;
 mod organize;
 mod outbox;
 mod pim;
@@ -13,6 +14,7 @@ mod print;
 mod providers;
 mod scheduled;
 mod templates;
+mod updates;
 mod vacation;
 mod watcher;
 
@@ -219,6 +221,10 @@ pub fn run() {
             outbox::queue_send,
             outbox::cancel_send,
             outbox::send_now,
+            updates::check_update,
+            updates::open_release_page,
+            mailfiles::save_eml,
+            mailfiles::import_messages,
             scheduled::schedule_send,
             scheduled::list_scheduled,
             scheduled::send_scheduled_now,
