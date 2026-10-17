@@ -23,7 +23,7 @@ To install a specific version: `scripts/install.sh 0.5.0`. Or download the RPM f
 
 ## Status
 
-**Working prototype (v0.5.0).** Verified in the real GUI against a local Dovecot + SMTP test server:
+**Working prototype (v0.4.0).** Verified in the real GUI against a local Dovecot + SMTP test server:
 add an account (IMAP/SMTP over TLS or STARTTLS, certificate always verified), folder list,
 message list from a local SQLite cache, full-text search, IMAP IDLE push with a polling fallback, and:
 

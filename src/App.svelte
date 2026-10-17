@@ -74,6 +74,7 @@
   // Search everywhere in the account, or only in the open folder.
   let searchScope = $state<"all" | "folder">("all");
   let searchHelp = $state(false);
+  let searchEl: HTMLInputElement | undefined = $state();
   const SEARCH_FILTERS = [
     { insert: "from:", label: "from:", hint: "sender name or address" },
     { insert: "to:", label: "to:", hint: "recipient (To or Cc)" },
@@ -87,7 +88,7 @@
   function addFilter(f: string) {
     query = `${query.trimEnd()}${query.trim() ? " " : ""}${f}`;
     searchHelp = false;
-    document.querySelector<HTMLInputElement>(".search input")?.focus();
+    searchEl?.focus();
     if (!f.endsWith(":")) onSearch();
   }
   function setScope(s: "all" | "folder") { searchScope = s; onSearch(); }
@@ -900,7 +901,7 @@
     <section class="list">
       <div class="search">
         <Icon name="search" />
-        <input placeholder="Search messages…" bind:value={query} oninput={onSearch} aria-label="Search messages" />
+        <input bind:this={searchEl} placeholder="Search messages…" bind:value={query} oninput={onSearch} aria-label="Search messages" />
         <button class="filters-btn" class:on={searchHelp} onclick={(e) => { e.stopPropagation(); searchHelp = !searchHelp; }}
           aria-expanded={searchHelp} aria-label="Search filters" title="Search filters">
           <Icon name="filter" size={15} /></button>
@@ -923,8 +924,8 @@
       <div class="meta muted">
         {hits ? `${hits.length} result${hits.length === 1 ? "" : "s"}` : `${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length).toLocaleString()} message${(folders.find((f) => f.id === folder?.id)?.total ?? messages.length) === 1 ? "" : "s"}`}
         <span class="status" title={status}>{status}</span>
-        <button class="threads" onclick={() => setCompact(!compact)} aria-pressed={compact}
-          title={compact ? "Compact list: click for two-line rows with a preview" : "Show more messages: one line per message"}>{compact ? "Compact" : "Comfortable"}</button>
+        <button class="density" onclick={() => setCompact(!compact)} aria-pressed={compact} aria-label="Compact list"
+          title={compact ? "Compact list is on: click to show previews" : "Compact list: hide previews to fit more messages"}><Icon name="list" size={14} /></button>
         {#if !hits}
           <button class="threads" onclick={() => setThreaded(!threaded)} aria-pressed={threaded}
             title={threaded ? "Showing conversations: click to list every message" : "Group messages into conversations"}>
@@ -1226,6 +1227,8 @@
   .item:hover { background: var(--hover); }
   ul.compact .item { padding: 4px 10px; border-radius: 6px; }
   ul.compact .item .preview { display: none; }
+  .density { border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 2px 4px; display: flex; cursor: pointer; flex: none; }
+  .density[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
   .zoomrow { display: flex; align-items: center; gap: 4px; padding: 6px 10px; font-size: 13px; }
   .zoomrow span { flex: 1; }
   .zb { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 6px; min-width: 26px; height: 24px; padding: 0 6px; cursor: pointer; }

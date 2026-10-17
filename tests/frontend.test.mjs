@@ -482,3 +482,101 @@ test('automatic replies refuse the server when it cannot reply or ignore dates',
   assert.equal(saves[0].on_server, true);
   assert.equal(saves[0].start, null);
 });
+
+// ---- 0.5: send later, signatures per address, templates, search scope ----
+import ts from 'typescript';
+async function tsModule(path) {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+  const { outputText } = ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } });
+  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+}
+
+test('send-later choices follow the clock and the week', async () => {
+  const { laterChoices, toLocalInput, fromLocalInput, whenLabel } = await tsModule('src/lib/sendLater.ts');
+  const wed = new Date(2026, 9, 14, 10, 0);            // Wednesday 10:00
+  const c = laterChoices(wed);
+  assert.equal(c.length, 4);
+  assert.match(c[0].label, /^This evening/);
+  assert.equal(c[1].at.getTime(), new Date(2026, 9, 15, 8, 0).getTime());
+  assert.equal(c[3].at.getTime(), new Date(2026, 9, 19, 8, 0).getTime(), 'next Monday');
+  const sun = laterChoices(new Date(2026, 9, 18, 17, 0)); // Sunday evening: tomorrow is Monday
+  assert.deepEqual(sun.map((x) => x.label.split(' ·')[0]), ['Tomorrow morning', 'Tomorrow afternoon']);
+  const d = new Date(2026, 0, 2, 7, 5);
+  assert.equal(toLocalInput(d), '2026-01-02T07:05');
+  assert.equal(fromLocalInput('2026-01-02T07:05').getTime(), d.getTime());
+  assert.equal(fromLocalInput('tomorrow'), null);
+  assert.match(whenLabel(new Date(2026, 9, 15, 8, 0), wed), /^Tomorrow, /);
+  assert.match(whenLabel(new Date(2026, 9, 14, 18, 0), wed), /^Today, /);
+});
+
+test('Send later schedules the message at the chosen time; the past is refused', async () => {
+  const calls = [];
+  const item = { id: 3, account_id: 1, send_at: 2_000_000_000, state: 'waiting', attempts: 0, last_error: null, subject: 'Hello', recipients: 'friend' };
+  const done = [];
+  const c = componentScript('src/lib/Composer.svelte', {
+    $props: () => ({ account, draft, title: 'New message', onDone: (r) => done.push(r), replaceDraft: 7 }),
+    api: { getAccountSettings: async () => ({ identities: [] }), scheduleSend: async (...a) => { calls.push(a); return item; } },
+  }, `({ sendLater, state: () => ({ error }) })`);
+  await c.sendLater(new Date(Date.now() - 60_000));
+  assert.equal(calls.length, 0);
+  assert.match(c.state().error, /future/);
+  const when = new Date(Date.now() + 3_600_000);
+  await c.sendLater(when);
+  assert.equal(calls[0][0], 1);
+  assert.equal(calls[0][2], 7, 'replaces the resumed draft');
+  assert.equal(calls[0][4], Math.floor(when.getTime() / 1000));
+  assert.equal(JSON.stringify(done), JSON.stringify([{ kind: 'scheduled', item }]));
+});
+
+test('changing From swaps the signature in plain text', () => {
+  const c = componentScript('src/lib/Composer.svelte', {
+    $props: () => ({ account, draft: { ...draft, body: '\n\n-- \nKaan\n' }, title: 'New message', onDone: () => {} }),
+    api: { getAccountSettings: async () => ({ identities: [] }) },
+    DOMParser: class { parseFromString(h) { return { querySelectorAll: () => [], body: { textContent: h.replace(/<[^>]+>/g, '') } }; } },
+  }, `({ changeFrom, plain() { rich = false; }, setSigs(s) { signatures = s; }, state: () => ({ body, from }) })`);
+  c.plain();
+  c.setSigs({ base: '<b>Kaan</b>', ids: { 'sales@example.test': '<b>Sales team</b>' } });
+  c.changeFrom('sales@example.test');
+  assert.equal(c.state().body, '\n\n-- \nSales team\n');
+  c.changeFrom('me@example.test');
+  assert.equal(c.state().body, '\n\n-- \nKaan\n');
+  assert.equal(c.state().from, 'me@example.test');
+});
+
+test('scheduled messages: the list updates and results are reported', async () => {
+  let list = [];
+  const c = componentScript('src/App.svelte', {
+    api: threads({ listFolders: async () => [], listMessages: async () => [], syncAccount: async () => report, listScheduled: async () => list }),
+    pimApi: {},
+  }, `({ composerDone, onScheduled, setAccount(a) { account = a; }, state: () => ({ scheduled, toast }) })`);
+  c.setAccount(account);
+  const item = { id: 4, account_id: 1, send_at: 2_000_000_000, state: 'waiting', attempts: 0, last_error: null, subject: 'Hi', recipients: 'Bob' };
+  await c.composerDone({ kind: 'scheduled', item });
+  assert.equal(c.state().scheduled.length, 1);
+  assert.match(c.state().toast.text, /^Scheduled for .* to Bob$/);
+  list = [];
+  c.onScheduled({ id: 4, status: 'sent', subject: 'Hi', recipients: 'Bob', error: null, result: { sent_copy: 'saved', sent_copy_error: null, draft_cleanup_error: null } });
+  assert.match(c.state().toast.text, /Scheduled message sent to Bob/);
+  c.onScheduled({ id: 5, status: 'failed', subject: 'Hi', recipients: 'Ann', error: 'auth failed', result: null });
+  assert.match(c.state().toast.text, /Couldn't send the scheduled message to Ann: auth failed/);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(c.state().scheduled.length, 0, 'reloaded from the backend');
+});
+
+test('search can be limited to the open folder', async () => {
+  const calls = [];
+  const c = componentScript('src/App.svelte', {
+    api: threads({ listFolders: async () => [], listMessages: async () => [], search: async (...a) => { calls.push(a); return []; } }),
+    pimApi: {},
+  }, `({ onSearch, setScope, addFilter, run: async () => {}, setup(a, f) { account = a; folder = f; }, type(q) { query = q; }, q: () => query })`);
+  c.setup(account, { id: 10, name: 'INBOX', display: 'Inbox', role: 'inbox' });
+  c.type('from:bob');
+  c.onSearch();
+  await c.runTimers();
+  c.setScope('folder');
+  await c.runTimers();
+  assert.equal(JSON.stringify(calls), JSON.stringify([[1, 'from:bob', null], [1, 'from:bob', 10]]));
+  c.addFilter('has:attachment');
+  assert.equal(c.q(), 'from:bob has:attachment');
+});

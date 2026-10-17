@@ -418,8 +418,10 @@
   .later-pop > button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
   .later-custom { display: flex; gap: 6px; padding: 6px 4px 0; border-top: 1px solid var(--border); margin-top: 4px; }
   .later-custom input { flex: 1; min-width: 0; }
-  .tpl-wrap { position: relative; }
-  .tpl-pop { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; width: 280px; max-height: 320px; overflow: auto;
+  /* Anchored to the footer, so it stays inside a narrow inline reply. */
+  footer { position: relative; }
+  .tpl-wrap { position: static; }
+  .tpl-pop { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; width: min(300px, 100%); max-height: 320px; overflow: auto;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.2);
     display: flex; flex-direction: column; gap: 6px; }
   .tpl-pop p { margin: 2px 4px; font-size: 12px; }
