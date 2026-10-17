@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-queue-send"
+description = "Enables the queue_send command without any pre-configured scope."
+commands.allow = ["queue_send"]
+
+[[permission]]
+identifier = "deny-queue-send"
+description = "Denies the queue_send command without any pre-configured scope."
+commands.deny = ["queue_send"]

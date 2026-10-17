@@ -1,11 +1,14 @@
 <script lang="ts">
   // Per-account settings: server/login (re-verified on save), signature,
-  // sync window, trusted remote-image senders, and account removal.
+  // sync window, undo send, automatic replies, trusted remote-image senders,
+  // and account removal.
   import { onMount } from "svelte";
   import AccountSetup from "./AccountSetup.svelte";
   import RichEditor from "./RichEditor.svelte";
+  import AutoReply from "./AutoReply.svelte";
   import { Icon } from "@neutron/ui";
   import { api, errorText, type Account, type AccountSettings, type MailAddress } from "./api";
+  import { UNDO_SEND_CHOICES, setUndoSendSeconds, undoSendSeconds } from "./prefs";
 
   let { account, onClose, onUpdated, onRemoved }:
     { account: Account; onClose: () => void; onUpdated: (a: Account) => void; onRemoved: (id: number) => void } = $props();
@@ -14,6 +17,7 @@
   let signature = $state("");
   let syncDays = $state(0);
   let identities = $state<MailAddress[]>([]);
+  let undoDelay = $state(undoSendSeconds());
   let senders = $state<string[]>([]);
   let prefsBusy = $state(false);
   let prefsMsg = $state<{ text: string; error: boolean } | null>(null);
@@ -107,6 +111,17 @@
         <button class="btn primary" onclick={savePrefs} disabled={prefsBusy}>{prefsBusy ? "Saving…" : "Save signature, addresses and sync window"}</button>
       </div>
     </section>
+
+    <section class="card">
+      <h3>Undo send</h3>
+      <p class="muted">After you press Send, the message waits this long so you can still undo it (all accounts on this computer).</p>
+      <select value={undoDelay} onchange={(e) => { undoDelay = Number((e.currentTarget as HTMLSelectElement).value); setUndoSendSeconds(undoDelay); }}
+        aria-label="Undo send delay">
+        {#each UNDO_SEND_CHOICES as s (s)}<option value={s}>{s === 0 ? "Off: send immediately" : `${s} seconds`}</option>{/each}
+      </select>
+    </section>
+
+    {#key account.id}<AutoReply {account} />{/key}
 
     <section class="card">
       <h3>Remote images</h3>

@@ -45,7 +45,7 @@ pub struct MessageView {
     sender_trusted: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SendResult {
     /// "saved", "no_sent_folder" or "failed".
     sent_copy: &'static str,
@@ -441,22 +441,49 @@ async fn delete_draft(
     Ok(())
 }
 
-/// Sends via SMTP, then APPENDs a copy to the account's Sent folder (if
-/// one is known). The result tells the UI whether the Sent copy worked; a
-/// failure there does not mean the message was not sent.
-#[tauri::command]
-pub async fn send_message(
-    state: State<'_, AppState>,
+/// Remove earlier autosaved copies of a draft (same Message-ID) from the
+/// Drafts folder, on the server and in the cache. Needs UIDPLUS, like any
+/// single-message delete.
+async fn delete_drafts_by_message_id(
+    state: &AppState,
+    account: &Account,
+    password: &str,
+    message_id: &str,
+) -> Res<()> {
+    let Some(drafts) = state.store.folder_by_role(account.id, "drafts")? else {
+        return Ok(());
+    };
+    let mut s = imap::connect(&account.config, password).await?;
+    let res = async {
+        let uids = imap::uids_by_message_id(&mut s, &drafts.name, message_id).await?;
+        for uid in &uids {
+            imap::delete_uid(&mut s, &drafts.name, *uid).await?;
+        }
+        Ok::<_, Error>(uids)
+    }
+    .await;
+    drop(s.logout().await);
+    state.store.remove_uids(drafts.id, &res?)?;
+    Ok(())
+}
+
+/// Send via SMTP, then APPEND a copy to the account's Sent folder (if one
+/// is known) and remove the draft this message replaces (a resumed draft
+/// and/or its autosaved copy). The result tells the UI whether the Sent
+/// copy worked; a failure there does not mean the message was not sent.
+pub(crate) async fn deliver(
+    state: &AppState,
     account_id: i64,
-    message: OutgoingMessage,
+    message: &OutgoingMessage,
     replace_draft: Option<i64>,
+    replace_message_id: Option<&str>,
 ) -> Res<SendResult> {
     let account = state.store.account(account_id)?;
-    let password = crate::providers::credential(&state, account_id).await?;
+    let password = crate::providers::credential(state, account_id).await?;
     let identities = state.store.account_settings(account_id)?.identities;
     let sender = smtp::with_sender(&account.config, &identities, message.from.as_deref())?;
-    let files = resolve_attachments(&state, account_id, &message.attachments)?;
-    let raw = smtp::send(&sender, &password, &message, &files).await?;
+    let files = resolve_attachments(state, account_id, &message.attachments)?;
+    let raw = smtp::send(&sender, &password, message, &files).await?;
     tracing::info!(
         account = account_id,
         recipients = message.to.len() + message.cc.len() + message.bcc.len(),
@@ -486,27 +513,77 @@ pub async fn send_message(
         }
     }
     if let Some(draft) = replace_draft {
-        if let Err(e) = delete_draft(&state, &account, &password, draft).await {
+        if let Err(e) = delete_draft(state, &account, &password, draft).await {
             result.draft_cleanup_error = Some(e.to_string());
+        }
+    }
+    if let Some(mid) = replace_message_id.filter(|m| !m.is_empty()) {
+        if let Err(e) = delete_drafts_by_message_id(state, &account, &password, mid).await {
+            result.draft_cleanup_error.get_or_insert(e.to_string());
         }
     }
     for t in message.attachments.iter() {
         if let AttachmentRef::File { token } = t {
-            attachments::forget(&state, token);
+            attachments::forget(state, token);
         }
     }
     Ok(result)
 }
 
-/// Save to the Drafts folder (APPEND with \Draft). When resuming a draft,
-/// the previous version is removed after the new one is stored.
+/// Check a message can be built (recipients, sender, attachment sizes)
+/// without sending it, so mistakes show up in the composer at once.
+pub(crate) fn validate_outgoing(
+    state: &AppState,
+    account_id: i64,
+    message: &OutgoingMessage,
+) -> Res<()> {
+    let account = state.store.account(account_id)?;
+    let identities = state.store.account_settings(account_id)?.identities;
+    let sender = smtp::with_sender(&account.config, &identities, message.from.as_deref())?;
+    let files = resolve_attachments(state, account_id, &message.attachments)?;
+    smtp::build(&sender, message, &files, false)?;
+    Ok(())
+}
+
+/// Send now (no undo delay); see [`deliver`].
+#[tauri::command]
+pub async fn send_message(
+    state: State<'_, AppState>,
+    account_id: i64,
+    message: OutgoingMessage,
+    replace_draft: Option<i64>,
+    replace_message_id: Option<String>,
+) -> Res<SendResult> {
+    deliver(
+        &state,
+        account_id,
+        &message,
+        replace_draft,
+        replace_message_id.as_deref(),
+    )
+    .await
+}
+
+#[derive(Serialize)]
+pub struct SavedDraft {
+    /// Message-ID of the stored draft (pass it back to replace it later).
+    message_id: String,
+    /// Set when the previous copy could not be removed (e.g. no UIDPLUS):
+    /// the UI stops autosaving instead of piling up copies.
+    replace_error: Option<String>,
+}
+
+/// Save to the Drafts folder (APPEND with \Draft). The previous version of
+/// the draft (a resumed draft, and/or an earlier save of this one by
+/// Message-ID) is removed after the new one is stored.
 #[tauri::command]
 pub async fn save_draft(
     state: State<'_, AppState>,
     account_id: i64,
     message: OutgoingMessage,
     replace_draft: Option<i64>,
-) -> Res<()> {
+    replace_message_id: Option<String>,
+) -> Res<SavedDraft> {
     let account = state.store.account(account_id)?;
     let password = crate::providers::credential(&state, account_id).await?;
     let drafts = state
@@ -520,10 +597,36 @@ pub async fn save_draft(
     let mut s = imap::connect(&account.config, &password).await?;
     imap::append_with_flags(&mut s, &drafts.name, &built.raw, "(\\Seen \\Draft)").await?;
     drop(s.logout().await);
+    let mut replace_error = None;
     if let Some(old) = replace_draft {
-        delete_draft(&state, &account, &password, old).await?;
+        if let Err(e) = delete_draft(&state, &account, &password, old).await {
+            replace_error = Some(e.to_string());
+        }
     }
-    Ok(())
+    if let Some(mid) = replace_message_id
+        .as_deref()
+        .filter(|m| !m.is_empty() && *m != built.message_id)
+    {
+        if let Err(e) = delete_drafts_by_message_id(&state, &account, &password, mid).await {
+            replace_error.get_or_insert(e.to_string());
+        }
+    }
+    Ok(SavedDraft {
+        message_id: built.message_id,
+        replace_error,
+    })
+}
+
+/// Remove an autosaved draft (Discard in the composer).
+#[tauri::command]
+pub async fn discard_draft(
+    state: State<'_, AppState>,
+    account_id: i64,
+    message_id: String,
+) -> Res<()> {
+    let account = state.store.account(account_id)?;
+    let password = crate::providers::credential(&state, account_id).await?;
+    delete_drafts_by_message_id(&state, &account, &password, &message_id).await
 }
 
 /// Sanitize HTML pasted into (or loaded into) the rich-text composer.

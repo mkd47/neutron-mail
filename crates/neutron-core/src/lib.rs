@@ -5,6 +5,7 @@
 //! exposes these functions as commands.
 
 pub mod attachments;
+pub mod autoreply;
 pub mod compose;
 pub mod error;
 pub mod folders;

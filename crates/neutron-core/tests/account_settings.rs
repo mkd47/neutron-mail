@@ -297,3 +297,82 @@ fn replies_use_the_alias_the_mail_was_sent_to_and_never_address_it() {
     let plain = compose::prepare_as(raw, 1, Mode::Reply, &["me@example.test"]);
     assert_eq!(plain.from, None);
 }
+
+#[test]
+fn automatic_replies_store_settings_and_answer_each_sender_once_per_period() {
+    use neutron_core::autoreply::AutoReply;
+    let (store, id) = store_with_account();
+    assert_eq!(store.auto_reply(id).unwrap(), AutoReply::default());
+    assert!(
+        store
+            .set_auto_reply(
+                id,
+                &AutoReply {
+                    enabled: true,
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+        "needs a message"
+    );
+    let on = store
+        .set_auto_reply(
+            id,
+            &AutoReply {
+                enabled: true,
+                subject: "  Away  ".into(),
+                body: "Back Monday".into(),
+                days: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(on.enabled_at > 0, "switching on records when");
+    assert_eq!(on.subject, "Away");
+    assert_eq!(store.auto_reply(id).unwrap(), on);
+    // Once per sender every `days` days, case-insensitively.
+    let t = 1_000_000;
+    assert!(store.auto_reply_due(id, "bob@example.test", t, 2).unwrap());
+    store.record_auto_reply(id, "Bob@Example.test", t).unwrap();
+    assert!(!store
+        .auto_reply_due(id, "bob@example.test", t + 86_400, 2)
+        .unwrap());
+    assert!(store
+        .auto_reply_due(id, "bob@example.test", t + 2 * 86_400, 2)
+        .unwrap());
+    // Editing while on keeps the start time and the log; a new period resets both.
+    let edited = store
+        .set_auto_reply(
+            id,
+            &AutoReply {
+                body: "Back Tuesday".into(),
+                ..on.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(edited.enabled_at, on.enabled_at);
+    assert!(!store
+        .auto_reply_due(id, "bob@example.test", t + 1, 2)
+        .unwrap());
+    store
+        .set_auto_reply(
+            id,
+            &AutoReply {
+                enabled: false,
+                ..edited.clone()
+            },
+        )
+        .unwrap();
+    store
+        .set_auto_reply(
+            id,
+            &AutoReply {
+                enabled: true,
+                ..edited
+            },
+        )
+        .unwrap();
+    assert!(store
+        .auto_reply_due(id, "bob@example.test", t + 1, 2)
+        .unwrap());
+}

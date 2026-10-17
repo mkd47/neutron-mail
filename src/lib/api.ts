@@ -67,6 +67,9 @@ export interface ComposeDraft {
   in_reply_to: string | null; references: string[]; attachments: ForwardedAttachment[];
   /** Alias to send from (preselected for replies to mail sent to it); null = the account's address. */
   from?: string | null;
+  /** Frontend only, when reopening a message (undo send): files already picked, and its autosaved copy. */
+  picked?: PickedAttachment[];
+  draft_message_id?: string | null;
 }
 export type ComposeMode = "reply" | "reply_all" | "forward" | "draft";
 export interface PickedAttachment { token: string; name: string; size: number; mime: string }
@@ -103,6 +106,28 @@ export interface AccountSettings {
   identities: MailAddress[];
 }
 
+export interface AutoReply {
+  enabled: boolean;
+  /** Empty: "Automatic reply: <original subject>". */
+  subject: string;
+  body: string;
+  /** Optional period, unix seconds (inclusive). */
+  start: number | null;
+  end: number | null;
+  /** Reply to each sender at most once every this many days (1–30). */
+  days: number;
+  /** Let the mail server reply (Sieve vacation) instead of this computer. */
+  on_server: boolean;
+  enabled_at: number;
+}
+
+export interface AutoReplyServerSupport {
+  available: boolean;
+  dates: boolean;
+  detail: string;
+  provider_hint: string | null;
+}
+
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   listAccounts: () => invoke<Account[]>("list_accounts"),
@@ -118,6 +143,10 @@ export const api = {
   getAccountSettings: (accountId: number) => invoke<AccountSettings>("get_account_settings", { accountId }),
   setAccountSettings: (accountId: number, settings: AccountSettings) =>
     invoke<AccountSettings>("set_account_settings", { accountId, settings }),
+  getAutoReply: (accountId: number) => invoke<AutoReply>("get_auto_reply", { accountId }),
+  autoReplyServerSupport: (accountId: number) =>
+    invoke<AutoReplyServerSupport>("auto_reply_server_support", { accountId }),
+  setAutoReply: (accountId: number, settings: AutoReply) => invoke<AutoReply>("set_auto_reply", { accountId, settings }),
   newDraft: (accountId: number) => invoke<ComposeDraft>("new_draft", { accountId }),
   listImageSenders: (accountId: number) => invoke<string[]>("list_image_senders", { accountId }),
   setPassword: (accountId: number, password: string) => invoke<void>("set_password", { accountId, password }),
@@ -132,10 +161,17 @@ export const api = {
   messageSource: (messageId: number) => invoke<string>("message_source", { messageId }),
   search: (accountId: number, query: string) => invoke<SearchHit[]>("search", { accountId, query }),
   composePrefill: (messageId: number, mode: ComposeMode) => invoke<ComposeDraft>("compose_prefill", { messageId, mode }),
-  send: (accountId: number, message: Outgoing, replaceDraft: number | null = null) =>
-    invoke<SendResult>("send_message", { accountId, message, replaceDraft }),
-  saveDraft: (accountId: number, message: Outgoing, replaceDraft: number | null = null) =>
-    invoke<void>("save_draft", { accountId, message, replaceDraft }),
+  send: (accountId: number, message: Outgoing, replaceDraft: number | null = null, replaceMessageId: string | null = null) =>
+    invoke<SendResult>("send_message", { accountId, message, replaceDraft, replaceMessageId }),
+  /** Send after `delaySecs` unless cancelled (undo send); resolves to the queue id. */
+  queueSend: (accountId: number, message: Outgoing, replaceDraft: number | null, replaceMessageId: string | null, delaySecs: number) =>
+    invoke<number>("queue_send", { accountId, message, replaceDraft, replaceMessageId, delaySecs }),
+  cancelSend: (id: number) => invoke<boolean>("cancel_send", { id }),
+  sendNow: (id: number) => invoke<boolean>("send_now", { id }),
+  onSendResult: (cb: (e: SendResultEvent) => void): Promise<UnlistenFn> => listen<SendResultEvent>("mail://send-result", (e) => cb(e.payload)),
+  saveDraft: (accountId: number, message: Outgoing, replaceDraft: number | null = null, replaceMessageId: string | null = null) =>
+    invoke<{ message_id: string; replace_error: string | null }>("save_draft", { accountId, message, replaceDraft, replaceMessageId }),
+  discardDraft: (accountId: number, messageId: string) => invoke<void>("discard_draft", { accountId, messageId }),
   analyzeLink: (url: string) => invoke<LinkInfo>("analyze_link", { url }),
   pickAttachments: () => invoke<{ files: PickedAttachment[]; rejected: string[] }>("pick_attachments"),
   saveAttachment: (messageId: number, index: number) => invoke<string | null>("save_attachment", { messageId, index }),
@@ -198,7 +234,9 @@ export function errorText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
 }
 
-export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" };
+export type ComposerResult = { kind: "sent"; warning: string | null } | { kind: "draft" } | { kind: "discarded" }
+  | { kind: "queued"; id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null };
+export interface SendResultEvent { id: number; account_id: number; status: "sent" | "failed" | "cancelled"; result: SendResult | null; error: string | null }
 export const emptyDraft = (): ComposeDraft => ({ to: [], cc: [], bcc: [], subject: "", body: "", html: null, in_reply_to: null, references: [], attachments: [], from: null });
 
 export type DeleteMode = "move_to_trash" | "delete_messages";

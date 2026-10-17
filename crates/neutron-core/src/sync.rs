@@ -185,6 +185,15 @@ pub async fn sync_account_with_progress(
             }
         }
     }
+    // Automatic replies first, so rules that move mail can't hide it.
+    if let Some((fid, uids)) = &inbox_new {
+        if let Err(e) =
+            crate::autoreply::process(store, cfg, password, account_id, *fid, uids).await
+        {
+            tracing::warn!(account = account_id, "automatic reply failed: {e}");
+            report.rule_errors.push(format!("Automatic reply: {e}"));
+        }
+    }
     if let Some((fid, uids)) = inbox_new {
         match run_rules_on_new(store, &mut session, cfg, password, account_id, fid, &uids).await {
             Ok(rep) => {

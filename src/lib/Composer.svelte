@@ -1,11 +1,12 @@
 <script lang="ts">
   // Shared message editor: used inline in the preview pane (Reply / Reply all /
   // Forward / Edit draft) and inside the standalone Compose window.
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { Icon } from "@neutron/ui";
   import RecipientField from "./RecipientField.svelte";
   import RichEditor from "./RichEditor.svelte";
   import { size } from "./format";
+  import { undoSendSeconds } from "./prefs";
   import { api, errorText, type Account, type ComposeDraft, type ComposerResult, type ForwardedAttachment, type MailAddress, type PickedAttachment } from "./api";
 
   let { account, draft, title, inline = false, replaceDraft = null, onDone }:
@@ -25,7 +26,7 @@
   let html = $state(init.html ?? textToHtml(init.body));
   let editorKey = $state(0);
   let carried = $state<ForwardedAttachment[]>([...init.attachments]);
-  let picked = $state<PickedAttachment[]>([]);
+  let picked = $state<PickedAttachment[]>([...(init.picked ?? [])]);
   let busy = $state<"" | "send" | "draft" | "pick">("");
   let error = $state("");
   let notice = $state("");
@@ -37,6 +38,51 @@
   onMount(() => {
     api.getAccountSettings(account.id).then((s) => { identities = s.identities ?? []; }).catch(() => {});
   });
+
+  // ---- automatic draft saving ----
+  // Every 30 s, if anything changed, the draft is stored in Drafts; each save
+  // replaces the previous one (by Message-ID), and the resumed draft this
+  // composer was opened from is replaced by the first save.
+  const AUTOSAVE_MS = 30_000;
+  // svelte-ignore state_referenced_locally
+  let resumedId = $state<number | null>(replaceDraft);
+  let draftMid = $state<string | null>(init.draft_message_id ?? null);
+  let autosave = $state<"" | "saving" | "off">("");
+  let savedAt = $state<Date | null>(null);
+  let saveNote = $state("");
+  let saving: Promise<void> | null = null;
+  let closed = false;
+  const content = () => JSON.stringify(message());
+  // svelte-ignore state_referenced_locally
+  let lastSaved = content();
+  function hasContent() {
+    return to.length + cc.length + bcc.length > 0 || subject.trim() !== "" || picked.length > 0
+      || (rich ? html.replace(/<[^>]*>|&nbsp;/g, "").trim() !== "" : body.trim() !== "");
+  }
+  async function storeDraft(): Promise<void> {
+    const snapshot = content();
+    const r = await api.saveDraft(account.id, message(), resumedId, draftMid);
+    draftMid = r.message_id; resumedId = null; lastSaved = snapshot; savedAt = new Date(); saveNote = "";
+    if (r.replace_error) {
+      autosave = "off";
+      saveNote = `Autosave paused: the earlier copy couldn't be replaced (${r.replace_error})`;
+    }
+  }
+  function autoSave(): Promise<void> {
+    if (closed || busy || saving || autosave === "off" || content() === lastSaved || !hasContent()) return saving ?? Promise.resolve();
+    autosave = "saving";
+    saving = storeDraft()
+      .catch((e) => { saveNote = `Not saved: ${errorText(e)}`; })
+      .finally(() => { saving = null; if (autosave === "saving") autosave = ""; });
+    return saving;
+  }
+  $effect(() => {
+    const t = setInterval(() => void autoSave(), AUTOSAVE_MS);
+    return () => clearInterval(t);
+  });
+  // Closed without Send / Save / Discard (e.g. another message was opened):
+  // keep what was typed.
+  onDestroy(() => { void autoSave(); closed = true; });
 
   $effect(() => {
     // Replies: cursor at the top, above the quote.
@@ -91,24 +137,43 @@
       if (r.rejected.length) notice = `Not attached: ${r.rejected.join("; ")}`;
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
+  /** Everything needed to reopen this message exactly (undo send, failed send). */
+  function snapshot(): ComposeDraft {
+    return {
+      to: [...to], cc: [...cc], bcc: [...bcc], subject,
+      body: rich ? "" : body, html: rich ? html : null,
+      in_reply_to: init.in_reply_to, references: init.references,
+      attachments: [...carried], from, picked: [...picked], draft_message_id: draftMid,
+    };
+  }
   async function send() {
     if (busy) return;
     if (!to.length && !cc.length && !bcc.length) { error = "Add at least one recipient."; return; }
     busy = "send"; error = "";
     try {
-      const r = await api.send(account.id, message(), replaceDraft);
-      const warn = r.sent_copy === "failed"
-        ? `Sent, but the copy could not be saved to Sent: ${r.sent_copy_error}`
-        : r.sent_copy === "no_sent_folder" ? "Sent. This account has no Sent folder, so no copy was saved."
-        : r.draft_cleanup_error ? `Sent, but the old draft could not be removed: ${r.draft_cleanup_error}` : null;
-      onDone({ kind: "sent", warning: warn });
+      if (saving) await saving;
+      const id = await api.queueSend(account.id, message(), resumedId, draftMid, undoSendSeconds());
+      closed = true;
+      onDone({ kind: "queued", id, account, draft: snapshot(), replaceDraft: resumedId });
     } catch (e) { error = errorText(e); } finally { busy = ""; }
   }
   async function saveDraft() {
     if (busy) return;
     busy = "draft"; error = "";
-    try { await api.saveDraft(account.id, message(), replaceDraft); onDone({ kind: "draft" }); }
-    catch (e) { error = errorText(e); } finally { busy = ""; }
+    try {
+      if (saving) await saving;
+      await storeDraft();
+      closed = true;
+      onDone({ kind: "draft" });
+    } catch (e) { error = errorText(e); } finally { busy = ""; }
+  }
+  async function discard() {
+    if (busy === "send") return;
+    closed = true;
+    if (saving) await saving.catch(() => {});
+    // Remove the autosaved copy too; a failure is reported but doesn't block.
+    if (draftMid) api.discardDraft(account.id, draftMid).catch(() => {});
+    onDone({ kind: "discarded" });
   }
   function onKey(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void send(); }
@@ -168,7 +233,10 @@
       title={rich ? "Send as plain text only" : "Use rich text (HTML)"}>{rich ? "Plain text" : "Rich text"}</button>
     <button type="button" class="btn" onclick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "Saving…" : "Save draft"}</button>
     <span class="spacer"></span>
-    <button type="button" class="btn ghost" onclick={() => onDone({ kind: "discarded" })} disabled={busy === "send"}>Discard</button>
+    <span class="saved muted" role="status" aria-live="polite" title={saveNote}>
+      {#if autosave === "saving"}Saving…{:else if saveNote}{saveNote.startsWith("Autosave paused") ? "Autosave paused" : "Not saved"}{:else if savedAt}Saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{/if}
+    </span>
+    <button type="button" class="btn ghost" onclick={discard} disabled={busy === "send"}>Discard</button>
   </footer>
 </section>
 
@@ -194,6 +262,7 @@
   .notice { margin: 0; color: #f5b14c; font-size: 13px; }
   .error { margin: 0; font-size: 13px; }
   footer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-top: 6px; }
+  .saved { font-size: 12px; white-space: nowrap; }
   footer .btn { display: inline-flex; gap: 6px; align-items: center; }
   .spacer { flex: 1; }
   .ghost { background: transparent; }

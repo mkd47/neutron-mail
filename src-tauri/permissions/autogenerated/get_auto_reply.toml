@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-auto-reply"
+description = "Enables the get_auto_reply command without any pre-configured scope."
+commands.allow = ["get_auto_reply"]
+
+[[permission]]
+identifier = "deny-get-auto-reply"
+description = "Denies the get_auto_reply command without any pre-configured scope."
+commands.deny = ["get_auto_reply"]

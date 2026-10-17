@@ -17,22 +17,22 @@ function composer(api) {
 
 test('repeated send shortcut cannot submit a second SMTP request', async () => {
   const request = deferred(); let calls = 0;
-  const c = composer({ send() { calls++; return request.promise; } });
+  const c = composer({ queueSend() { calls++; return request.promise; } });
   const sending = c.send();
   c.onKey({ ctrlKey: true, key: 'Enter', preventDefault() {} });
   await c.send();
   assert.equal(calls, 1);
-  request.resolve({ sent_copy: 'saved', draft_cleanup_error: null });
+  request.resolve(7);
   await sending;
 });
 
 test('send shortcut is blocked while a draft save is in flight', async () => {
   const request = deferred(); let sends = 0;
-  const c = composer({ saveDraft: () => request.promise, send: async () => { sends++; return { sent_copy: 'saved' }; } });
+  const c = composer({ saveDraft: () => request.promise, queueSend: async () => { sends++; return 1; } });
   const saving = c.saveDraft();
   await c.send();
   assert.equal(sends, 0);
-  request.resolve(); await saving;
+  request.resolve({ message_id: 'd1', replace_error: null }); await saving;
 });
 
 function app(api) {
@@ -266,7 +266,7 @@ test('the composer sends from the primary address unless an alias is chosen', as
   const sent = [];
   const make = (d) => componentScript('src/lib/Composer.svelte', {
     $props: () => ({ account, draft: d, title: 'Reply', onDone() {} }),
-    api: { send: async (_id, m) => { sent.push(m.from); return { sent_copy: 'saved' }; } },
+    api: { queueSend: async (_id, m) => { sent.push(m.from); return 1; } },
   }, '({ send, setFrom(v) { from = v; } })');
   await make(draft).send();
   const reply = make({ ...draft, from: 'sales@example.test' });
@@ -299,4 +299,163 @@ test('in conversation view, actions on a row apply to every message of the conve
   assert.equal(JSON.stringify(calls), JSON.stringify([
     ['flag', [5, 3, 1], 'seen', true], ['flag', [5, 3, 1], 'flagged', true], ['flag', [4], 'flagged', false], ['move', [5, 3, 1], 11],
   ]));
+});
+
+// ---- undo send and draft autosave ----
+function draftComposer(api, props = {}) {
+  const done = [];
+  const c = componentScript('src/lib/Composer.svelte', {
+    $props: () => ({ account, draft, title: 'New message', onDone: (r) => done.push(r), ...props }),
+    api: { getAccountSettings: async () => ({ identities: [] }), ...api },
+  }, `({ send, saveDraft, discard, autoSave, type(v) { subject = v; },
+         state: () => ({ draftMid, autosave, resumedId, saveNote }) })`);
+  return { c, done };
+}
+
+test('Send queues the message with the undo delay and hands back everything needed to reopen it', async () => {
+  const calls = [];
+  const { c, done } = draftComposer({ queueSend: async (...args) => { calls.push(args); return 42; } }, { replaceDraft: 5 });
+  await c.send();
+  const [accountId, , replaceDraft, replaceMid, delay] = calls[0];
+  assert.deepEqual([accountId, replaceDraft, replaceMid, delay], [1, 5, null, 10]);
+  assert.equal(done[0].kind, 'queued');
+  assert.equal(done[0].id, 42);
+  assert.equal(done[0].draft.subject, 'Hello');
+  assert.equal(done[0].replaceDraft, 5);
+});
+
+test('autosave stores changed drafts and replaces its own previous copy', async () => {
+  const saves = [];
+  let n = 0;
+  const { c } = draftComposer({ saveDraft: async (_a, m, replaceDraft, replaceMid) => { saves.push([m.subject, replaceDraft, replaceMid]); return { message_id: `d${++n}`, replace_error: null }; } },
+    { replaceDraft: 9 });
+  await c.autoSave();                       // unchanged since opening: nothing to save
+  assert.equal(saves.length, 0);
+  c.type('Hello again'); await c.autoSave();
+  c.type('Hello again!'); await c.autoSave();
+  await c.autoSave();                       // unchanged again
+  assert.equal(JSON.stringify(saves), JSON.stringify([['Hello again', 9, null], ['Hello again!', null, 'd1']]));
+  assert.equal(c.state().draftMid, 'd2');
+});
+
+test('autosave pauses instead of piling up copies when the old one cannot be replaced', async () => {
+  let saves = 0;
+  const { c } = draftComposer({ saveDraft: async () => { saves++; return { message_id: `d${saves}`, replace_error: 'needs UIDPLUS' }; } });
+  c.type('One'); await c.autoSave();
+  c.type('Two'); await c.autoSave();
+  assert.equal(saves, 1);
+  assert.equal(c.state().autosave, 'off');
+  assert.match(c.state().saveNote, /Autosave paused/);
+});
+
+test('Discard removes the autosaved copy; Send after an autosave replaces it', async () => {
+  const discarded = [], queued = [];
+  const { c, done } = draftComposer({
+    saveDraft: async () => ({ message_id: 'auto1', replace_error: null }),
+    discardDraft: async (accountId, mid) => { discarded.push([accountId, mid]); },
+    queueSend: async (_a, _m, _r, mid) => { queued.push(mid); return 3; },
+  });
+  c.type('Changed'); await c.autoSave();
+  await c.send();
+  assert.deepEqual(queued, ['auto1']);
+  const second = draftComposer({ saveDraft: async () => ({ message_id: 'auto2', replace_error: null }),
+    discardDraft: async (accountId, mid) => { discarded.push([accountId, mid]); } });
+  second.c.type('Changed'); await second.c.autoSave();
+  await second.c.discard();
+  assert.equal(JSON.stringify(discarded), JSON.stringify([[1, 'auto2']]));
+  assert.equal(second.done[0].kind, 'discarded');
+  assert.equal(done[0].kind, 'queued');
+});
+
+function outbox(api) {
+  const c = componentScript('src/App.svelte', { api: threads({ listFolders: async () => [], listMessages: async () => [], syncAccount: async () => report, ...api }), pimApi: {} },
+    `({ composerDone, undoSend, sendNow, onSendResult, setAccount(a) { account = a; },
+        state: () => ({ pendingSends, compose, composeTitle, composeReplace, toast }) })`);
+  c.setAccount(account);
+  return c;
+}
+const queued = (id) => ({ kind: 'queued', id, account, draft: { ...draft, picked: [{ token: 't', name: 'a.pdf', size: 1, mime: 'application/pdf' }] }, replaceDraft: 4 });
+
+test('Undo within the delay reopens the exact message; too late says so', async () => {
+  const c = outbox({ cancelSend: async (id) => id === 1 });
+  await c.composerDone(queued(1));
+  await c.composerDone(queued(2));
+  assert.equal(c.state().pendingSends.length, 2);
+  await c.undoSend(c.state().pendingSends[0]);
+  assert.equal(c.state().compose.subject, 'Hello');
+  assert.equal(c.state().compose.picked[0].token, 't');
+  assert.equal(c.state().composeReplace, 4);
+  assert.equal(c.state().composeTitle, 'Edit message');
+  await c.undoSend(c.state().pendingSends[0]);
+  assert.match(c.state().toast.text, /Too late to undo/);
+  assert.equal(c.state().pendingSends.length, 0);
+});
+
+test('a failed send reopens the message; a sent one just confirms', async () => {
+  const c = outbox({});
+  await c.composerDone(queued(5));
+  c.onSendResult({ id: 5, account_id: 1, status: 'sent', result: { sent_copy: 'saved', sent_copy_error: null, draft_cleanup_error: null }, error: null });
+  assert.equal(c.state().pendingSends.length, 0);
+  assert.equal(c.state().compose, null);
+  assert.match(c.state().toast.text, /Message sent to friend@example.test/);
+  await c.composerDone(queued(6));
+  c.onSendResult({ id: 6, account_id: 1, status: 'failed', result: null, error: 'SMTP error: 550' });
+  assert.equal(c.state().compose.subject, 'Hello');
+  assert.match(c.state().toast.text, /Couldn't send: SMTP error: 550/);
+});
+
+// ---- automatic replies ----
+const autoReplyOff = { enabled: false, subject: '', body: '', start: null, end: null, days: 4, on_server: false, enabled_at: 0 };
+function autoReply(api) {
+  return componentScript('src/lib/AutoReply.svelte', {
+    $props: () => ({ account }),
+    api: { getAutoReply: async () => ({ ...autoReplyOff }), autoReplyServerSupport: async () => ({ available: false, dates: false, detail: 'no ManageSieve', provider_hint: '263 webmail' }), ...api },
+  }, `({ save, toDay, fromDay, edit(v) { enabled = v.enabled ?? enabled; body = v.body ?? body; startDay = v.startDay ?? startDay;
+         endDay = v.endDay ?? endDay; onServer = v.onServer ?? onServer; days = v.days ?? days; },
+         state: () => ({ enabled, msg, support, saved }) })`);
+}
+
+test('automatic reply dates are whole local days', () => {
+  const c = autoReply({});
+  const start = c.fromDay('2026-07-01', false), end = c.fromDay('2026-07-14', true);
+  assert.equal(c.toDay(start), '2026-07-01');
+  assert.equal(c.toDay(end), '2026-07-14');
+  assert.equal(end - c.fromDay('2026-07-14', false), 86399);
+  assert.equal(c.fromDay('', false), null);
+});
+
+test('automatic replies save from this computer and show the provider hint', async () => {
+  const saves = [];
+  const c = autoReply({ setAutoReply: async (_id, s) => { saves.push(s); return { ...s, enabled_at: 100 }; } });
+  await c.mount();
+  assert.equal(c.state().support.provider_hint, '263 webmail');
+  c.edit({ enabled: true });
+  await c.save();                                // no text yet
+  assert.equal(saves.length, 0);
+  assert.match(c.state().msg.text, /reply text/);
+  c.edit({ body: 'Away until Monday', startDay: '2026-07-14', endDay: '2026-07-01' });
+  await c.save();                                // end before start
+  assert.equal(saves.length, 0);
+  c.edit({ startDay: '2026-07-01', endDay: '2026-07-14', days: 99 });
+  await c.save();
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].days, 30);
+  assert.equal(saves[0].on_server, false);
+  assert.equal(c.toDay(saves[0].start), '2026-07-01');
+  assert.equal(c.state().saved.enabled_at, 100);
+});
+
+test('automatic replies refuse the server when it cannot reply or ignore dates', async () => {
+  const saves = [];
+  const c = autoReply({ setAutoReply: async (_id, s) => { saves.push(s); return s; },
+    autoReplyServerSupport: async () => ({ available: true, dates: false, detail: '', provider_hint: null }) });
+  await c.mount();
+  c.edit({ enabled: true, body: 'Away', onServer: true, startDay: '2026-07-01' });
+  await c.save();
+  assert.equal(saves.length, 0);
+  assert.match(c.state().msg.text, /dates/);
+  c.edit({ startDay: '' });
+  await c.save();
+  assert.equal(saves[0].on_server, true);
+  assert.equal(saves[0].start, null);
 });

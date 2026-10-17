@@ -324,44 +324,46 @@ pub struct SieveStatus {
     oauth: bool,
 }
 
-fn export(state: &AppState, account_id: i64) -> Res<SieveExport> {
+pub(crate) fn export(state: &AppState, account_id: i64) -> Res<SieveExport> {
     let account = state.store.account(account_id)?;
     let trash = state
         .store
         .folder_by_role(account_id, "trash")?
         .map(|f| f.display)
         .unwrap_or_else(|| "Trash".into());
-    Ok(rules::to_sieve(
+    // The automatic reply rides in the same script when it runs on the server.
+    let reply = state.store.auto_reply(account_id)?;
+    let vacation = (reply.enabled && reply.on_server).then(|| {
+        let own: Vec<String> = std::iter::once(account.config.email.clone())
+            .chain(
+                state
+                    .store
+                    .account_settings(account_id)
+                    .map(|s| s.identities)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|i| i.email),
+            )
+            .collect();
+        neutron_core::autoreply::sieve_block(&reply, &own)
+    });
+    Ok(rules::to_sieve_with(
         &state.store.rules()?,
         &account.config.email,
         &trash,
+        vacation,
     ))
 }
 
-#[tauri::command]
-pub fn sieve_status(state: State<'_, AppState>, account_id: i64) -> Res<SieveStatus> {
-    Ok(SieveStatus {
-        settings: state.store.sieve_settings(account_id)?,
-        preview: export(&state, account_id)?,
-        oauth: state.store.account(account_id)?.config.auth.is_oauth(),
-    })
-}
-
-/// Check, upload and activate the server-side rules as a Sieve script.
-#[tauri::command]
-pub async fn sieve_upload(
-    state: State<'_, AppState>,
+/// Upload and activate our script (rules + automatic reply) on `port`.
+pub(crate) async fn upload_script(
+    state: &AppState,
     account_id: i64,
     port: u16,
 ) -> Res<SieveExport> {
     let account = state.store.account(account_id)?;
-    let ex = export(&state, account_id)?;
-    if ex.exported.is_empty() {
-        return Err(Error::Invalid(
-            "no enabled rule is set to run on the server".into(),
-        ));
-    }
-    let password = crate::providers::credential(&state, account_id).await?;
+    let ex = export(state, account_id)?;
+    let password = crate::providers::credential(state, account_id).await?;
     let mut ms = managesieve::Client::connect(&account.config, port, &password).await?;
     let r = async {
         ms.check_script(&ex.script).await?;
@@ -382,12 +384,11 @@ pub async fn sieve_upload(
     Ok(ex)
 }
 
-/// Deactivate and remove our script; server-side rules run locally again.
-#[tauri::command]
-pub async fn sieve_disable(state: State<'_, AppState>, account_id: i64) -> Res<()> {
+/// Deactivate and remove our script.
+pub(crate) async fn remove_script(state: &AppState, account_id: i64) -> Res<()> {
     let account = state.store.account(account_id)?;
     let settings = state.store.sieve_settings(account_id)?;
-    let password = crate::providers::credential(&state, account_id).await?;
+    let password = crate::providers::credential(state, account_id).await?;
     let mut ms = managesieve::Client::connect(&account.config, settings.port, &password).await?;
     let r = async {
         let ours = ms
@@ -413,4 +414,36 @@ pub async fn sieve_disable(state: State<'_, AppState>, account_id: i64) -> Res<(
             active: false,
         },
     )
+}
+
+#[tauri::command]
+pub fn sieve_status(state: State<'_, AppState>, account_id: i64) -> Res<SieveStatus> {
+    Ok(SieveStatus {
+        settings: state.store.sieve_settings(account_id)?,
+        preview: export(&state, account_id)?,
+        oauth: state.store.account(account_id)?.config.auth.is_oauth(),
+    })
+}
+
+/// Check, upload and activate the server-side rules as a Sieve script.
+#[tauri::command]
+pub async fn sieve_upload(
+    state: State<'_, AppState>,
+    account_id: i64,
+    port: u16,
+) -> Res<SieveExport> {
+    let preview = export(&state, account_id)?;
+    let reply = state.store.auto_reply(account_id)?;
+    if preview.exported.is_empty() && !(reply.enabled && reply.on_server) {
+        return Err(Error::Invalid(
+            "no enabled rule is set to run on the server".into(),
+        ));
+    }
+    upload_script(&state, account_id, port).await
+}
+
+/// Deactivate and remove our script; server-side rules run locally again.
+#[tauri::command]
+pub async fn sieve_disable(state: State<'_, AppState>, account_id: i64) -> Res<()> {
+    remove_script(&state, account_id).await
 }

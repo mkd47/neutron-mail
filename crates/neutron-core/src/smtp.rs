@@ -431,6 +431,67 @@ fn rand_hex() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// An automatic (out-of-office) reply: plain text, threaded to the original,
+/// marked `Auto-Submitted: auto-replied` (RFC 3834) so other auto-responders
+/// don't answer it, and `X-Auto-Response-Suppress: All` for Exchange.
+pub fn build_auto_reply(
+    cfg: &AccountConfig,
+    to: &str,
+    subject: &str,
+    body: &str,
+    in_reply_to: Option<&str>,
+    references: &[String],
+) -> Result<Built> {
+    let to = mailbox(to)?;
+    let from: Mailbox = Mailbox::new(
+        Some(cfg.display_name.clone()).filter(|n| !n.is_empty()),
+        cfg.email
+            .parse()
+            .map_err(|e| Error::Invalid(format!("bad sender address: {e}")))?,
+    );
+    let subject: String = subject
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect();
+    let domain = from.email.domain().to_string();
+    let message_id = new_message_id(&domain);
+    let mut b = MessageBuilder::new()
+        .from(to_addr(&from))
+        .to(to_addr(&to))
+        .subject(subject)
+        .message_id(message_id.clone())
+        .date(chrono::Utc::now().timestamp())
+        .header("User-Agent", Text::new("Neutron Mail"))
+        .header("Auto-Submitted", Text::new("auto-replied"))
+        .header("X-Auto-Response-Suppress", Text::new("All"));
+    if let Some(parent) = in_reply_to
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|p| clean_id(p).ok())
+    {
+        b = b.in_reply_to(parent);
+    }
+    let refs: Vec<String> = references
+        .iter()
+        .filter_map(|r| clean_id(r).ok())
+        .take(20)
+        .collect();
+    if !refs.is_empty() {
+        b = b.references(refs);
+    }
+    let raw = b
+        .body(MimePart::new(utf8("text/plain"), body.to_string()))
+        .write_to_vec()
+        .map_err(|e| Error::Invalid(format!("cannot build message: {e}")))?;
+    let envelope = Envelope::new(Some(from.email.clone()), vec![to.email.clone()])
+        .map_err(|e| Error::Invalid(format!("envelope: {e}")))?;
+    Ok(Built {
+        raw,
+        envelope,
+        message_id,
+    })
+}
+
 /// A rule forward: the original attached as `message/rfc822`, marked
 /// `Auto-Submitted: auto-forwarded` (RFC 3834) so other automata (and our
 /// own rules) don't forward it again.

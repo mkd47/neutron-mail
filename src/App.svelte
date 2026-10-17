@@ -13,7 +13,8 @@
   import Calendar from "./lib/Calendar.svelte";
   import TodayPanel from "./lib/TodayPanel.svelte";
   import { api, emptyDraft, errorText, type Account, type AppInfo, type ComposeDraft, type ComposerResult, type Folder,
-    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, pimApi } from "./lib/api";
+    type LinkInfo, type MailAddress, type MessageSummary, type MessageView, type SearchHit, type Transfer, type DeleteMode, type EmailLink, type SyncProgress, type ThreadSummary, type SendResultEvent, pimApi } from "./lib/api";
+  import { undoSendSeconds } from "./lib/prefs";
   import { shortDate, snippetParts } from "./lib/format";
 
   let theme = $state<"dark" | "light">(
@@ -131,6 +132,7 @@
 
   async function newCompose() {
     if (!account) return;
+    composeAccount = null; composeReplace = null; composeTitle = "New message";
     try { compose = await api.newDraft(account.id); }
     catch (e) { compose = emptyDraft(); showToast(`Couldn't load your signature: ${errorText(e)}`, true); }
   }
@@ -147,6 +149,72 @@
     else { accountVersion++; navigationRequest++; detailRequest++; searchRequest++; account = null; folders = []; messages = []; detail = null; selectedId = null; picked = []; showSetup = true; }
   }
   let compose = $state<ComposeDraft | null>(null);
+  // The standalone composer normally writes from the current account; a
+  // message reopened after Undo keeps its own account and resumed draft.
+  let composeAccount = $state<Account | null>(null);
+  let composeReplace = $state<number | null>(null);
+  let composeTitle = $state("New message");
+
+  // ---- undo send ----
+  type PendingSend = { id: number; account: Account; draft: ComposeDraft; replaceDraft: number | null; label: string; deadline: number; total: number };
+  let pendingSends = $state<PendingSend[]>([]);
+  let clock = $state(Date.now());
+  $effect(() => {
+    if (!pendingSends.length) return;
+    const t = setInterval(() => (clock = Date.now()), 250);
+    return () => clearInterval(t);
+  });
+  function recipientsLabel(d: ComposeDraft) {
+    const all = [...d.to, ...d.cc, ...d.bcc];
+    const first = (all[0] ?? "").replace(/\s*<[^>]+>$/, "").replace(/^"|"$/g, "") || all[0] || "";
+    return all.length > 1 ? `${first} +${all.length - 1}` : first;
+  }
+  function reopenMessage(p: { account: Account; draft: ComposeDraft; replaceDraft: number | null }, title: string) {
+    if (compose) {
+      // One composer at a time: keep the reopened message safe in Drafts instead.
+      api.saveDraft(p.account.id, toOutgoing(p.draft), p.replaceDraft, p.draft.draft_message_id ?? null)
+        .then(() => showToast("The message was saved to Drafts (another message is open)."))
+        .catch((e) => showToast(`Couldn't keep the message: ${errorText(e)}`, true));
+      return;
+    }
+    composeAccount = p.account; composeReplace = p.replaceDraft; composeTitle = title; compose = p.draft;
+  }
+  function toOutgoing(d: ComposeDraft) {
+    return {
+      from: d.from ?? null, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body: d.body, html_body: d.html,
+      in_reply_to: d.in_reply_to, references: d.references,
+      attachments: [
+        ...d.attachments.map((a) => ({ kind: "message" as const, message_id: a.message_id, index: a.index })),
+        ...(d.picked ?? []).map((f) => ({ kind: "file" as const, token: f.token })),
+      ],
+    };
+  }
+  async function undoSend(p: PendingSend) {
+    const stillWaiting = await api.cancelSend(p.id).catch(() => false);
+    pendingSends = pendingSends.filter((x) => x.id !== p.id);
+    if (stillWaiting) reopenMessage(p, "Edit message");
+    else showToast("Too late to undo: the message is already on its way.", true);
+  }
+  function sendNow(p: PendingSend) {
+    void api.sendNow(p.id);
+    pendingSends = pendingSends.map((x) => (x.id === p.id ? { ...x, deadline: Date.now() } : x));
+  }
+  function onSendResult(e: SendResultEvent) {
+    const p = pendingSends.find((x) => x.id === e.id);
+    pendingSends = pendingSends.filter((x) => x.id !== e.id);
+    if (e.status === "sent" && e.result) {
+      const r = e.result;
+      const warn = r.sent_copy === "failed" ? `Sent, but the copy could not be saved to Sent: ${r.sent_copy_error}`
+        : r.sent_copy === "no_sent_folder" ? "Sent. This account has no Sent folder, so no copy was saved."
+        : r.draft_cleanup_error ? `Sent, but the draft could not be removed: ${r.draft_cleanup_error}` : null;
+      showToast(warn ?? `Message sent${p ? ` to ${p.label}` : ""}`, warn !== null);
+      void sync();
+    } else if (e.status === "failed") {
+      showToast(`Couldn't send: ${e.error}. The message is open again, nothing was lost.`, true);
+      if (p) reopenMessage(p, "Send failed: edit message");
+    }
+  }
+
   let agendaKey = $state(0);
   // Unread badge (window title + dock): unread mail in the inbox.
   const inboxUnread = $derived(folders.find((f) => f.role === "inbox")?.unread ?? 0);
@@ -459,7 +527,8 @@
   function onKey(e: KeyboardEvent) {
     const t = e.target as HTMLElement;
     if (t.closest("input, textarea, select, [contenteditable], .modal") || compose || showSettings || showRules) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && lastTransfer) { e.preventDefault(); void undo(); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && pendingSends.length) { e.preventDefault(); void undoSend(pendingSends[pendingSends.length - 1]); }
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && lastTransfer) { e.preventDefault(); void undo(); }
     else if (e.key.toLowerCase() === "v" && !e.ctrlKey && !e.metaKey && selection().length) { e.preventDefault(); pickerQuery = ""; picker = { copy: e.shiftKey }; }
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && t.closest(".list")) { e.preventDefault(); picked = list.map((m) => m.id); }
     else if (e.key === "Escape") { picked = []; menu = null; msgMenu = null; }
@@ -559,6 +628,12 @@
     untrack(() => { if (selectedId !== null) void reload(loadRemote, true); });
   });
   async function composerDone(r: ComposerResult) {
+    if (r.kind === "queued") {
+      const delay = undoSendSeconds();
+      pendingSends = [...pendingSends, { id: r.id, account: r.account, draft: r.draft, replaceDraft: r.replaceDraft,
+        label: recipientsLabel(r.draft), deadline: Date.now() + delay * 1000, total: Math.max(delay, 0.001) * 1000 }];
+      return;
+    }
     if (r.kind === "sent") { showToast(r.warning ?? "Message sent", r.warning !== null); await sync(); }
     else if (r.kind === "draft") { showToast("Draft saved to Drafts"); await sync(); }
   }
@@ -593,7 +668,8 @@
         const u5 = await api.onSyncProgress(onSyncProgress);
         // A clicked new-mail notification opens its message.
         const u6 = await api.onOpenMessage((e) => { void openMessageById(e.message_id); });
-        unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); };
+        const u7 = await api.onSendResult(onSendResult);
+        unlisten = () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); };
         if (accounts[0]) await selectAccount(accounts[0]); else showSetup = true;
       } catch (e) { status = errorText(e); }
     })();
@@ -784,7 +860,8 @@
   {/if}
   </div>
   {#if compose}
-    <Compose {account} draft={compose} onClose={(r) => { compose = null; void composerDone(r); }} />
+    <Compose account={composeAccount ?? account} draft={compose} title={composeTitle} replaceDraft={composeReplace}
+      onClose={(r) => { compose = null; composeAccount = null; composeReplace = null; void composerDone(r); }} />
   {/if}
   {#if link}
     <LinkDialog {link} onClose={(u) => { link = null; if (u) showToast(`Opened ${new URL(u).host} in your browser`); }} />
@@ -879,6 +956,24 @@
       </div>
     </div>
   {/if}
+  {#if pendingSends.length}
+    <div class="sendbar-stack" aria-live="polite">
+      {#each pendingSends as p (p.id)}
+        {@const left = Math.max(0, p.deadline - clock)}
+        <div class="sendbar" role="status">
+          <div class="sendtext">
+            <strong>{left > 0 ? `Sending in ${Math.ceil(left / 1000)} s` : "Sending…"}</strong>
+            <span class="muted">to {p.label || "recipients"}{p.draft.subject ? ` · ${p.draft.subject}` : ""}</span>
+          </div>
+          {#if left > 0}
+            <button class="btn sm" onclick={() => undoSend(p)} title="Undo (Ctrl+Z): reopen the message">Undo</button>
+            <button class="btn sm ghost-btn" onclick={() => sendNow(p)}>Send now</button>
+          {/if}
+          <div class="sendprogress" style:width={`${(left / p.total) * 100}%`}></div>
+        </div>
+      {/each}
+    </div>
+  {/if}
   {#if toast}
     <div class="toast" class:warn={toast.warn} role="status">{toast.text}
       {#if toast.undo}{@const u = toast.undo}<button class="btn sm" onclick={() => undo(u)} title="Undo (Ctrl+Z)">Undo</button>{/if}
@@ -935,6 +1030,13 @@
   .empty { padding: 24px; text-align: center; }
   .reader { background: var(--panel); min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   .reader > :global(:not(.agenda)) { flex: 1; min-height: 0; }
+  .sendbar-stack { position: fixed; left: 18px; bottom: 18px; z-index: 61; display: flex; flex-direction: column; gap: 8px; max-width: min(460px, calc(100vw - 36px)); }
+  .sendbar { position: relative; overflow: hidden; display: flex; gap: 10px; align-items: center; padding: 10px 12px 12px 14px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 30px #0005; font-size: 13px; }
+  .sendtext { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .sendtext .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sendbar .ghost-btn { background: transparent; }
+  .sendprogress { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); transition: width .25s linear; }
   .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 60; display: flex; gap: 8px; align-items: center;
     background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 10px;
     padding: 8px 8px 8px 14px; box-shadow: 0 10px 30px #0005; max-width: 70vw; font-size: 13px; }

@@ -6,7 +6,8 @@
   import Composer from "./Composer.svelte";
   import type { Account, ComposeDraft, ComposerResult } from "./api";
 
-  let { account, draft, onClose }: { account: Account; draft: ComposeDraft; onClose: (r: ComposerResult) => void } = $props();
+  let { account, draft, onClose, title = "New message", replaceDraft = null }:
+    { account: Account; draft: ComposeDraft; onClose: (r: ComposerResult) => void; title?: string; replaceDraft?: number | null } = $props();
 
   const MIN_W = 480, MIN_H = 380;
   function saved(): { w: number; h: number; max: boolean } {
@@ -43,11 +44,11 @@
 </script>
 
 <div class="backdrop" role="presentation">
-  <div class="window" class:maximized role="dialog" aria-modal="true" aria-label="New message"
+  <div class="window" class:maximized role="dialog" aria-modal="true" aria-label={title}
     style:width={maximized ? null : `min(${width}px, calc(100vw - 16px))`} style:height={maximized ? null : `min(${height}px, calc(100vh - 16px))`}>
     <button class="max" onclick={toggleMax} title={maximized ? "Restore size" : "Maximize"} aria-pressed={maximized}
       aria-label={maximized ? "Restore window size" : "Maximize window"}>{maximized ? "❐" : "□"}</button>
-    <Composer {account} {draft} title="New message" onDone={onClose} />
+    <Composer {account} {draft} {title} {replaceDraft} onDone={onClose} />
     {#if !maximized}
       <div class="grip" role="separator" aria-label="Resize window" title="Drag to resize"
         onpointerdown={startResize} onpointermove={onResize} onpointerup={endResize} onpointercancel={endResize}>

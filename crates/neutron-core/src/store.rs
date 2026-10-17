@@ -83,6 +83,12 @@ CREATE TABLE IF NOT EXISTS account_settings (
   signature_html TEXT NOT NULL DEFAULT '',
   sync_days INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS auto_reply_log (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  sent_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, email)
+);
 CREATE TABLE IF NOT EXISTS rules (
   id INTEGER PRIMARY KEY,
   position INTEGER NOT NULL,
@@ -304,6 +310,16 @@ impl Store {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN thread_key TEXT;")?;
         }
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_key);")?;
+        let has_auto_reply = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'auto_reply'",
+            )?
+            .exists([])?;
+        if !has_auto_reply {
+            conn.execute_batch(
+                "ALTER TABLE account_settings ADD COLUMN auto_reply TEXT NOT NULL DEFAULT '{}';",
+            )?;
+        }
         let has_identities = conn
             .prepare(
                 "SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'identities'",
@@ -596,6 +612,85 @@ impl Store {
             params![id, clean.signature_html, clean.sync_days, identities],
         )?;
         Ok(clean)
+    }
+
+    /// Automatic-reply settings (defaults when never set).
+    pub fn auto_reply(&self, account_id: i64) -> Result<crate::autoreply::AutoReply> {
+        let json: Option<String> = self
+            .db()
+            .query_row(
+                "SELECT auto_reply FROM account_settings WHERE account_id = ?1",
+                [account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default())
+    }
+
+    /// Store automatic-reply settings. Switching it on records the moment
+    /// (older mail is never answered) and starts a fresh per-sender log.
+    pub fn set_auto_reply(
+        &self,
+        account_id: i64,
+        r: &crate::autoreply::AutoReply,
+    ) -> Result<crate::autoreply::AutoReply> {
+        r.validate()?;
+        self.account(account_id)?;
+        let before = self.auto_reply(account_id)?;
+        let mut clean = r.clone();
+        clean.subject = clean.subject.trim().to_string();
+        clean.enabled_at = if clean.enabled && !before.enabled {
+            chrono::Utc::now().timestamp()
+        } else {
+            before.enabled_at
+        };
+        let json = serde_json::to_string(&clean)
+            .map_err(|e| Error::Invalid(format!("automatic reply: {e}")))?;
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO account_settings (account_id, auto_reply) VALUES (?1, ?2)
+             ON CONFLICT(account_id) DO UPDATE SET auto_reply = excluded.auto_reply",
+            params![account_id, json],
+        )?;
+        if clean.enabled && !before.enabled {
+            tx.execute(
+                "DELETE FROM auto_reply_log WHERE account_id = ?1",
+                [account_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(clean)
+    }
+
+    /// Whether `email` may get an automatic reply now (none in `days` days).
+    pub fn auto_reply_due(
+        &self,
+        account_id: i64,
+        email: &str,
+        now: i64,
+        days: u32,
+    ) -> Result<bool> {
+        let last: Option<i64> = self
+            .db()
+            .query_row(
+                "SELECT sent_at FROM auto_reply_log WHERE account_id = ?1 AND email = ?2",
+                params![account_id, email.to_ascii_lowercase()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(last.is_none_or(|t| now - t >= i64::from(days) * 86_400))
+    }
+
+    pub fn record_auto_reply(&self, account_id: i64, email: &str, now: i64) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO auto_reply_log (account_id, email, sent_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, email) DO UPDATE SET sent_at = excluded.sent_at",
+            params![account_id, email.to_ascii_lowercase(), now],
+        )?;
+        Ok(())
     }
 
     pub fn image_senders(&self, account_id: i64) -> Result<Vec<String>> {

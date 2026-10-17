@@ -36,6 +36,8 @@ export function componentScript(path, bindings = {}, expose = '({})') {
     matchMedia: () => ({ matches: false }),
     document: { documentElement: { dataset: {} } },
     errorText: (error) => String(error),
+    // src/lib/prefs.ts defaults (imports are stripped from components).
+    undoSendSeconds: () => 10, UNDO_SEND_CHOICES: [0, 5, 10, 20, 30], setUndoSendSeconds: () => {},
     ...bindings,
   };
   const { outputText } = ts.transpileModule(`${source}\n;globalThis.__handlers = ${expose};`, {

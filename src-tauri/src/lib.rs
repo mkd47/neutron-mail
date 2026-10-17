@@ -7,9 +7,11 @@ mod calendar;
 mod commands;
 mod contacts;
 mod organize;
+mod outbox;
 mod pim;
 mod print;
 mod providers;
+mod vacation;
 mod watcher;
 
 use std::{collections::HashMap, sync::Arc};
@@ -31,6 +33,8 @@ pub struct AppState {
     pub calendar: calendar::Calendar,
     pub cache: CacheStatus,
     pub print: print::PrintJobs,
+    /// Messages waiting out the undo-send delay.
+    pub outbox: outbox::Outbox,
     /// New-mail notification id -> (account id, message id) it opens when clicked.
     pub notified: std::sync::Mutex<HashMap<u32, (i64, i64)>>,
 }
@@ -167,6 +171,7 @@ pub fn run() {
                 calendar: calendar::Calendar::default(),
                 cache,
                 print: print::PrintJobs::default(),
+                outbox: outbox::Outbox::default(),
                 notified: std::sync::Mutex::new(HashMap::new()),
             };
             let accounts = state.store.accounts()?;
@@ -207,6 +212,13 @@ pub fn run() {
             commands::search,
             commands::compose_prefill,
             commands::send_message,
+            commands::discard_draft,
+            outbox::queue_send,
+            outbox::cancel_send,
+            outbox::send_now,
+            vacation::get_auto_reply,
+            vacation::auto_reply_server_support,
+            vacation::set_auto_reply,
             commands::save_draft,
             commands::analyze_link,
             attachments::pick_attachments,
@@ -263,8 +275,18 @@ pub fn run() {
             pim::delete_task,
             pim::flagged_emails,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Neutron Mail");
+        .build(tauri::generate_context!())
+        .expect("error while building Neutron Mail")
+        .run(|app, event| {
+            // Quitting during an undo-send countdown sends the message
+            // instead of dropping it.
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !app.state::<AppState>().outbox.is_empty() {
+                    api.prevent_exit();
+                    outbox::flush_on_exit(app);
+                }
+            }
+        });
 }
 
 /// The main window is created here (not from tauri.conf.json) so that a
