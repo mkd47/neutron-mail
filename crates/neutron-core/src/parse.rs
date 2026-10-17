@@ -197,9 +197,7 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
             }
             let url = format!("data:image/{sub};base64,{}", base64(data));
             let cid = cid.trim_matches(|c| c == '<' || c == '>');
-            let reference = format!("cid:{cid}");
-            if html.contains(&reference) {
-                *html = html.replace(&reference, &url);
+            if replace_cid(html, cid, &url) {
                 shown_cids.push(cid.to_string());
             }
         }
@@ -429,8 +427,48 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Replace whole `cid:<cid>` references (not `cid:<cid>0`, a different
+/// image) with `url`; true if any was found.
+fn replace_cid(html: &mut String, cid: &str, url: &str) -> bool {
+    let reference = format!("cid:{cid}");
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html.as_str();
+    let mut found = false;
+    while let Some(at) = rest.find(&reference) {
+        let end = at + reference.len();
+        let whole = rest[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '"' | '\'' | ')' | '>' | ';' | '\\') || c.is_whitespace());
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { url } else { &reference });
+        found |= whole;
+        rest = &rest[end..];
+    }
+    if found {
+        out.push_str(rest);
+        *html = out;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cid_references_must_match_exactly() {
+        let mut html =
+            r#"<img src="cid:img1"><img src="cid:img10"><div style="background:url(cid:img1)">"#
+                .to_string();
+        assert!(super::replace_cid(&mut html, "img1", "data:x"));
+        assert_eq!(
+            html,
+            r#"<img src="data:x"><img src="cid:img10"><div style="background:url(data:x)">"#
+        );
+        let mut only10 = r#"<img src="cid:img10">"#.to_string();
+        assert!(!super::replace_cid(&mut only10, "img1", "data:x"));
+        assert_eq!(only10, r#"<img src="cid:img10">"#);
+    }
+
     #[test]
     fn images_shown_in_the_body_are_marked_inline_not_listed_as_attachments() {
         let png = super::base64(b"\x89PNG\r\n\x1a\n0000");

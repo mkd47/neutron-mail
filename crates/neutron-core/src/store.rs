@@ -685,10 +685,32 @@ impl Store {
     }
 
     pub fn record_auto_reply(&self, account_id: i64, email: &str, now: i64) -> Result<()> {
-        self.db().execute(
+        let db = self.db();
+        db.execute(
             "INSERT INTO auto_reply_log (account_id, email, sent_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(account_id, email) DO UPDATE SET sent_at = excluded.sent_at",
             params![account_id, email.to_ascii_lowercase(), now],
+        )?;
+        // Entries older than the longest interval (30 days) no longer matter.
+        db.execute(
+            "DELETE FROM auto_reply_log WHERE account_id = ?1 AND sent_at < ?2",
+            params![account_id, now - 31 * 86_400],
+        )?;
+        Ok(())
+    }
+
+    /// Put back settings exactly as they were (after a failed server
+    /// update): no new switch-on time, the reply log is kept.
+    pub fn restore_auto_reply(
+        &self,
+        account_id: i64,
+        r: &crate::autoreply::AutoReply,
+    ) -> Result<()> {
+        let json = serde_json::to_string(r)
+            .map_err(|e| Error::Invalid(format!("automatic reply: {e}")))?;
+        self.db().execute(
+            "UPDATE account_settings SET auto_reply = ?2 WHERE account_id = ?1",
+            params![account_id, json],
         )?;
         Ok(())
     }

@@ -454,17 +454,20 @@ async fn delete_drafts_by_message_id(
         return Ok(());
     };
     let mut s = imap::connect(&account.config, password).await?;
+    // Cache rows go for every UID actually deleted, even if a later one fails.
+    let mut deleted = Vec::new();
     let res = async {
         let uids = imap::uids_by_message_id(&mut s, &drafts.name, message_id).await?;
-        for uid in &uids {
-            imap::delete_uid(&mut s, &drafts.name, *uid).await?;
+        for uid in uids {
+            imap::delete_uid(&mut s, &drafts.name, uid).await?;
+            deleted.push(uid);
         }
-        Ok::<_, Error>(uids)
+        Ok::<_, Error>(())
     }
     .await;
     drop(s.logout().await);
-    state.store.remove_uids(drafts.id, &res?)?;
-    Ok(())
+    state.store.remove_uids(drafts.id, &deleted)?;
+    res
 }
 
 /// Send via SMTP, then APPEND a copy to the account's Sent folder (if one
@@ -584,30 +587,45 @@ pub async fn save_draft(
     replace_draft: Option<i64>,
     replace_message_id: Option<String>,
 ) -> Res<SavedDraft> {
+    store_draft(
+        &state,
+        account_id,
+        &message,
+        replace_draft,
+        replace_message_id.as_deref(),
+    )
+    .await
+}
+
+/// APPEND the message to Drafts, then remove the copy it replaces.
+pub(crate) async fn store_draft(
+    state: &AppState,
+    account_id: i64,
+    message: &OutgoingMessage,
+    replace_draft: Option<i64>,
+    replace_message_id: Option<&str>,
+) -> Res<SavedDraft> {
     let account = state.store.account(account_id)?;
-    let password = crate::providers::credential(&state, account_id).await?;
+    let password = crate::providers::credential(state, account_id).await?;
     let drafts = state
         .store
         .folder_by_role(account_id, "drafts")?
         .ok_or_else(|| Error::Invalid("this account has no Drafts folder".into()))?;
     let identities = state.store.account_settings(account_id)?.identities;
     let sender = smtp::with_sender(&account.config, &identities, message.from.as_deref())?;
-    let files = resolve_attachments(&state, account_id, &message.attachments)?;
-    let built = smtp::build(&sender, &message, &files, true)?;
+    let files = resolve_attachments(state, account_id, &message.attachments)?;
+    let built = smtp::build(&sender, message, &files, true)?;
     let mut s = imap::connect(&account.config, &password).await?;
     imap::append_with_flags(&mut s, &drafts.name, &built.raw, "(\\Seen \\Draft)").await?;
     drop(s.logout().await);
     let mut replace_error = None;
     if let Some(old) = replace_draft {
-        if let Err(e) = delete_draft(&state, &account, &password, old).await {
+        if let Err(e) = delete_draft(state, &account, &password, old).await {
             replace_error = Some(e.to_string());
         }
     }
-    if let Some(mid) = replace_message_id
-        .as_deref()
-        .filter(|m| !m.is_empty() && *m != built.message_id)
-    {
-        if let Err(e) = delete_drafts_by_message_id(&state, &account, &password, mid).await {
+    if let Some(mid) = replace_message_id.filter(|m| !m.is_empty() && *m != built.message_id) {
+        if let Err(e) = delete_drafts_by_message_id(state, &account, &password, mid).await {
             replace_error.get_or_insert(e.to_string());
         }
     }

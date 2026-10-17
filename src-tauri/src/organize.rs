@@ -361,6 +361,15 @@ pub(crate) async fn upload_script(
     account_id: i64,
     port: u16,
 ) -> Res<SieveExport> {
+    tokio::time::timeout(SIEVE_TIMEOUT, upload_script_inner(state, account_id, port))
+        .await
+        .map_err(|_| Error::Invalid("the mail server didn't answer in time".into()))?
+}
+
+/// Longest wait for a ManageSieve exchange.
+const SIEVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn upload_script_inner(state: &AppState, account_id: i64, port: u16) -> Res<SieveExport> {
     let account = state.store.account(account_id)?;
     let ex = export(state, account_id)?;
     let password = crate::providers::credential(state, account_id).await?;
@@ -386,6 +395,12 @@ pub(crate) async fn upload_script(
 
 /// Deactivate and remove our script.
 pub(crate) async fn remove_script(state: &AppState, account_id: i64) -> Res<()> {
+    tokio::time::timeout(SIEVE_TIMEOUT, remove_script_inner(state, account_id))
+        .await
+        .map_err(|_| Error::Invalid("the mail server didn't answer in time".into()))?
+}
+
+async fn remove_script_inner(state: &AppState, account_id: i64) -> Res<()> {
     let account = state.store.account(account_id)?;
     let settings = state.store.sieve_settings(account_id)?;
     let password = crate::providers::credential(state, account_id).await?;
@@ -445,5 +460,11 @@ pub async fn sieve_upload(
 /// Deactivate and remove our script; server-side rules run locally again.
 #[tauri::command]
 pub async fn sieve_disable(state: State<'_, AppState>, account_id: i64) -> Res<()> {
+    let reply = state.store.auto_reply(account_id)?;
+    if reply.enabled && reply.on_server {
+        return Err(Error::Invalid(
+            "automatic replies run on the server: turn them off or switch them to \"From this computer\" first".into(),
+        ));
+    }
     remove_script(&state, account_id).await
 }

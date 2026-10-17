@@ -179,6 +179,10 @@ pub fn evaluate(
             .is_some_and(|v| ["all", "oof", "autoreply"].iter().any(|k| v.contains(k)))
         || header("Return-Path").is_some_and(|v| v == "<>")
         || header("X-Neutron-Rule").is_some()
+        || header("X-Autoreply").is_some()
+        || header("X-Autorespond").is_some()
+        || header("Precedence").is_some_and(|v| v == "auto_reply")
+        || header("Content-Type").is_some_and(|v| v.starts_with("multipart/report"))
     {
         return Err(Skip::Automated);
     }
@@ -251,8 +255,12 @@ pub async fn process(
         .chain(identities.iter().map(|i| i.email.clone()))
         .collect();
     let mut sent = 0;
+    // A message that can't be answered doesn't stop the others; repeated
+    // send failures (server down, login refused) end the batch.
+    let mut failures = 0;
+    let mut first_error = None;
     for id in store.ids_for_uids(folder_id, uids)? {
-        if sent >= MAX_PER_SYNC {
+        if sent >= MAX_PER_SYNC || failures >= 3 {
             break;
         }
         let Ok(plan) = evaluate(&store.raw(id)?, &reply, &own, now) else {
@@ -261,21 +269,37 @@ pub async fn process(
         if !store.auto_reply_due(account_id, &plan.to, now, reply.days)? {
             continue;
         }
-        let sender = smtp::with_sender(cfg, &identities, Some(&plan.via))?;
-        let built = smtp::build_auto_reply(
-            &sender,
-            &plan.to,
-            &plan.subject,
-            &reply.body,
-            plan.in_reply_to.as_deref(),
-            &plan.references,
-        )?;
-        smtp::send_built(&sender, password, &built).await?;
-        store.record_auto_reply(account_id, &plan.to, now)?;
-        sent += 1;
-        tracing::info!(account = account_id, "automatic reply sent");
+        let result = async {
+            let sender = smtp::with_sender(cfg, &identities, Some(&plan.via))?;
+            let built = smtp::build_auto_reply(
+                &sender,
+                &plan.to,
+                &plan.subject,
+                &reply.body,
+                plan.in_reply_to.as_deref(),
+                &plan.references,
+            )?;
+            smtp::send_built(&sender, password, &built).await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                store.record_auto_reply(account_id, &plan.to, now)?;
+                sent += 1;
+                failures = 0;
+                tracing::info!(account = account_id, "automatic reply sent");
+            }
+            Err(e) => {
+                tracing::warn!(account = account_id, "automatic reply failed: {e}");
+                failures += 1;
+                first_error.get_or_insert(e);
+            }
+        }
     }
-    Ok(sent)
+    match first_error {
+        Some(e) if sent == 0 => Err(e),
+        _ => Ok(sent),
+    }
 }
 
 /// Sieve `vacation` (RFC 5230) for the server script: the extensions it
@@ -358,6 +382,24 @@ mod tests {
             "From: Bob <Bob@Example.test>\r\nTo: Me <me@example.test>\r\nSubject: Quote\r\nMessage-ID: <q1@example.test>\r\nDate: Mon, 12 Jan 1970 13:50:00 +0000\r\n{extra}\r\nHi"
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn other_auto_responders_and_bounces_are_not_answered() {
+        for extra in [
+            "X-Autoreply: yes",
+            "X-Autorespond: on",
+            "Precedence: auto_reply",
+            "Content-Type: multipart/report; report-type=delivery-status; boundary=x",
+        ] {
+            assert!(
+                matches!(
+                    evaluate(&mail(extra), &on(), &own(), NOW),
+                    Err(Skip::Automated)
+                ),
+                "{extra}"
+            );
+        }
     }
 
     #[test]

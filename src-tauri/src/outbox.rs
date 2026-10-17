@@ -5,7 +5,7 @@
 //! away instead of being lost (see [`flush_on_exit`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Notify};
 
-use crate::commands::{deliver, validate_outgoing, Res, SendResult};
+use crate::commands::{deliver, store_draft, validate_outgoing, Res, SendResult};
 use crate::AppState;
 
 /// Longest undo window the UI may ask for.
@@ -33,6 +33,8 @@ pub struct Outbox {
     /// Waiting plus currently sending; the app only exits at 0.
     in_flight: AtomicUsize,
     idle: Notify,
+    /// The app is quitting: send at once, and keep failures in Drafts.
+    flushing: AtomicBool,
 }
 
 impl Outbox {
@@ -40,6 +42,8 @@ impl Outbox {
         self.waiting.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    // The lock is held until the command is sent, so a task that finds its
+    // id already removed can rely on `try_recv` to see the command.
     fn signal(&self, id: u64, cmd: Command) -> bool {
         match self.waiting().remove(&id) {
             Some(tx) => tx.send(cmd).is_ok(),
@@ -49,6 +53,12 @@ impl Outbox {
 
     pub fn is_empty(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) == 0
+    }
+
+    /// True the first time only: a second exit request (ours, after the
+    /// flush, or the user's) is let through instead of flushing again.
+    pub fn begin_flush(&self) -> bool {
+        !self.flushing.swap(true, Ordering::SeqCst)
     }
 }
 
@@ -79,19 +89,29 @@ pub async fn queue_send(
     validate_outgoing(&state, account_id, &message)?;
     let outbox = &state.outbox;
     let id = outbox.next.fetch_add(1, Ordering::SeqCst) + 1;
-    let (tx, rx) = oneshot::channel();
-    outbox.waiting().insert(id, tx);
+    let (tx, mut rx) = oneshot::channel();
+    // Counted before it can be signalled, so an exit request never misses it.
     outbox.in_flight.fetch_add(1, Ordering::SeqCst);
-    let delay = Duration::from_secs(delay_secs.min(MAX_DELAY_SECS));
+    outbox.waiting().insert(id, tx);
+    let delay = if outbox.flushing.load(Ordering::SeqCst) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(delay_secs.min(MAX_DELAY_SECS))
+    };
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app2.state::<AppState>();
-        let cancelled = tokio::select! {
+        // Commands win over the timer when both are ready.
+        let mut cancelled = tokio::select! {
+            biased;
+            cmd = &mut rx => matches!(cmd, Ok(Command::Cancel)),
             _ = tokio::time::sleep(delay) => false,
-            cmd = rx => matches!(cmd, Ok(Command::Cancel)),
         };
-        // From here on Undo is no longer possible.
-        state.outbox.waiting().remove(&id);
+        // From here on Undo is no longer possible. If Undo got in between
+        // the timer and this point, it was already promised: honour it.
+        if state.outbox.waiting().remove(&id).is_none() && !cancelled {
+            cancelled = matches!(rx.try_recv(), Ok(Command::Cancel));
+        }
         let event = if cancelled {
             tracing::info!(account = account_id, "queued message cancelled");
             SendEvent {
@@ -120,6 +140,19 @@ pub async fn queue_send(
                 },
                 Err(e) => {
                     tracing::warn!(account = account_id, "queued message failed: {e}");
+                    if state.outbox.flushing.load(Ordering::SeqCst) {
+                        // Nobody is left to see the error: keep the message.
+                        match store_draft(&state, account_id, &message, None, None).await {
+                            Ok(_) => tracing::info!(
+                                account = account_id,
+                                "unsent message kept in Drafts"
+                            ),
+                            Err(d) => tracing::error!(
+                                account = account_id,
+                                "unsent message could not be kept in Drafts: {d}"
+                            ),
+                        }
+                    }
                     SendEvent {
                         id,
                         account_id,

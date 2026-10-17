@@ -281,7 +281,8 @@ pub fn run() {
             // Quitting during an undo-send countdown sends the message
             // instead of dropping it.
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if !app.state::<AppState>().outbox.is_empty() {
+                let outbox = &app.state::<AppState>().outbox;
+                if !outbox.is_empty() && outbox.begin_flush() {
                     api.prevent_exit();
                     outbox::flush_on_exit(app);
                 }

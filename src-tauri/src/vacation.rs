@@ -127,10 +127,13 @@ pub async fn set_auto_reply(
         Ok(())
     };
     if let Err(e) = result {
-        let _ = state.store.set_auto_reply(account_id, &before);
-        return Err(Error::Invalid(format!(
-            "couldn't update the automatic reply on the server: {e}"
-        )));
+        let restored = state.store.restore_auto_reply(account_id, &before);
+        return Err(Error::Invalid(match restored {
+            Ok(()) => format!("couldn't update the automatic reply on the server: {e}"),
+            Err(r) => format!(
+                "couldn't update the automatic reply on the server ({e}), and the previous settings couldn't be restored: {r}"
+            ),
+        }));
     }
     tracing::info!(
         account = account_id,
