@@ -78,8 +78,15 @@
     busy = true; msg = null;
     try {
       rules = await rulesApi.save(rules); saved = JSON.stringify(rules);
-      msg = { text: sieve?.settings.active ? "Saved. Upload again to update the server script." : "Saved.", error: false };
       await loadSieve();
+      msg = {
+        text: sieve?.stale
+          ? "Saved. The server still has an older script; it will be uploaded again automatically."
+          : sieve?.settings.active
+            ? "Saved and updated on the server."
+            : "Saved.",
+        error: false,
+      };
     } catch (e) { msg = { text: errorText(e), error: true }; } finally { busy = false; }
   }
   async function runTest() {
@@ -138,7 +145,7 @@
         <h3>Server filtering (ManageSieve)</h3>
         {#if sieve?.oauth}<p class="muted small">Not available for OAuth accounts yet; server-side rules run locally.</p>
         {:else}
-          <p class="small">Status: <b>{sieve?.settings.active ? "active on server" : "not uploaded"}</b></p>
+          <p class="small">Status: <b class:warn={sieve?.stale}>{sieve?.settings.active ? (sieve.stale ? "out of date" : "active on server") : "not uploaded"}</b></p>
           <label class="small">Port <input type="number" min="1" max="65535" bind:value={sievePort} style="width:90px" /></label>
           <div class="row">
             <button class="btn" onclick={() => (showSieve = !showSieve)}>{showSieve ? "Hide" : "Preview"} Sieve</button>

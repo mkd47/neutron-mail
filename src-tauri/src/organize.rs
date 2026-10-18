@@ -2,10 +2,11 @@
 
 use neutron_core::{
     folders::{self, DeleteMode, Transfer},
-    imap, managesieve,
+    imap,
     model::Folder,
     rules::{self, MessageFacts, Plan, Rule, SieveExport},
     rules_exec::{self, RunReport},
+    sieve_state,
     store::SieveSettings,
     Error,
 };
@@ -246,8 +247,34 @@ pub fn list_rules(state: State<'_, AppState>) -> Res<Vec<Rule>> {
 }
 
 #[tauri::command]
-pub fn save_rules(state: State<'_, AppState>, rules: Vec<Rule>) -> Res<Vec<Rule>> {
-    state.store.save_rules(&rules)
+pub async fn save_rules(state: State<'_, AppState>, rules: Vec<Rule>) -> Res<Vec<Rule>> {
+    let saved = state.store.save_rules(&rules)?;
+    // Accounts that already run a server script get the edit uploaded now.
+    // A failure leaves the stored hash behind, so the next sync retries.
+    for account in state.store.accounts()? {
+        let settings = state.store.sieve_settings(account.id)?;
+        if !settings.active {
+            continue;
+        }
+        let script = sieve_state::desired_script(&state.store, account.id)?.script;
+        if !sieve_state::is_stale(&settings, &script) {
+            continue;
+        }
+        let _guard = state.account_sync_lock(account.id).lock_owned().await;
+        let password = match crate::providers::credential(&state, account.id).await {
+            Ok(password) => password,
+            Err(e) => {
+                tracing::warn!(account = account.id, "sieve re-upload skipped: {e}");
+                continue;
+            }
+        };
+        if let Err(e) =
+            sieve_state::reconcile(&state.store, &account.config, &password, account.id).await
+        {
+            tracing::warn!(account = account.id, "sieve re-upload failed: {e}");
+        }
+    }
+    Ok(saved)
 }
 
 #[derive(Serialize)]
@@ -322,37 +349,12 @@ pub struct SieveStatus {
     settings: SieveSettings,
     preview: SieveExport,
     oauth: bool,
+    /// The active server script does not match the rules saved locally.
+    stale: bool,
 }
 
 pub(crate) fn export(state: &AppState, account_id: i64) -> Res<SieveExport> {
-    let account = state.store.account(account_id)?;
-    let trash = state
-        .store
-        .folder_by_role(account_id, "trash")?
-        .map(|f| f.display)
-        .unwrap_or_else(|| "Trash".into());
-    // The automatic reply rides in the same script when it runs on the server.
-    let reply = state.store.auto_reply(account_id)?;
-    let vacation = (reply.enabled && reply.on_server).then(|| {
-        let own: Vec<String> = std::iter::once(account.config.email.clone())
-            .chain(
-                state
-                    .store
-                    .account_settings(account_id)
-                    .map(|s| s.identities)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|i| i.email),
-            )
-            .collect();
-        neutron_core::autoreply::sieve_block(&reply, &own)
-    });
-    Ok(rules::to_sieve_with(
-        &state.store.rules()?,
-        &account.config.email,
-        &trash,
-        vacation,
-    ))
+    sieve_state::desired_script(&state.store, account_id)
 }
 
 /// Upload and activate our script (rules + automatic reply) on `port`.
@@ -371,20 +373,9 @@ const SIEVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn upload_script_inner(state: &AppState, account_id: i64, port: u16) -> Res<SieveExport> {
     let account = state.store.account(account_id)?;
-    let ex = export(state, account_id)?;
     let password = crate::providers::credential(state, account_id).await?;
-    let mut ms = managesieve::Client::connect(&account.config, port, &password).await?;
-    let r = async {
-        ms.check_script(&ex.script).await?;
-        ms.put_script(managesieve::SCRIPT_NAME, &ex.script).await?;
-        ms.set_active(managesieve::SCRIPT_NAME).await
-    }
-    .await;
-    ms.logout().await;
-    r?;
-    state
-        .store
-        .set_sieve_settings(account_id, SieveSettings { port, active: true })?;
+    let ex =
+        sieve_state::upload(&state.store, &account.config, &password, account_id, port).await?;
     tracing::info!(
         account = account_id,
         rules = ex.exported.len(),
@@ -402,41 +393,20 @@ pub(crate) async fn remove_script(state: &AppState, account_id: i64) -> Res<()> 
 
 async fn remove_script_inner(state: &AppState, account_id: i64) -> Res<()> {
     let account = state.store.account(account_id)?;
-    let settings = state.store.sieve_settings(account_id)?;
     let password = crate::providers::credential(state, account_id).await?;
-    let mut ms = managesieve::Client::connect(&account.config, settings.port, &password).await?;
-    let r = async {
-        let ours = ms
-            .list_scripts()
-            .await?
-            .into_iter()
-            .find(|(n, _)| n == managesieve::SCRIPT_NAME);
-        if let Some((_, active)) = ours {
-            if active {
-                ms.set_active("").await?;
-            }
-            ms.delete_script(managesieve::SCRIPT_NAME).await?;
-        }
-        Ok::<_, Error>(())
-    }
-    .await;
-    ms.logout().await;
-    r?;
-    state.store.set_sieve_settings(
-        account_id,
-        SieveSettings {
-            port: settings.port,
-            active: false,
-        },
-    )
+    sieve_state::remove(&state.store, &account.config, &password, account_id).await
 }
 
 #[tauri::command]
 pub fn sieve_status(state: State<'_, AppState>, account_id: i64) -> Res<SieveStatus> {
+    let settings = state.store.sieve_settings(account_id)?;
+    let preview = export(&state, account_id)?;
+    let stale = sieve_state::is_stale(&settings, &preview.script);
     Ok(SieveStatus {
-        settings: state.store.sieve_settings(account_id)?,
-        preview: export(&state, account_id)?,
+        settings,
+        preview,
         oauth: state.store.account(account_id)?.config.auth.is_oauth(),
+        stale,
     })
 }
 

@@ -185,7 +185,49 @@ pub async fn sync_account_with_progress(
             }
         }
     }
+    // A local edit can leave an older script active. Re-upload before rules
+    // run so server-side filtering matches the rules we just saved. A
+    // failure here does not discard the mail sync.
+    if let Err(e) = crate::sieve_state::reconcile(store, cfg, password, account_id).await {
+        tracing::warn!(account = account_id, "sieve script reconcile failed: {e}");
+        report.rule_errors.push(format!("Server rules: {e}"));
+    }
+
+    let inbox_id = store.folder_by_role(account_id, "inbox")?.map(|f| f.id);
+    let mut rule_folder = inbox_new.as_ref().map(|(fid, _)| *fid);
+    let mut rule_uids = inbox_new
+        .as_ref()
+        .map(|(_, uids)| uids.clone())
+        .unwrap_or_default();
+    if let Some(fid) = inbox_id {
+        let now = chrono::Utc::now().timestamp();
+        let cached: HashSet<u32> = store.uids(fid)?.into_iter().collect();
+        for uid in store.due_rule_uids(account_id, fid, now)? {
+            if !cached.contains(&uid) {
+                store.fail_pending_uid(
+                    account_id,
+                    fid,
+                    uid,
+                    &format!(
+                        "UID {uid}: the message is no longer in the inbox, so unfinished rule actions were left incomplete"
+                    ),
+                )?;
+            }
+        }
+        if rule_folder.is_none() {
+            rule_folder = Some(fid);
+        }
+        if rule_folder == Some(fid) {
+            for uid in store.due_rule_uids(account_id, fid, now)? {
+                if !rule_uids.contains(&uid) {
+                    rule_uids.push(uid);
+                }
+            }
+        }
+    }
+
     // Automatic replies first, so rules that move mail can't hide it.
+    // Retries are not new mail and must not send another reply.
     if let Some((fid, uids)) = &inbox_new {
         if let Err(e) =
             crate::autoreply::process(store, cfg, password, account_id, *fid, uids).await
@@ -194,8 +236,18 @@ pub async fn sync_account_with_progress(
             report.rule_errors.push(format!("Automatic reply: {e}"));
         }
     }
-    if let Some((fid, uids)) = inbox_new {
-        match run_rules_on_new(store, &mut session, cfg, password, account_id, fid, &uids).await {
+    if let Some(fid) = rule_folder.filter(|_| !rule_uids.is_empty()) {
+        match run_rules_on_new(
+            store,
+            &mut session,
+            cfg,
+            password,
+            account_id,
+            fid,
+            &rule_uids,
+        )
+        .await
+        {
             Ok(rep) => {
                 report.rules_matched = rep.matched;
                 for name in &rep.touched {
@@ -209,11 +261,17 @@ pub async fn sync_account_with_progress(
                                 .await;
                     }
                 }
-                report.rule_errors = rep.errors;
+                report.rule_errors.extend(rep.errors);
             }
             Err(e) => report.rule_errors.push(e.to_string()),
         }
     }
+    for message in store.unreported_rule_failures(account_id)? {
+        if !report.rule_errors.contains(&message) {
+            report.rule_errors.push(message);
+        }
+    }
+    store.mark_rule_failures_reported(account_id)?;
     let _ = imap::logout(&mut session).await;
     Ok(report)
 }
@@ -403,8 +461,10 @@ async fn sync_folder_with_progress(
         );
     }
 
-    // Only record state after everything above succeeded, so an interrupted
-    // sync is simply repeated from the old state next time.
+    // Only record state after the folder download succeeded, so an
+    // interrupted sync is repeated from the old checkpoint. Rule actions
+    // run after this and keep their own retry ledger: rewinding the
+    // checkpoint would also reprocess mail whose actions already succeeded.
     let uidnext = state.uidnext.unwrap_or(max_uid.saturating_add(1));
     store.set_folder_sync_state(
         folder_id,

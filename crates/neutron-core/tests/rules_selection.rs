@@ -68,6 +68,7 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
             SieveSettings {
                 port: 4190,
                 active: true,
+                script_hash: None,
             },
         )
         .unwrap();
@@ -78,6 +79,7 @@ fn sieve_keeps_unexportable_rules_local_and_disabled_rules_off() {
             SieveSettings {
                 port: 4190,
                 active: false,
+                script_hash: None,
             },
         )
         .unwrap();

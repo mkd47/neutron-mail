@@ -304,7 +304,12 @@ export interface Plan {
 export interface RuleTest { matched: boolean; conditions: boolean[]; plan: Plan }
 export interface RunReport { examined: number; matched: number; moved: number; copied: number; flagged: number; forwarded: number; skipped: string[]; errors: string[] }
 export interface SieveExport { script: string; exported: number[]; local_only: [number, string][] }
-export interface SieveStatus { settings: { port: number; active: boolean }; preview: SieveExport; oauth: boolean }
+export interface SieveStatus {
+  settings: { port: number; active: boolean; script_hash: string | null };
+  preview: SieveExport;
+  oauth: boolean;
+  stale: boolean;
+}
 export const rulesApi = {
   list: () => invoke<Rule[]>("list_rules"),
   save: (rules: Rule[]) => invoke<Rule[]>("save_rules", { rules }),
