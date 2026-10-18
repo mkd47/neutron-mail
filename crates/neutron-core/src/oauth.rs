@@ -15,7 +15,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::model::AuthMethod;
 use crate::{Error, Result};
@@ -339,27 +339,28 @@ impl Loopback {
 
     /// Wait for the browser redirect; returns the authorization code once a
     /// request with the matching `state` arrives. Requests with a wrong
-    /// state are answered with an error and ignored.
+    /// state are answered with an error and ignored. An idle connection
+    /// (the per-read timeout) or a reset connection is dropped and the wait
+    /// continues until `timeout`. One probe from the browser must not abort
+    /// sign-in.
     pub async fn wait_for_code(self, state: &str, timeout: Duration) -> Result<String> {
-        tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             loop {
-                let (mut sock, _) = self.listener.accept().await?;
-                let mut buf = vec![0u8; 8192];
-                let mut n = 0;
-                // Read just the request line + headers.
-                while n < buf.len() {
-                    let r = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf[n..]))
-                        .await
-                        .map_err(|_| Error::Timeout)??;
-                    if r == 0 {
-                        break;
+                let (mut sock, _) = match self.listener.accept().await {
+                    Ok(conn) => conn,
+                    // A peer can reset before accept() returns the socket.
+                    // Keep waiting; a dead listener is still fatal.
+                    Err(e) if abandoned_peer(&e) => {
+                        tracing::debug!(error = %e, "ignoring abandoned OAuth callback accept");
+                        tokio::task::yield_now().await;
+                        continue;
                     }
-                    n += r;
-                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let req = String::from_utf8_lossy(&buf[..n]);
+                    Err(e) => return Err(Error::from(e)),
+                };
+                let Some(req) = read_callback_headers(&mut sock).await else {
+                    tracing::debug!("ignoring idle or reset OAuth callback connection");
+                    continue;
+                };
                 let target = req
                     .lines()
                     .next()
@@ -405,9 +406,47 @@ impl Loopback {
                 }
             }
         })
-        .await
-        .map_err(|_| Error::Timeout)?
+        .await;
+        match result {
+            Ok(code) => code,
+            Err(_) => Err(Error::Timeout),
+        }
     }
+}
+
+/// How long to wait for bytes on one callback connection before abandoning
+/// it and accepting another. This is not the sign-in deadline.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn abandoned_peer(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// `None` when this socket did not deliver a complete request head: it went
+/// idle, reset, or closed. The caller keeps waiting for a real callback.
+async fn read_callback_headers(sock: &mut TcpStream) -> Option<String> {
+    let mut buf = [0u8; 8192];
+    let mut n = 0;
+    while n < buf.len() {
+        let chunk =
+            match tokio::time::timeout(CALLBACK_READ_TIMEOUT, sock.read(&mut buf[n..])).await {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => return None,
+            };
+        n += chunk;
+        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            return Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -617,5 +656,66 @@ mod tests {
             lb.wait_for_code("s", Duration::from_millis(100)).await,
             Err(Error::Timeout)
         ));
+    }
+
+    fn loopback_addr(redirect: &str) -> String {
+        redirect
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    async fn raw_get(addr: &str, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut body = Vec::new();
+        sock.read_to_end(&mut body).await.unwrap();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// A reset or idle connection used to fail the whole sign-in (the 5s
+    /// read timeout and connection-reset were returned with `?`). Time is
+    /// paused so the idle timeout does not wait on the wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_callback_does_not_abort_sign_in() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let lb = Loopback::bind().await.unwrap();
+        let addr = loopback_addr(&lb.redirect_uri);
+        let wait =
+            tokio::spawn(async move { lb.wait_for_code("good", Duration::from_secs(60)).await });
+
+        // Reach accept() before connecting.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        // RST before a request is written. SO_LINGER 0 aborts the socket;
+        // tokio deprecates set_linger because a normal drop can block, which
+        // is acceptable in this test.
+        let reset = TcpStream::connect(&addr).await.unwrap();
+        #[allow(deprecated)]
+        reset.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(reset);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Idle peer: the 5s header timeout must abandon this socket only.
+        let mut idle = TcpStream::connect(&addr).await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // The abandoned socket may already be closed. Don't fail the test on that.
+        let _ = idle.shutdown().await;
+        drop(idle);
+
+        let body = raw_get(&addr, "/?code=C0DE&state=good").await;
+        assert!(body.contains("Signed in"), "{body}");
+        assert_eq!(wait.await.unwrap().unwrap(), "C0DE");
     }
 }

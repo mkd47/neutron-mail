@@ -11,7 +11,7 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@neutron/ui": "github:mkd47/neutron-ui#877c436539ee6601e00baf025ca40f9dd6bb64c3",
+    "@neutron/ui": "https://github.com/mkd47/neutron-ui/archive/877c436539ee6601e00baf025ca40f9dd6bb64c3.tar.gz",
     "@tauri-apps/api": "^2.12.3",
     "@tauri-apps/plugin-opener": "^2.7.2"
   },

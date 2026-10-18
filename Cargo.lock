@@ -2614,6 +2614,7 @@ dependencies = [
  "getrandom 0.3.4",
  "keyring",
  "lettre",
+ "libc",
  "mail-builder",
  "mail-parser",
  "regex",

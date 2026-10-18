@@ -264,7 +264,7 @@
 {#snippet attRow(a: Attachment)}
   <div class="att" class:risky={a.risky}>
     <span class="aname" title={a.name}>{a.name}</span>
-    <span class="muted small asize">{size(a.size)}{a.risky ? " · program" : ""}</span>
+    <span class="muted small asize">{size(a.size)}{a.risky ? " · runs code" : ""}</span>
     <button class="mini" onclick={() => save(a.index)} title="Save…" aria-label={`Save ${a.name}`}>Save</button>
     <button class="mini" onclick={() => openAtt(a.index)} title="Open with default app" aria-label={`Open ${a.name}`}>Open</button>
   </div>
@@ -453,8 +453,8 @@
   </article>
   {#if confirmOpen}
     <div class="backdrop" role="presentation">
-      <div class="dialog" role="alertdialog" aria-modal="true" aria-label="Open program?">
-        <h3>⚠ Open a program or script?</h3>
+      <div class="dialog" role="alertdialog" aria-modal="true" aria-label="Open a file that can run code?">
+        <h3>⚠ Open a file that can run code?</h3>
         <p>{confirmOpen.reason}</p>
         <div class="actions">
           <button class="btn" onclick={() => (confirmOpen = null)}>Cancel</button>
