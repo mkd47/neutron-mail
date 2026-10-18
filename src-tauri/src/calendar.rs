@@ -38,7 +38,7 @@ struct Inner {
 
 impl Inner {
     async fn ensure(&mut self) -> Option<&EdsCalendar> {
-        if self.eds.is_none() && !self.last_attempt.is_some_and(|t| t.elapsed() < RETRY_AFTER) {
+        if self.eds.is_none() && self.last_attempt.is_none_or(|t| t.elapsed() >= RETRY_AFTER) {
             self.last_attempt = Some(Instant::now());
             match EdsCalendar::connect().await {
                 Ok(c) => {

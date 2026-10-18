@@ -1,7 +1,16 @@
 //! Password storage. Uses the freedesktop Secret Service (GNOME Keyring) via
-//! the `keyring` crate. If no Secret Service is reachable, falls back to an
+//! `keyring` 4 (zbus). If no Secret Service is reachable, falls back to an
 //! in-process memory store: the password then works for the current session
 //! only and is never written to disk in plain text.
+//!
+//! Entries written by keyring 3.6.3 (`sync-secret-service`) stay readable.
+//! Both versions store the secret in the default collection and look it up
+//! by the attributes `service` = `dev.neutronmail.NeutronMail` and
+//! `username` = `account-<id>` or `cache-key`. 3.6.3 also set `target` =
+//! `default` and `application` = `rust-keyring`, and labelled the secret
+//! `text/plain`. Secret Service search matches items that have *at least*
+//! the requested attributes, and the secret bytes do not depend on the
+//! content type, so those extra fields do not hide an existing password.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -56,9 +65,9 @@ pub struct SecretStore {
 impl SecretStore {
     /// Probe the Secret Service once; choose memory fallback if unavailable.
     pub fn detect() -> Self {
-        let backend = match keyring::Entry::new(SERVICE, "__probe__") {
-            Ok(e) => match e.get_password() {
-                Ok(_) | Err(keyring::Error::NoEntry) => Backend::Keyring,
+        let backend = match keyring_call(|| keyring::v1::Entry::new(SERVICE, "__probe__")) {
+            Ok(e) => match keyring_call(|| e.get_password()) {
+                Ok(_) | Err(keyring::v1::Error::NoEntry) => Backend::Keyring,
                 Err(err) => {
                     tracing::warn!("Secret Service unavailable, using memory fallback: {err}");
                     Backend::Memory
@@ -89,9 +98,11 @@ impl SecretStore {
 
     pub fn set(&self, account_id: i64, password: &str) -> Result<()> {
         match self.backend {
-            Backend::Keyring => keyring::Entry::new(SERVICE, &Self::key(account_id))
-                .and_then(|e| e.set_password(password))
-                .map_err(|e| Error::Secret(e.to_string())),
+            Backend::Keyring => keyring_call(|| {
+                keyring::v1::Entry::new(SERVICE, &Self::key(account_id))
+                    .and_then(|e| e.set_password(password))
+            })
+            .map_err(|e| Error::Secret(e.to_string())),
             Backend::Memory => {
                 self.mem()
                     .insert(Self::key(account_id), password.to_owned());
@@ -102,12 +113,14 @@ impl SecretStore {
 
     pub fn get(&self, account_id: i64) -> Result<String> {
         match self.backend {
-            Backend::Keyring => keyring::Entry::new(SERVICE, &Self::key(account_id))
-                .and_then(|e| e.get_password())
-                .map_err(|e| match e {
-                    keyring::Error::NoEntry => Error::NotFound("stored password".into()),
-                    other => Error::Secret(other.to_string()),
-                }),
+            Backend::Keyring => keyring_call(|| {
+                keyring::v1::Entry::new(SERVICE, &Self::key(account_id))
+                    .and_then(|e| e.get_password())
+            })
+            .map_err(|e| match e {
+                keyring::v1::Error::NoEntry => Error::NotFound("stored password".into()),
+                other => Error::Secret(other.to_string()),
+            }),
             Backend::Memory => self
                 .mem()
                 .get(&Self::key(account_id))
@@ -120,12 +133,15 @@ impl SecretStore {
 
     pub fn delete(&self, account_id: i64) -> Result<()> {
         match self.backend {
-            Backend::Keyring => match keyring::Entry::new(SERVICE, &Self::key(account_id))
-                .and_then(|e| e.delete_credential())
-            {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(Error::Secret(e.to_string())),
-            },
+            Backend::Keyring => {
+                match keyring_call(|| {
+                    keyring::v1::Entry::new(SERVICE, &Self::key(account_id))
+                        .and_then(|e| e.delete_credential())
+                }) {
+                    Ok(()) | Err(keyring::v1::Error::NoEntry) => Ok(()),
+                    Err(e) => Err(Error::Secret(e.to_string())),
+                }
+            }
             Backend::Memory => {
                 self.mem().remove(&Self::key(account_id));
                 Ok(())
@@ -140,19 +156,18 @@ impl SecretStore {
         if self.backend != Backend::Keyring {
             return Ok(None);
         }
-        let entry = keyring::Entry::new(SERVICE, CACHE_KEY_USER)
+        let entry = keyring_call(|| keyring::v1::Entry::new(SERVICE, CACHE_KEY_USER))
             .map_err(|e| Error::Secret(e.to_string()))?;
-        match entry.get_password() {
+        match keyring_call(|| entry.get_password()) {
             Ok(hex) => CacheKey::from_hex(&hex)
                 .map(Some)
                 .ok_or_else(|| Error::Secret("stored cache key is malformed".into())),
-            Err(keyring::Error::NoEntry) => {
+            Err(keyring::v1::Error::NoEntry) => {
                 let key = CacheKey::random()?;
-                entry
-                    .set_password(key.hex())
+                keyring_call(|| entry.set_password(key.hex()))
                     .map_err(|e| Error::Secret(e.to_string()))?;
                 // Read back: never encrypt data with a key the keyring did not keep.
-                match entry.get_password() {
+                match keyring_call(|| entry.get_password()) {
                     Ok(h) if h.as_str() == key.hex().as_str() => Ok(Some(key)),
                     Ok(_) => Err(Error::Secret(
                         "keyring returned a different cache key".into(),
@@ -166,5 +181,22 @@ impl SecretStore {
 
     fn mem(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
         self.memory.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// keyring 4 talks to the Secret Service through zbus's blocking client,
+/// which refuses to start while the calling thread is inside a Tokio
+/// runtime. Account commands and the OAuth refresh path run on that
+/// runtime, so the call is moved to a short-lived thread first.
+fn keyring_call<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(f)
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    } else {
+        f()
     }
 }

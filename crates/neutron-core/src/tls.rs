@@ -47,6 +47,21 @@ pub fn client_config(extra_ca_pem: Option<&str>) -> Result<Arc<ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
+/// reqwest builder whose TLS stack matches [`client_config`]: rustls with
+/// the ring provider and the Mozilla roots in `webpki-roots`, not the
+/// operating system's certificate store and not aws-lc.
+///
+/// HTTP/1.1 only, as with the previous reqwest 0.12 feature set (no `http2`).
+pub(crate) fn http_builder() -> Result<reqwest::ClientBuilder> {
+    // reqwest's own rustls backend panics while building a client if no
+    // process-wide provider is installed. The preconfigured config below
+    // carries its own provider; this also covers any builder that does not.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut tls = (*client_config(None)?).clone();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(reqwest::Client::builder().tls_backend_preconfigured(tls))
+}
+
 pub async fn wrap(
     stream: TcpStream,
     host: &str,

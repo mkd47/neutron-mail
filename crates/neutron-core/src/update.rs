@@ -56,7 +56,8 @@ pub fn parse_latest(json: &str) -> Result<Release> {
 
 /// The newest release, if it is newer than `current`.
 pub async fn check(current: &str) -> Result<Option<Release>> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_builder()
+        .map_err(|e| Error::Invalid(format!("update check: {e}")))?
         .timeout(Duration::from_secs(15))
         .user_agent(concat!("neutron-mail/", env!("CARGO_PKG_VERSION")))
         .build()

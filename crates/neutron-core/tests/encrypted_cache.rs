@@ -114,6 +114,57 @@ fn plaintext_cache_is_migrated_and_scrubbed() {
     assert!(!r.migrated);
 }
 
+/// Database written by rusqlite 0.37's bundled SQLCipher 4.6.1 (page size
+/// 4096, HMAC-SHA512, raw key `x'<64 hex>'`). 0.40 bundles SQLCipher 4.14;
+/// the 4.x on-disk format is unchanged, so the same key must open the file
+/// instead of moving it aside and starting empty.
+#[test]
+fn sqlcipher_4_6_1_database_still_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("cache.sqlite3");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sqlcipher/cache-4.6.1.sqlite3");
+    std::fs::copy(&src, &p).unwrap();
+    let salt = {
+        let bytes = std::fs::read(&p).unwrap();
+        bytes[..16].to_vec()
+    };
+    let key =
+        CacheKey::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .unwrap();
+    assert_eq!(
+        fixture_note(&p),
+        "neutron-mail-v0.5.1-sqlcipher",
+        "SQLCipher 4.14 must decrypt a 4.6.1 file with the same raw key"
+    );
+    let (s, r) = Store::open_encrypted(&p, &key).unwrap();
+    assert!(!r.migrated);
+    assert!(r.unreadable_moved_to.is_none());
+    assert!(s.accounts().unwrap().is_empty());
+    drop(s);
+    let opened = std::fs::read(&p).unwrap();
+    assert_eq!(
+        &opened[..16],
+        salt.as_slice(),
+        "a failed key would replace the file with a new salt"
+    );
+    assert_eq!(fixture_note(&p), "neutron-mail-v0.5.1-sqlcipher");
+    let (s, r) = Store::open_encrypted(&p, &key).unwrap();
+    assert!(!r.migrated && r.unreadable_moved_to.is_none());
+    assert!(s.accounts().unwrap().is_empty());
+    assert_eq!(fixture_note(&p), "neutron-mail-v0.5.1-sqlcipher");
+}
+
+fn fixture_note(path: &Path) -> String {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "PRAGMA key = \"x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'\";",
+    )
+    .unwrap();
+    conn.query_row("SELECT note FROM fixture", [], |r| r.get(0))
+        .unwrap()
+}
+
 #[test]
 fn wrong_key_moves_cache_aside_instead_of_failing() {
     let dir = tempfile::tempdir().unwrap();

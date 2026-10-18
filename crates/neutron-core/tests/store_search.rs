@@ -169,6 +169,99 @@ fn duplicate_insert_is_idempotent_and_removal_updates_index() {
 }
 
 #[test]
+fn address_backfill_resumes_in_batches_and_does_not_recount() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let account_id;
+    {
+        let s = Store::open_plaintext(&path).unwrap();
+        account_id = s.add_account(&cfg()).unwrap();
+        let f = s.upsert_folder(account_id, "INBOX", Some("inbox")).unwrap();
+        for uid in 1..=100u32 {
+            let raw = raw(
+                "Hello",
+                &format!("Person {uid} <p{uid}@example.test>"),
+                "body",
+            );
+            s.insert_message(
+                f,
+                &NewMessage {
+                    uid,
+                    seen: false,
+                    flagged: false,
+                    raw: &raw,
+                },
+            )
+            .unwrap();
+        }
+    }
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        // Pretend the first 40 messages were already indexed, then the
+        // process stopped. The rest must be filled without touching the
+        // earlier rows again.
+        db.execute("DELETE FROM addresses", []).unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('addresses-backfill-after','40')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM cache_metadata WHERE key = 'addresses-backfill'",
+            [],
+        )
+        .unwrap();
+    }
+    {
+        let s = Store::open_plaintext(&path).unwrap();
+        assert!(
+            s.address_history(account_id, "p1@example.test", 10)
+                .unwrap()
+                .is_empty(),
+            "messages at or below the checkpoint are not re-read"
+        );
+        assert_eq!(
+            s.address_history(account_id, "p100@example.test", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let uses: i64 = db
+            .query_row(
+                "SELECT uses FROM addresses WHERE email = 'p100@example.test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uses, 1);
+        let done: String = db
+            .query_row(
+                "SELECT value FROM cache_metadata WHERE key = 'addresses-backfill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "1");
+    }
+    // A later open sees the done flag and must not count p100 again.
+    {
+        let _s = Store::open_plaintext(&path).unwrap();
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let uses: i64 = db
+        .query_row(
+            "SELECT uses FROM addresses WHERE email = 'p100@example.test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(uses, 1);
+}
+
+#[test]
 fn duplicate_batch_does_not_inflate_address_history() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.sqlite3");

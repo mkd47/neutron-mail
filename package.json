@@ -12,14 +12,14 @@
   },
   "dependencies": {
     "@neutron/ui": "https://github.com/mkd47/neutron-ui/archive/877c436539ee6601e00baf025ca40f9dd6bb64c3.tar.gz",
-    "@tauri-apps/api": "^2.12.3",
+    "@tauri-apps/api": "^2.12.4",
     "@tauri-apps/plugin-opener": "^2.7.2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tsconfig/svelte": "^5.0.8",
     "svelte": "^5.57.2",
-    "svelte-check": "^4.7.6",
+    "svelte-check": "^4.7.7",
     "typescript": "^5.9.3",
     "vite": "^8.3.4"
   },

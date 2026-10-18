@@ -248,7 +248,8 @@ async fn token_request(
         }
         b.finish()
     };
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_builder()
+        .map_err(|e| Error::Invalid(format!("OAuth: {e}")))?
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -579,7 +580,7 @@ mod tests {
         let browser = tokio::spawn({
             let redirect = redirect.clone();
             async move {
-                let c = reqwest::Client::new();
+                let c = crate::tls::http_builder().unwrap().build().unwrap();
                 // A forged request with the wrong state is ignored.
                 let r = c
                     .get(format!("{redirect}?code=EVIL&state=wrong"))
@@ -644,7 +645,10 @@ mod tests {
         let lb = Loopback::bind().await.unwrap();
         let u = format!("{}?error=access_denied&state={}", lb.redirect_uri, p.state);
         tokio::spawn(async move {
-            let _ = reqwest::get(u).await;
+            // reqwest 0.13 with rustls-no-provider has no default crypto
+            // provider; the app's builder installs ring.
+            let client = crate::tls::http_builder().unwrap().build().unwrap();
+            let _ = client.get(u).send().await;
         });
         let e = lb
             .wait_for_code(&p.state, Duration::from_secs(10))

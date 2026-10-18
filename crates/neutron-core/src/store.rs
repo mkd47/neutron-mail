@@ -600,35 +600,109 @@ impl Store {
     }
 
     /// Caches created before the address table existed: index once.
+    ///
+    /// Raw messages are read in small batches, parsed outside the connection
+    /// lock, and written back with a checkpoint. A large mailbox therefore
+    /// never has to sit in one `Vec`. A cache that already has address rows
+    /// (they are recorded as mail arrives) is marked done without counting
+    /// those rows again. An interrupted pass resumes from the checkpoint.
     fn backfill_addresses(&self) -> Result<()> {
-        let mut db = self.db();
-        let empty: bool = db.query_row("SELECT NOT EXISTS (SELECT 1 FROM addresses)", [], |r| {
-            r.get(0)
-        })?;
-        if !empty {
-            return Ok(());
-        }
-        let tx = db.transaction()?;
-        {
-            let mut st = tx.prepare(
-                "SELECT f.account_id, m.raw FROM messages m JOIN folders f ON f.id = m.folder_id",
-            )?;
-            let rows: Vec<(i64, Vec<u8>)> = st
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (account_id, raw) in rows {
-                let p = parse::parse(&raw);
-                for (name, email) in &p.addresses {
+        const BATCH: i64 = 40;
+        loop {
+            let rows: Vec<(i64, i64, Vec<u8>)> = {
+                let db = self.db();
+                let meta = |key: &str| {
+                    db.query_row(
+                        "SELECT value FROM cache_metadata WHERE key = ?1",
+                        [key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                };
+                if meta("addresses-backfill")?.as_deref() == Some("1") {
+                    return Ok(());
+                }
+                let after_raw = meta("addresses-backfill-after")?;
+                let after: i64 = after_raw
+                    .as_deref()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                // No checkpoint and the table is already populated: this cache
+                // was filled by ordinary inserts (or a previous complete pass).
+                if after_raw.is_none() {
+                    let empty: bool =
+                        db.query_row("SELECT NOT EXISTS (SELECT 1 FROM addresses)", [], |r| {
+                            r.get(0)
+                        })?;
+                    if !empty {
+                        db.execute(
+                            "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('addresses-backfill','1')",
+                            [],
+                        )?;
+                        return Ok(());
+                    }
+                }
+                let mut st = db.prepare(
+                    "SELECT m.id, f.account_id, m.raw FROM messages m
+                     JOIN folders f ON f.id = m.folder_id
+                     WHERE m.id > ?1 ORDER BY m.id LIMIT ?2",
+                )?;
+                let rows = st
+                    .query_map(params![after, BATCH], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            struct Indexed {
+                id: i64,
+                account_id: i64,
+                addresses: Vec<(String, String)>,
+                date: i64,
+            }
+            let parsed: Vec<Indexed> = rows
+                .into_iter()
+                .map(|(id, account_id, raw)| {
+                    let p = parse::parse(&raw);
+                    Indexed {
+                        id,
+                        account_id,
+                        addresses: p.addresses,
+                        date: p.date,
+                    }
+                })
+                .collect();
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            for row in &parsed {
+                for (name, email) in &row.addresses {
                     tx.execute(
                         "INSERT INTO addresses (account_id, email, name, uses, last_seen) VALUES (?1, ?2, ?3, 1, ?4)
                          ON CONFLICT(account_id, email) DO UPDATE SET uses = uses + 1, last_seen = max(last_seen, excluded.last_seen)",
-                        params![account_id, email, name, p.date],
+                        params![row.account_id, email, name, row.date],
                     )?;
                 }
             }
+            let finished = parsed.len() as i64 != BATCH;
+            match parsed.last() {
+                Some(last) if !finished => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('addresses-backfill-after', ?1)",
+                        [last.id.to_string()],
+                    )?;
+                }
+                _ => {
+                    tx.execute_batch(
+                        "INSERT OR REPLACE INTO cache_metadata (key,value) VALUES ('addresses-backfill','1');
+                         DELETE FROM cache_metadata WHERE key = 'addresses-backfill-after';",
+                    )?;
+                }
+            }
+            tx.commit()?;
+            if finished {
+                return Ok(());
+            }
         }
-        tx.commit()?;
-        Ok(())
     }
 
     pub(crate) fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
