@@ -164,11 +164,14 @@ More: [delete folder confirmation](docs/screenshots/folder-delete-confirm.png), 
 ### Shared UI package
 
 The theme (palette, dark/light, base controls), the left app rail and the icon set come from
-[**@neutron/ui**](https://github.com/mkd47/neutron-ui), shared with the other Neutron apps. It is a
-GitHub dependency pinned to a commit in `package.json` (`github:mkd47/neutron-ui#<sha>`), and `package-lock.json`
-records its integrity hash, so builds are reproducible. `npm ci` fetches it as an HTTPS tarball (no git or SSH
-needed; checked in a clean `fedora:44` container). To update it, push to neutron-ui and bump the commit with
-`npm install github:mkd47/neutron-ui#<new-sha>`. Mail-only styles stay in `src/app.css`.
+[**@neutron/ui**](https://github.com/mkd47/neutron-ui), shared with the other Neutron apps. It is pinned to a
+commit as an HTTPS tarball in `package.json`
+(`https://github.com/mkd47/neutron-ui/archive/<sha>.tar.gz`). `package-lock.json` records that URL and its
+integrity hash, so `npm ci` downloads the tarball over HTTPS and checks the hash. Builds do not need git or
+GitHub SSH. Do not switch the dependency back to `github:mkd47/neutron-ui#<sha>`: npm resolves that to
+`git+ssh` and [skips integrity checks for git dependencies](https://github.com/npm/rfcs/pull/525). To update
+it, push to neutron-ui and refresh the pin with
+`npm install https://github.com/mkd47/neutron-ui/archive/<new-sha>.tar.gz`. Mail-only styles stay in `src/app.css`.
 
 ### Why Svelte (not React)
 Svelte compiles to plain DOM code with no runtime: an 82 KB JS bundle (30 KB gzipped) and two

@@ -5,7 +5,9 @@
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
-use neutron_core::attachments::{is_risky, mime_for, safe_filename, MAX_ATTACHMENT_BYTES};
+use neutron_core::attachments::{
+    is_risky, mime_for, read_capped, safe_filename, CappedReadError, MAX_ATTACHMENT_BYTES,
+};
 use neutron_core::model::OutgoingAttachment;
 use neutron_core::{parse, Error};
 use serde::Serialize;
@@ -101,8 +103,9 @@ pub async fn pick_attachments(app: AppHandle, state: State<'_, AppState>) -> Res
     Ok(result)
 }
 
-/// Read a picked file for sending (size re-checked: the file may have
-/// changed since it was picked).
+/// Read a picked file for sending. The open is non-blocking and the read is
+/// capped, so a file that grows or is replaced by a fifo after it was picked
+/// cannot bypass [`MAX_ATTACHMENT_BYTES`] or stall the send.
 pub fn read_picked(state: &AppState, token: &str) -> Res<OutgoingAttachment> {
     let (path, name) = {
         let map = state.picked.lock().unwrap_or_else(|p| p.into_inner());
@@ -111,11 +114,16 @@ pub fn read_picked(state: &AppState, token: &str) -> Res<OutgoingAttachment> {
             .ok_or_else(|| Error::NotFound("picked file".into()))?;
         (f.path.clone(), f.name.clone())
     };
-    let meta = std::fs::metadata(&path)?;
-    if meta.len() > MAX_ATTACHMENT_BYTES {
-        return Err(Error::Invalid(format!("{name} is too large")));
-    }
-    let data = std::fs::read(&path)?;
+    let data = match read_capped(&path, MAX_ATTACHMENT_BYTES) {
+        Ok(data) => data,
+        Err(CappedReadError::TooLarge) => {
+            return Err(Error::Invalid(format!("{name} is too large")));
+        }
+        Err(CappedReadError::NotRegularFile) => {
+            return Err(Error::Invalid(format!("{name} is not a regular file")));
+        }
+        Err(CappedReadError::Io(e)) => return Err(e.into()),
+    };
     Ok(OutgoingAttachment {
         mime: mime_for(&name).to_string(),
         name,
@@ -239,7 +247,7 @@ pub async fn open_attachment(
         return Ok(OpenResult {
             status: "needs_confirmation",
             reason: Some(format!(
-                "\"{name}\" is a program or script. Opening it can run code on your computer. Only continue if you trust the sender and expected this file."
+                "\"{name}\" can run code on your computer when opened. Only continue if you trust the sender and expected this file."
             )),
         });
     }

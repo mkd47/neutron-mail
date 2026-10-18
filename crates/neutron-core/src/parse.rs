@@ -512,6 +512,40 @@ mod tests {
     }
 
     #[test]
+    fn html_svg_and_xhtml_attachments_are_marked_risky() {
+        let png = super::base64(b"%PDF-1.4");
+        let html = super::base64(b"<html><script>alert(1)</script></html>");
+        let svg = super::base64(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>");
+        let raw = format!(
+            "From: a@example.test\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--M\r\nContent-Type: text/html; charset=utf-8; name=\"page.html\"\r\n\
+Content-Disposition: attachment; filename=\"page.html\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{html}\r\n\
+--M\r\nContent-Type: image/svg+xml; name=\"logo.svg\"\r\n\
+Content-Disposition: attachment; filename=\"logo.svg\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{svg}\r\n\
+--M\r\nContent-Type: application/xhtml+xml\r\n\
+Content-Disposition: attachment; filename=\"note.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{html}\r\n\
+--M\r\nContent-Type: application/pdf; name=\"invoice.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{png}\r\n\
+--M--\r\n"
+        );
+        let p = super::parse(raw.as_bytes());
+        let risky = |n: &str| p.attachments.iter().find(|a| a.name == n).unwrap().risky;
+        assert!(risky("page.html"));
+        assert!(risky("logo.svg"));
+        assert!(
+            risky("note.bin"),
+            "xhtml mime is active even without the extension"
+        );
+        assert!(!risky("invoice.pdf"));
+    }
+
+    #[test]
     fn base64_matches_reference() {
         assert_eq!(super::base64(b""), "");
         assert_eq!(super::base64(b"f"), "Zg==");

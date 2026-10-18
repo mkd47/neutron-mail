@@ -167,6 +167,22 @@ const RISKY_EXTENSIONS: &[&str] = &[
     "docm",
     "xlsm",
     "pptm",
+    // Active documents. Opening these with the default app hands the raw
+    // bytes to a browser, which runs scripts. SVG is included because it
+    // is XML that can carry script; XHTML, XSLT and MHTML are the same class.
+    "html",
+    "htm",
+    "shtml",
+    "shtm",
+    "xhtml",
+    "xht",
+    "svg",
+    "svgz",
+    "xml",
+    "xsl",
+    "xslt",
+    "mht",
+    "mhtml",
 ];
 
 const RISKY_MIME: &[&str] = &[
@@ -188,18 +204,177 @@ const RISKY_MIME: &[&str] = &[
     "application/javascript",
     "text/javascript",
     "application/x-perl",
+    "text/html",
+    "application/xhtml+xml",
+    "application/vnd.wap.xhtml+xml",
+    "image/svg+xml",
+    "application/svg+xml",
+    "text/xml",
+    "application/xml",
+    "application/xslt+xml",
+    "text/xsl",
+    "application/x-httpd-php",
 ];
 
 /// Whether opening this attachment could execute code. Checks the file
-/// extension, the declared MIME type and the content's magic bytes (ELF,
-/// PE/MZ, shebang), so a renamed executable is still caught.
+/// extension, the declared MIME type (parameters ignored) and the content's
+/// magic bytes (ELF, PE/MZ, shebang, or an HTML/SVG document), so a renamed
+/// executable or active document is still caught.
 pub fn is_risky(name: &str, mime: &str, data: &[u8]) -> bool {
     let ext_risky =
         extension(&safe_filename(name)).is_some_and(|e| RISKY_EXTENSIONS.contains(&e.as_str()));
-    let mime_risky = RISKY_MIME.contains(&mime.to_ascii_lowercase().as_str());
-    let magic_risky =
-        data.starts_with(b"\x7fELF") || data.starts_with(b"MZ") || data.starts_with(b"#!");
+    let mime_risky = RISKY_MIME.contains(&mime_essence(mime).as_str());
+    let magic_risky = data.starts_with(b"\x7fELF")
+        || data.starts_with(b"MZ")
+        || data.starts_with(b"#!")
+        || looks_like_active_markup(data);
     ext_risky || mime_risky || magic_risky
+}
+
+/// `text/html; charset=utf-8` and `TEXT/HTML` both compare as `text/html`.
+fn mime_essence(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// How much of the file start is sniffed. A preamble (doctype, comments)
+/// past this window can hide a later root tag; the window is large enough
+/// for a normal SVG or XHTML prologue.
+const MARKUP_SNIFF_BYTES: usize = 4096;
+
+/// HTML, XHTML and SVG are active even when the filename and the declared
+/// type are innocuous: file managers sniff the bytes and open a browser.
+/// Only the start of the file is inspected, after a BOM, whitespace, an XML
+/// declaration, comments and a non-HTML doctype, which is how those
+/// documents are usually wrapped.
+fn looks_like_active_markup(data: &[u8]) -> bool {
+    if let Some(text) = utf16_prefix(data) {
+        return markup_at_start(&text.to_ascii_lowercase());
+    }
+    let data = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
+    let head = &data[..data.len().min(MARKUP_SNIFF_BYTES)];
+    markup_at_start(&String::from_utf8_lossy(head).to_ascii_lowercase())
+}
+
+/// UTF-16 HTML/SVG (BOM plus the same tags) is active in a browser. Only a
+/// leading BOM is treated as UTF-16, so an ordinary binary file is not
+/// decoded.
+fn utf16_prefix(data: &[u8]) -> Option<String> {
+    let (rest, little) = if let Some(rest) = data.strip_prefix(&[0xFF, 0xFE]) {
+        (rest, true)
+    } else {
+        let rest = data.strip_prefix(&[0xFE, 0xFF])?;
+        (rest, false)
+    };
+    let n = rest.len().min(MARKUP_SNIFF_BYTES.saturating_mul(2));
+    let n = n - (n % 2);
+    let (chunks, _) = rest[..n].as_chunks::<2>();
+    let units: Vec<u16> = chunks
+        .iter()
+        .map(|c| {
+            if little {
+                u16::from_le_bytes(*c)
+            } else {
+                u16::from_be_bytes(*c)
+            }
+        })
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+fn markup_at_start(mut rest: &str) -> bool {
+    loop {
+        let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if trimmed.len() != rest.len() {
+            rest = trimmed;
+            continue;
+        }
+        if is_active_markup_start(rest) {
+            return true;
+        }
+        match skip_leading_preamble(rest) {
+            Some(next) if next.len() < rest.len() => rest = next,
+            _ => return false,
+        }
+    }
+}
+
+fn is_active_markup_start(s: &str) -> bool {
+    // `<!DOCTYPE svg` is the document, even when the `<svg` tag sits past a
+    // long public identifier. The same for HTML. Other doctypes are skipped
+    // so the root element can still be seen.
+    if starts_with_doctype(s, "html") || starts_with_doctype(s, "svg") {
+        return true;
+    }
+    for tag in ["<html", "<head", "<body", "<svg", "<script"] {
+        if let Some(after) = s.strip_prefix(tag) {
+            if after.starts_with([' ', '\t', '\n', '\r', '>', '/']) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `<!DOCTYPE svg PUBLIC …>` and `<!DOCTYPE\nHTML>`.
+fn starts_with_doctype(s: &str, name: &str) -> bool {
+    let Some(after) = s.strip_prefix("<!doctype") else {
+        return false;
+    };
+    let after = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let Some(rest) = after.strip_prefix(name) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '>')
+}
+
+/// Drop one leading processing instruction, comment, or doctype. The caller
+/// has already treated an HTML or SVG doctype as active.
+fn skip_leading_preamble(s: &str) -> Option<&str> {
+    if let Some(after) = s.strip_prefix("<?") {
+        let end = after.find("?>")?;
+        return Some(&after[end + 2..]);
+    }
+    if let Some(after) = s.strip_prefix("<!--") {
+        let end = after.find("-->")?;
+        return Some(&after[end + 3..]);
+    }
+    if let Some(after) = s.strip_prefix("<!doctype") {
+        let end = declaration_end(after)?;
+        return Some(&after[end..]);
+    }
+    None
+}
+
+/// Offset just past the `>` that closes a declaration, ignoring `>` inside
+/// quotes or a `[…]` internal subset.
+fn declaration_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut brackets = 0i32;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '[' => brackets += 1,
+            ']' => {
+                if brackets == 0 {
+                    return None;
+                }
+                brackets -= 1;
+            }
+            '>' if brackets == 0 => return Some(i + c.len_utf8()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Content-type guess for an outgoing file (by extension; the UI never
@@ -224,6 +399,80 @@ pub fn mime_for(name: &str) -> &'static str {
         Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/octet-stream",
     }
+}
+
+/// Why [`read_capped`] refused a file.
+#[derive(Debug)]
+pub enum CappedReadError {
+    /// The file is a regular file larger than the cap, including a file that
+    /// grew past the cap while it was being read.
+    TooLarge,
+    /// The opened descriptor is not a regular file (directory, fifo, device).
+    NotRegularFile,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for CappedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => write!(f, "file is too large"),
+            Self::NotRegularFile => write!(f, "not a regular file"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CappedReadError {}
+
+impl From<std::io::Error> for CappedReadError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Read a regular file, refusing anything over `max` bytes.
+///
+/// The file is opened `O_NONBLOCK` so a fifo or device swapped onto `path`
+/// cannot stall the caller, then checked with `fstat` on that descriptor.
+/// The read itself stops after `max + 1` bytes: a metadata length from before
+/// the read is not a limit, because the file can grow in between.
+pub fn read_capped(path: &std::path::Path, max: u64) -> Result<Vec<u8>, CappedReadError> {
+    let mut file = open_for_capped_read(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(CappedReadError::NotRegularFile);
+    }
+    if meta.len() > max {
+        return Err(CappedReadError::TooLarge);
+    }
+    read_limited(&mut file, max)
+}
+
+/// Stop after `max + 1` bytes so a reader that never reaches EOF (a file
+/// still being appended, or `/dev/zero` if the type check were skipped)
+/// cannot exhaust memory.
+fn read_limited(reader: &mut impl std::io::Read, max: u64) -> Result<Vec<u8>, CappedReadError> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    reader.take(max.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(CappedReadError::TooLarge);
+    }
+    Ok(data)
+}
+
+#[cfg(unix)]
+fn open_for_capped_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_for_capped_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 #[cfg(test)]
@@ -294,5 +543,159 @@ mod tests {
         assert!(is_risky("x", "application/x-desktop", b""));
         assert!(!is_risky("invoice.pdf", "application/pdf", b"%PDF-1.4"));
         assert!(!is_risky("notes.txt", "text/plain", b"hello"));
+    }
+
+    #[test]
+    fn active_documents_require_confirmation() {
+        for name in [
+            "page.html",
+            "page.HTM",
+            "page.xhtml",
+            "page.xht",
+            "page.shtml",
+            "logo.svg",
+            "logo.svgz",
+            "note.xml",
+            "style.xsl",
+            "style.xslt",
+            "saved.mht",
+            "saved.mhtml",
+            "nested/invoice.html",
+        ] {
+            assert!(
+                is_risky(name, "application/octet-stream", b"not markup"),
+                "{name}"
+            );
+        }
+        // Declared type, including parameters and odd case, even with a safe name.
+        assert!(is_risky("notes.bin", "text/html", b"hello"));
+        assert!(is_risky("notes.bin", "text/html; charset=utf-8", b"hello"));
+        assert!(is_risky("notes.bin", "TEXT/HTML; charset=UTF-8", b"hello"));
+        assert!(is_risky("logo.bin", "image/svg+xml", b"<svg/>"));
+        assert!(is_risky("page.bin", "application/xhtml+xml", b""));
+        assert!(is_risky("sheet.bin", "application/xml", b"<data/>"));
+        // Renamed: the bytes are what a file manager would sniff.
+        assert!(is_risky(
+            "invoice.pdf",
+            "application/pdf",
+            b"<!DOCTYPE html><script>alert(1)</script>"
+        ));
+        assert!(is_risky(
+            "photo.jpg",
+            "image/jpeg",
+            b"\xef\xbb\xbf  \n<html><script>x</script></html>"
+        ));
+        assert!(is_risky(
+            "image.png",
+            "image/png",
+            b"<?xml version=\"1.0\"?>\n<!-- logo -->\n<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"
+        ));
+        // Inkscape / Illustrator SVG: a doctype sits between the XML
+        // declaration and `<svg`. Stopping at that doctype would miss it.
+        assert!(is_risky(
+            "image.png",
+            "image/png",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"
+        ));
+        assert!(is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<head><script>alert(1)</script></head>"
+        ));
+        assert!(is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<body onload=\"alert(1)\"></body>"
+        ));
+        // `>` inside a doctype subset is not the end of the declaration.
+        assert!(is_risky(
+            "page.txt",
+            "text/plain",
+            b"<!DOCTYPE note [\n  <!ELEMENT note (to)>\n]>\n<html><script>x</script></html>"
+        ));
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "<html><script>x</script></html>".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        assert!(is_risky("invoice.pdf", "application/pdf", &utf16));
+        assert!(!is_risky(
+            "settings.txt",
+            "text/plain",
+            b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict></dict></plist>\n"
+        ));
+        assert!(!is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<header>not a document</header>"
+        ));
+        assert!(!is_risky(
+            "notes.txt",
+            "text/plain",
+            b"see <html> only later in the file"
+        ));
+        assert!(!is_risky(
+            "invoice.pdf",
+            "application/pdf",
+            b"%PDF-1.7\n<html>"
+        ));
+        assert!(!is_risky("data.csv", "text/csv", b"a,b\n1,2\n"));
+    }
+
+    #[test]
+    fn capped_read_stops_at_the_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.bin");
+        std::fs::write(&path, vec![7u8; 8]).unwrap();
+        assert_eq!(read_capped(&path, 8).unwrap(), vec![7u8; 8]);
+        assert!(matches!(
+            read_capped(&path, 7).unwrap_err(),
+            CappedReadError::TooLarge
+        ));
+        let empty = dir.path().join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(read_capped(&empty, 4).unwrap(), b"");
+
+        // A reader that never ends must not be copied forever. This is the
+        // case a metadata check misses: the file grows while it is read.
+        struct NeverEnds;
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+        assert!(matches!(
+            super::read_limited(&mut NeverEnds, 32).unwrap_err(),
+            CappedReadError::TooLarge
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_are_rejected_without_blocking() {
+        let err = read_capped(std::path::Path::new("/dev/zero"), 64).unwrap_err();
+        assert!(matches!(err, CappedReadError::NotRegularFile), "{err}");
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_capped(dir.path(), 64).unwrap_err();
+        assert!(matches!(err, CappedReadError::NotRegularFile), "{err}");
+
+        let pipe = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = read_capped(&pipe, 64).unwrap_err();
+        assert!(matches!(err, CappedReadError::NotRegularFile), "{err}");
+
+        let real = dir.path().join("real.bin");
+        std::fs::write(&real, b"abc").unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_capped(&link, 64).unwrap(), b"abc");
+        let zero = dir.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        let err = read_capped(&zero, 64).unwrap_err();
+        assert!(matches!(err, CappedReadError::NotRegularFile), "{err}");
     }
 }
