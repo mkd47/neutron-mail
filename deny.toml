@@ -7,8 +7,9 @@ all-features = false
 ignore = [
   # proc-macro-error: build-time proc macro pulled in by GTK3 bindings (via Tauri/wry). No runtime exposure.
   { id = "RUSTSEC-2024-0370", reason = "transitive via gtk3-rs (Tauri Linux backend); build-time only" },
-  # zbus 4/5 helper crates, merged into zbus 6 (2026-10). Pulled in by our D-Bus code and by Tauri's
-  # own plugins (opener, notification); not vulnerable. Revisit when Tauri moves to zbus 6.
+  # zbus 5 helper crates, merged into zbus 6 (2026-10). keyring 4 removed the
+  # duplicate zbus 4 copy; these remain through our D-Bus code and Tauri's
+  # plugins. Not vulnerabilities. Revisit when Tauri moves to zbus 6.
   { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; no safe upgrade yet (Tauri plugins use zbus 5)" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; no safe upgrade yet (Tauri plugins use zbus 5)" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; no safe upgrade yet (Tauri plugins use zbus 5)" },

@@ -316,7 +316,8 @@ pub fn autoconfig_urls(domain: &str) -> Vec<String> {
 pub async fn autoconfig(email: &str) -> Result<Discovered> {
     let domain =
         domain_of(email).ok_or_else(|| Error::Invalid("enter a valid email address".into()))?;
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_builder()
+        .map_err(|e| Error::Invalid(format!("autoconfig: {e}")))?
         .https_only(true)
         .timeout(std::time::Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::limited(3))

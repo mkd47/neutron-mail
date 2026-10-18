@@ -3,3 +3,5 @@ node_modules/
 /dist
 /src-tauri/gen/schemas
 *.sqlite3*
+# Checked-in SQLCipher 4.6.1 database used to prove a 0.40 upgrade still opens it.
+!crates/neutron-core/tests/fixtures/sqlcipher/cache-4.6.1.sqlite3

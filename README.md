@@ -236,7 +236,7 @@ The flow is unit-tested against a mock token endpoint; it has **not** been run a
 > with `Categories=Network;Email;`); on the build box the Cisco openh264 repo
 > (`ciscobinary.openh264.org`) timed out, so dnf was run with `--disablerepo=fedora-cisco-openh264`
 > (openh264 is only a weak dependency). The GUI was not run on a real Fedora/GNOME desktop.
-> Rust ≥ 1.88 is required (async-imap 0.12).
+> Rust ≥ 1.90 is required (Tauri 2.12; `rust-toolchain.toml` pins 1.90.0).
 
 ```bash
 # 1. System dependencies
@@ -245,7 +245,7 @@ sudo dnf install -y webkit2gtk4.1-devel openssl-devel curl wget file \
   gnome-keyring libsecret evolution-data-server
 sudo dnf group install -y c-development
 
-# 2. Rust (>= 1.88) via rustup, plus the Tauri CLI
+# 2. Rust (>= 1.90) via rustup, plus the Tauri CLI
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install --locked tauri-cli@^2
 

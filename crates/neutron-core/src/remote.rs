@@ -141,7 +141,7 @@ fn url_allowed(u: &Url, allow_private: bool) -> bool {
 }
 
 fn client(allow_private: bool) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::tls::http_builder()?
         // The caller refuses configured environment proxies first. Disable
         // automatic proxy discovery as well so all target DNS goes through
         // our resolver, including redirects.
@@ -491,7 +491,11 @@ mod tests {
         let (base, requests, server) = image_server(png_body(64)).await;
         let mut urls = vec![format!("{base}/first.png"); MAX_IMAGES];
         urls.push(format!("{base}/second.png"));
-        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let c = crate::tls::http_builder()
+            .unwrap()
+            .no_proxy()
+            .build()
+            .unwrap();
         let report =
             fetch_images_with_client(c, urls, true, Arc::new(DownloadBudget::new(1024))).await;
         server.abort();
@@ -505,7 +509,11 @@ mod tests {
     async fn concurrent_chunked_images_share_one_download_budget() {
         let (base, requests, server) = image_server(png_body(64)).await;
         let urls: Vec<_> = (0..20).map(|i| format!("{base}/{i}.png")).collect();
-        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let c = crate::tls::http_builder()
+            .unwrap()
+            .no_proxy()
+            .build()
+            .unwrap();
         let budget = Arc::new(DownloadBudget::new(128));
         let report = fetch_images_with_client(c, urls.clone(), true, Arc::clone(&budget)).await;
         server.abort();
@@ -519,7 +527,11 @@ mod tests {
     #[tokio::test]
     async fn invalid_images_consume_the_budget_and_stop_later_requests() {
         let (base, requests, server) = image_server(vec![b'x'; 64]).await;
-        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let c = crate::tls::http_builder()
+            .unwrap()
+            .no_proxy()
+            .build()
+            .unwrap();
         let budget = DownloadBudget::new(64);
         let invalid = fetch_one(&c, &format!("{base}/invalid.png"), true, &budget).await;
         assert!(invalid
@@ -538,7 +550,11 @@ mod tests {
     #[tokio::test]
     async fn over_budget_chunk_is_rejected_without_returning_an_image() {
         let (base, _, server) = image_server(png_body(64)).await;
-        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let c = crate::tls::http_builder()
+            .unwrap()
+            .no_proxy()
+            .build()
+            .unwrap();
         let budget = DownloadBudget::new(63);
         let result = fetch_one(&c, &format!("{base}/large.png"), true, &budget).await;
         server.abort();
