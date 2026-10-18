@@ -2551,6 +2551,20 @@ impl Store {
         Ok(true)
     }
 
+    /// Give back the slot [`take_forward_budget`] just took. A forward that
+    /// was not sent must not count, or retries during an outage fill the
+    /// hour and the storm guard then drops them for good.
+    pub fn refund_forward_budget(&self, account_id: i64) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM rule_forwards WHERE rowid = (
+                SELECT rowid FROM rule_forwards WHERE account_id = ?1
+                ORDER BY at DESC, rowid DESC LIMIT 1
+            )",
+            [account_id],
+        )?;
+        Ok(())
+    }
+
     pub fn sieve_settings(&self, account_id: i64) -> Result<SieveSettings> {
         Ok(self
             .db()

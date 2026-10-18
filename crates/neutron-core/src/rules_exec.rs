@@ -130,6 +130,19 @@ pub async fn run(
     let refs = store.message_refs(ids)?;
     let mut touched = BTreeSet::new();
     let now = chrono::Utc::now().timestamp();
+    // The folder checkpoint has already moved. Admit every candidate before
+    // the first IMAP or SMTP await, so a sync that is cancelled mid-batch
+    // leaves the rest pending and the next sync retries them. One message-id
+    // is one run: a second copy in this batch must not forward before the
+    // first has recorded what succeeded.
+    struct Queued {
+        uid: u32,
+        id: i64,
+        key: String,
+        done: Vec<String>,
+    }
+    let mut queued = Vec::new();
+    let mut seen_keys = BTreeSet::new();
     for (acc, fid, uid, mid) in refs {
         if acc != account_id || fid != folder_id {
             continue;
@@ -143,7 +156,12 @@ pub async fn run(
         } else {
             format!("mid:{mid}")
         };
-        let done = if automatic {
+        if automatic {
+            if !seen_keys.insert(key.clone()) {
+                rep.skipped
+                    .push(format!("UID {uid}: rules already ran on this message"));
+                continue;
+            }
             match store.admit_rule_run(account_id, &key, folder_id, uid, now)? {
                 RuleAdmission::Finished => {
                     rep.skipped
@@ -155,22 +173,39 @@ pub async fn run(
                         .push(format!("UID {uid}: rule actions are waiting to retry"));
                     continue;
                 }
-                RuleAdmission::Proceed { done } => done,
+                RuleAdmission::Proceed { done } => {
+                    let Some(id) = store.ids_for_uids(fid, &[uid])?.first().copied() else {
+                        continue;
+                    };
+                    queued.push(Queued { uid, id, key, done });
+                }
             }
         } else {
-            Vec::new()
-        };
-        let Some(id) = store.ids_for_uids(fid, &[uid])?.first().copied() else {
-            continue;
-        };
-        let raw = store.raw(id)?;
+            let Some(id) = store.ids_for_uids(fid, &[uid])?.first().copied() else {
+                continue;
+            };
+            queued.push(Queued {
+                uid,
+                id,
+                key,
+                done: Vec::new(),
+            });
+        }
+    }
+    for job in queued {
+        let raw = store.raw(job.id)?;
         let facts = MessageFacts::from_raw(&raw, &cfg.email);
         let plan = match rules::plan(rules, &facts, &source.display) {
             Ok(p) => p,
             Err(e) => {
                 if automatic {
-                    rep.errors
-                        .push(note_failure(store, account_id, &key, uid, &e.to_string())?);
+                    rep.errors.push(note_failure(
+                        store,
+                        account_id,
+                        &job.key,
+                        job.uid,
+                        &e.to_string(),
+                    )?);
                 } else {
                     rep.errors.push(e.to_string());
                 }
@@ -179,14 +214,14 @@ pub async fn run(
         };
         if plan.is_empty() {
             if automatic {
-                store.complete_rule_run(account_id, &key)?;
+                store.complete_rule_run(account_id, &job.key)?;
             }
             continue;
         }
         rep.matched += 1;
         rep.skipped.extend(plan.skipped.iter().cloned());
-        let done: BTreeSet<String> = done.into_iter().collect();
-        let track = automatic.then_some(key.as_str());
+        let done: BTreeSet<String> = job.done.iter().cloned().collect();
+        let track = automatic.then_some(job.key.as_str());
         if let Err(e) = apply(
             store,
             session,
@@ -196,7 +231,7 @@ pub async fn run(
             &source,
             trash.as_ref(),
             &folders,
-            uid,
+            job.uid,
             &raw,
             &facts,
             &plan,
@@ -207,15 +242,20 @@ pub async fn run(
         )
         .await
         {
-            tracing::warn!(uid, "rule action failed: {e}");
+            tracing::warn!(uid = job.uid, "rule action failed: {e}");
             if automatic {
-                rep.errors
-                    .push(note_failure(store, account_id, &key, uid, &e.to_string())?);
+                rep.errors.push(note_failure(
+                    store,
+                    account_id,
+                    &job.key,
+                    job.uid,
+                    &e.to_string(),
+                )?);
             } else {
-                rep.errors.push(format!("UID {uid}: {e}"));
+                rep.errors.push(format!("UID {}: {e}", job.uid));
             }
         } else if automatic {
-            store.complete_rule_run(account_id, &key)?;
+            store.complete_rule_run(account_id, &job.key)?;
         }
     }
     rep.touched = touched.into_iter().collect();
@@ -270,6 +310,19 @@ fn note_failure(
     };
     store.fail_rule_run(account_id, message_key, &message, now)?;
     Ok(message)
+}
+
+/// The forward was not sent. Return its slot and the error to retry.
+fn unsent_forward(
+    store: &Store,
+    account_id: i64,
+    to: &str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    match store.refund_forward_budget(account_id) {
+        Ok(()) => format!("forward to {to}: {error}"),
+        Err(refund) => format!("forward to {to}: {error} ({refund})"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,9 +421,17 @@ async fn apply(
             ));
             continue;
         }
-        let built = crate::smtp::build_auto_forward(cfg, to, &facts.subject, raw)?;
+        let built = match crate::smtp::build_auto_forward(cfg, to, &facts.subject, raw) {
+            Ok(built) => built,
+            Err(e) => {
+                // A slot is only a message that was sent. Building can fail
+                // before SMTP, and a retry must not inherit that slot.
+                problems.push(unsent_forward(store, account_id, to, &e));
+                continue;
+            }
+        };
         if let Err(e) = crate::smtp::send_built(cfg, password, &built).await {
-            problems.push(format!("forward to {to}: {e}"));
+            problems.push(unsent_forward(store, account_id, to, &e));
             continue;
         }
         remember(&key)?;

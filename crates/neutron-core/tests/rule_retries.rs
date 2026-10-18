@@ -41,6 +41,22 @@ fn rule(actions: Vec<Action>) -> Rule {
 }
 
 #[test]
+fn a_forward_that_was_not_sent_returns_its_hourly_slot() {
+    let store = Store::open_in_memory().unwrap();
+    let account = store.add_account(&cfg()).unwrap();
+    let limit = neutron_core::rules::MAX_FORWARDS_PER_HOUR;
+    // Nothing reserved is not an error and does not open a slot.
+    store.refund_forward_budget(account).unwrap();
+    for _ in 0..limit {
+        assert!(store.take_forward_budget(account, limit).unwrap());
+    }
+    assert!(!store.take_forward_budget(account, limit).unwrap());
+    store.refund_forward_budget(account).unwrap();
+    assert!(store.take_forward_budget(account, limit).unwrap());
+    assert!(!store.take_forward_budget(account, limit).unwrap());
+}
+
+#[test]
 fn backoff_grows_and_stays_bounded() {
     assert_eq!(rule_backoff_secs(1), 60);
     assert_eq!(rule_backoff_secs(2), 120);
