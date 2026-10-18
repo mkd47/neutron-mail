@@ -55,10 +55,18 @@
     ],
     "linux": {
       "deb": {
-        "desktopTemplate": "neutron-mail.desktop"
+        "desktopTemplate": "neutron-mail.desktop",
+        "depends": [
+          "libssl3t64 | libssl3",
+          "libdbus-1-3"
+        ]
       },
       "rpm": {
-        "desktopTemplate": "neutron-mail.desktop"
+        "desktopTemplate": "neutron-mail.desktop",
+        "depends": [
+          "openssl-libs",
+          "dbus-libs"
+        ]
       }
     }
   }

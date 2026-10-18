@@ -64,6 +64,47 @@ jobs:
       - name: npm audit
         run: npm audit
 
+  deb:
+    # tauri.conf.json ships a .deb target too; until now only the RPM was
+    # ever built, so a broken .deb (bad Depends, missing library) went unseen.
+    name: DEB build (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (Tauri v2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            librsvg2-dev libxdo-dev libssl-dev build-essential pkg-config file
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Release (LTO) artifacts only; keeps this cache apart from the
+          # debug/test cache of the ubuntu job.
+          key: release-deb
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install tauri-cli (cached in ~/.cargo/bin by rust-cache)
+        run: cargo install --locked tauri-cli@^2
+      - run: npm ci
+      - name: cargo tauri build (DEB)
+        run: cargo tauri build --bundles deb
+      - name: Inspect and install the DEB
+        run: |
+          deb=$(ls target/release/bundle/deb/*.deb)
+          dpkg-deb --info "$deb"
+          sudo apt-get install -y "./$deb"
+          ! ldd /usr/bin/neutron-mail | grep "not found"
+          ls -l "$deb" /usr/bin/neutron-mail
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neutron-mail-deb-ubuntu
+          path: target/release/bundle/deb/*.deb
+          retention-days: 14
+
   fedora:
     name: RPM build (Fedora 44 container)
     runs-on: ubuntu-latest
@@ -92,6 +133,7 @@ jobs:
           rpm -qip target/release/bundle/rpm/*.rpm
           dnf install -y target/release/bundle/rpm/*.rpm
           ! ldd /usr/bin/neutron-mail | grep "not found"
+          ls -l target/release/bundle/rpm/*.rpm /usr/bin/neutron-mail
       - uses: actions/upload-artifact@v4
         with:
           name: neutron-mail-rpm-fedora44
