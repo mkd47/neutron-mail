@@ -240,43 +240,76 @@ fn mime_essence(mime: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// How much of the file start is sniffed. A preamble (doctype, comments)
+/// past this window can hide a later root tag; the window is large enough
+/// for a normal SVG or XHTML prologue.
+const MARKUP_SNIFF_BYTES: usize = 4096;
+
 /// HTML, XHTML and SVG are active even when the filename and the declared
 /// type are innocuous: file managers sniff the bytes and open a browser.
 /// Only the start of the file is inspected, after a BOM, whitespace, an XML
-/// declaration and comments, which is how those documents are usually wrapped.
+/// declaration, comments and a non-HTML doctype, which is how those
+/// documents are usually wrapped.
 fn looks_like_active_markup(data: &[u8]) -> bool {
+    if let Some(text) = utf16_prefix(data) {
+        return markup_at_start(&text.to_ascii_lowercase());
+    }
     let data = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
-    let head = &data[..data.len().min(1024)];
-    let mut rest = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let head = &data[..data.len().min(MARKUP_SNIFF_BYTES)];
+    markup_at_start(&String::from_utf8_lossy(head).to_ascii_lowercase())
+}
+
+/// UTF-16 HTML/SVG (BOM plus the same tags) is active in a browser. Only a
+/// leading BOM is treated as UTF-16, so an ordinary binary file is not
+/// decoded.
+fn utf16_prefix(data: &[u8]) -> Option<String> {
+    let (rest, little) = if let Some(rest) = data.strip_prefix(&[0xFF, 0xFE]) {
+        (rest, true)
+    } else {
+        let rest = data.strip_prefix(&[0xFE, 0xFF])?;
+        (rest, false)
+    };
+    let n = rest.len().min(MARKUP_SNIFF_BYTES.saturating_mul(2));
+    let n = n - (n % 2);
+    let (chunks, _) = rest[..n].as_chunks::<2>();
+    let units: Vec<u16> = chunks
+        .iter()
+        .map(|c| {
+            if little {
+                u16::from_le_bytes(*c)
+            } else {
+                u16::from_be_bytes(*c)
+            }
+        })
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+fn markup_at_start(mut rest: &str) -> bool {
     loop {
         let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
         if trimmed.len() != rest.len() {
-            rest = trimmed.to_string();
+            rest = trimmed;
+            continue;
         }
-        if is_active_markup_start(&rest) {
+        if is_active_markup_start(rest) {
             return true;
         }
-        if let Some(after) = rest.strip_prefix("<?xml") {
-            if let Some(end) = after.find("?>") {
-                rest = after[end + 2..].to_string();
-                continue;
-            }
+        match skip_leading_preamble(rest) {
+            Some(next) if next.len() < rest.len() => rest = next,
+            _ => return false,
         }
-        if let Some(after) = rest.strip_prefix("<!--") {
-            if let Some(end) = after.find("-->") {
-                rest = after[end + 3..].to_string();
-                continue;
-            }
-        }
-        return false;
     }
 }
 
 fn is_active_markup_start(s: &str) -> bool {
-    if s.starts_with("<!doctype html") {
+    // `<!DOCTYPE svg` is the document, even when the `<svg` tag sits past a
+    // long public identifier. The same for HTML. Other doctypes are skipped
+    // so the root element can still be seen.
+    if starts_with_doctype(s, "html") || starts_with_doctype(s, "svg") {
         return true;
     }
-    for tag in ["<html", "<svg", "<script"] {
+    for tag in ["<html", "<head", "<body", "<svg", "<script"] {
         if let Some(after) = s.strip_prefix(tag) {
             if after.starts_with([' ', '\t', '\n', '\r', '>', '/']) {
                 return true;
@@ -284,6 +317,64 @@ fn is_active_markup_start(s: &str) -> bool {
         }
     }
     false
+}
+
+/// `<!DOCTYPE svg PUBLIC …>` and `<!DOCTYPE\nHTML>`.
+fn starts_with_doctype(s: &str, name: &str) -> bool {
+    let Some(after) = s.strip_prefix("<!doctype") else {
+        return false;
+    };
+    let after = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let Some(rest) = after.strip_prefix(name) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '>')
+}
+
+/// Drop one leading processing instruction, comment, or doctype. The caller
+/// has already treated an HTML or SVG doctype as active.
+fn skip_leading_preamble(s: &str) -> Option<&str> {
+    if let Some(after) = s.strip_prefix("<?") {
+        let end = after.find("?>")?;
+        return Some(&after[end + 2..]);
+    }
+    if let Some(after) = s.strip_prefix("<!--") {
+        let end = after.find("-->")?;
+        return Some(&after[end + 3..]);
+    }
+    if let Some(after) = s.strip_prefix("<!doctype") {
+        let end = declaration_end(after)?;
+        return Some(&after[end..]);
+    }
+    None
+}
+
+/// Offset just past the `>` that closes a declaration, ignoring `>` inside
+/// quotes or a `[…]` internal subset.
+fn declaration_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut brackets = 0i32;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '[' => brackets += 1,
+            ']' => {
+                if brackets == 0 {
+                    return None;
+                }
+                brackets -= 1;
+            }
+            '>' if brackets == 0 => return Some(i + c.len_utf8()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Content-type guess for an outgoing file (by extension; the UI never
@@ -498,6 +589,44 @@ mod tests {
             "image.png",
             "image/png",
             b"<?xml version=\"1.0\"?>\n<!-- logo -->\n<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"
+        ));
+        // Inkscape / Illustrator SVG: a doctype sits between the XML
+        // declaration and `<svg`. Stopping at that doctype would miss it.
+        assert!(is_risky(
+            "image.png",
+            "image/png",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"
+        ));
+        assert!(is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<head><script>alert(1)</script></head>"
+        ));
+        assert!(is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<body onload=\"alert(1)\"></body>"
+        ));
+        // `>` inside a doctype subset is not the end of the declaration.
+        assert!(is_risky(
+            "page.txt",
+            "text/plain",
+            b"<!DOCTYPE note [\n  <!ELEMENT note (to)>\n]>\n<html><script>x</script></html>"
+        ));
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "<html><script>x</script></html>".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        assert!(is_risky("invoice.pdf", "application/pdf", &utf16));
+        assert!(!is_risky(
+            "settings.txt",
+            "text/plain",
+            b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict></dict></plist>\n"
+        ));
+        assert!(!is_risky(
+            "notes.txt",
+            "text/plain",
+            b"<header>not a document</header>"
         ));
         assert!(!is_risky(
             "notes.txt",
