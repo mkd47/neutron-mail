@@ -27,6 +27,7 @@ pub mod rules_exec;
 pub mod sanitize;
 pub mod search;
 pub mod secrets;
+pub mod sieve_state;
 pub mod smtp;
 pub mod store;
 pub mod sync;

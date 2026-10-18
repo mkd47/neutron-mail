@@ -523,6 +523,7 @@ async fn sieve_upload_and_server_side_filtering() {
             SieveSettings {
                 port: 10419,
                 active: true,
+                script_hash: None,
             },
         )
         .unwrap();
@@ -553,4 +554,199 @@ async fn sieve_upload_and_server_side_filtering() {
     ms.delete_script(managesieve::SCRIPT_NAME).await.unwrap();
     ms.logout().await;
     imap::delete_folder(&mut s, &dest_wire).await.unwrap();
+}
+
+fn count_subject(store: &Store, folder: &Folder, subject: &str) -> usize {
+    store
+        .messages(folder.id, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.subject == subject)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_rule_retries_without_repeating_forward_or_copy() {
+    if !common::enabled() {
+        return;
+    }
+    let (_d, store, acc, mut s) = setup().await;
+    let tag = common::unique("retry");
+    let copies = common::unique("Copies");
+    let missing = common::unique("Missing");
+    imap::create_folder(&mut s, &copies).await.unwrap();
+    resync(&store, acc).await;
+    let copy_folder = by_display(&store, acc, &copies).unwrap();
+    store
+        .save_rules(&[subject_rule(
+            &tag,
+            vec![
+                Action::Copy {
+                    folder: copy_folder.display.clone(),
+                },
+                Action::Forward {
+                    to: "accounting@example.test".into(),
+                },
+                Action::Move {
+                    folder: missing.clone(),
+                },
+            ],
+        )])
+        .unwrap();
+    let subject = format!("Invoice {tag}");
+    imap::append(&mut s, "INBOX", &msg(&subject, &common::unique("r")), false)
+        .await
+        .unwrap();
+    let rep = resync(&store, acc).await;
+    assert!(
+        rep.rule_errors.iter().any(|e| e.contains("retry")),
+        "{:?}",
+        rep.rule_errors
+    );
+    let inbox = store.folder_by_role(acc, "inbox").unwrap().unwrap();
+    assert_eq!(count_subject(&store, &inbox, &subject), 1);
+    assert_eq!(count_subject(&store, &copy_folder, &subject), 1);
+    let progress = store.rule_runs(acc).unwrap();
+    assert!(
+        progress.iter().any(|(_, run)| {
+            run.status == "pending"
+                && run.done.iter().any(|d| d.starts_with("forward:"))
+                && run.done.iter().any(|d| d.starts_with("copy:"))
+                && !run.done.iter().any(|d| d.starts_with("move:"))
+        }),
+        "{progress:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rep2 = resync(&store, acc).await;
+    let fwd = format!("Fwd: {subject}");
+    assert_eq!(count_subject(&store, &inbox, &fwd), 1, "{rep2:?}");
+    assert_eq!(count_subject(&store, &copy_folder, &subject), 1);
+    assert_eq!(count_subject(&store, &inbox, &subject), 1);
+
+    store.release_rule_retries(acc).unwrap();
+    let rep3 = resync(&store, acc).await;
+    assert!(
+        rep3.rule_errors.iter().any(|e| e.contains("retry")),
+        "{:?}",
+        rep3.rule_errors
+    );
+    assert_eq!(
+        count_subject(&store, &inbox, &fwd),
+        1,
+        "forward was not repeated"
+    );
+    assert_eq!(
+        count_subject(&store, &copy_folder, &subject),
+        1,
+        "copy was not repeated"
+    );
+    assert_eq!(count_subject(&store, &inbox, &subject), 1);
+
+    imap::create_folder(&mut s, &missing).await.unwrap();
+    store.release_rule_retries(acc).unwrap();
+    let rep4 = resync(&store, acc).await;
+    assert!(rep4.rule_errors.is_empty(), "{:?}", rep4.rule_errors);
+    let dest = by_display(&store, acc, &missing).unwrap();
+    assert_eq!(count_subject(&store, &dest, &subject), 1);
+    assert_eq!(count_subject(&store, &inbox, &subject), 0);
+    assert_eq!(count_subject(&store, &copy_folder, &subject), 1);
+    assert_eq!(count_subject(&store, &inbox, &fwd), 1);
+    let rep5 = resync(&store, acc).await;
+    assert!(rep5.rule_errors.is_empty(), "{:?}", rep5.rule_errors);
+    assert_eq!(count_subject(&store, &copy_folder, &subject), 1);
+    assert_eq!(count_subject(&store, &inbox, &fwd), 1);
+    assert_eq!(count_subject(&store, &dest, &subject), 1);
+
+    imap::delete_folder(&mut s, &copies).await.unwrap();
+    imap::delete_folder(&mut s, &missing).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sieve_local_edit_reuploads_and_legacy_hash_converges() {
+    if !common::enabled() {
+        return;
+    }
+    let cfg = common::config(Security::Tls);
+    let (_d, store, acc, _s) = setup().await;
+    let tag = common::unique("sievever");
+    let mut rule = subject_rule(&tag, vec![Action::Flag]);
+    rule.server_side = true;
+    store.save_rules(&[rule]).unwrap();
+
+    let first = neutron_core::sieve_state::upload(&store, &cfg, common::PASSWORD, acc, 10419)
+        .await
+        .unwrap();
+    let stored = store.sieve_settings(acc).unwrap();
+    assert!(stored.active);
+    assert_eq!(
+        stored.script_hash.as_deref(),
+        Some(neutron_core::sieve_state::script_hash(&first.script).as_str())
+    );
+
+    let mut ms = managesieve::Client::connect(&cfg, 10419, common::PASSWORD)
+        .await
+        .unwrap();
+    let remote = ms.get_script(managesieve::SCRIPT_NAME).await.unwrap();
+    assert_eq!(
+        neutron_core::sieve_state::script_hash(&remote),
+        stored.script_hash.clone().unwrap()
+    );
+
+    let mut rules = store.rules().unwrap();
+    rules[0].actions.push(Action::MarkRead);
+    store.save_rules(&rules).unwrap();
+    let desired = neutron_core::sieve_state::desired_script(&store, acc).unwrap();
+    assert!(neutron_core::sieve_state::is_stale(
+        &store.sieve_settings(acc).unwrap(),
+        &desired.script
+    ));
+    let still_old = ms.get_script(managesieve::SCRIPT_NAME).await.unwrap();
+    assert_eq!(
+        neutron_core::sieve_state::script_hash(&still_old),
+        neutron_core::sieve_state::script_hash(&first.script)
+    );
+
+    assert_eq!(
+        neutron_core::sieve_state::reconcile(&store, &cfg, common::PASSWORD, acc)
+            .await
+            .unwrap(),
+        neutron_core::sieve_state::SieveReconcile::Uploaded
+    );
+    let updated = ms.get_script(managesieve::SCRIPT_NAME).await.unwrap();
+    let hash = neutron_core::sieve_state::script_hash(&updated);
+    assert_eq!(
+        store.sieve_settings(acc).unwrap().script_hash.as_deref(),
+        Some(hash.as_str())
+    );
+    assert_ne!(hash, neutron_core::sieve_state::script_hash(&first.script));
+    assert!(updated.contains(r#"\\Seen"#), "{updated}");
+    assert_eq!(
+        neutron_core::sieve_state::reconcile(&store, &cfg, common::PASSWORD, acc)
+            .await
+            .unwrap(),
+        neutron_core::sieve_state::SieveReconcile::Current
+    );
+
+    store
+        .set_sieve_settings(
+            acc,
+            SieveSettings {
+                port: 10419,
+                active: true,
+                script_hash: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        neutron_core::sieve_state::reconcile(&store, &cfg, common::PASSWORD, acc)
+            .await
+            .unwrap(),
+        neutron_core::sieve_state::SieveReconcile::Current
+    );
+    assert!(store.sieve_settings(acc).unwrap().script_hash.is_some());
+
+    ms.set_active("").await.unwrap();
+    ms.delete_script(managesieve::SCRIPT_NAME).await.unwrap();
+    ms.logout().await;
 }

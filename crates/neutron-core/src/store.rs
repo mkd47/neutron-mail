@@ -160,6 +160,47 @@ fn migrate_folder_sync_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Columns added after the first rules release. Existing `rule_runs` rows
+/// are completed claims and stay `done`, so they are not run again.
+fn migrate_rule_run_state(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(rule_runs)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (c, ty) in [
+        ("status", "TEXT NOT NULL DEFAULT 'done'"),
+        ("folder_id", "INTEGER"),
+        ("uid", "INTEGER"),
+        ("done_actions", "TEXT NOT NULL DEFAULT '[]'"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_try", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_error", "TEXT"),
+        // Older claims were already shown (or never failed). New failures
+        // start at 0 and are reported once.
+        ("reported", "INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        if !cols.iter().any(|x| x == c) {
+            conn.execute_batch(&format!("ALTER TABLE rule_runs ADD COLUMN {c} {ty}"))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS rule_runs_due ON rule_runs(account_id, status, next_try)",
+    )?;
+    Ok(())
+}
+
+/// Hash of the ManageSieve script last uploaded for an account. NULL on
+/// caches from before scripts were versioned, which is treated as drift.
+fn migrate_sieve_hash(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('account_settings') WHERE name = 'sieve_hash'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE account_settings ADD COLUMN sieve_hash TEXT")?;
+    }
+    Ok(())
+}
+
 /// What the last completed sync of a folder saw on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FolderSyncState {
@@ -438,6 +479,8 @@ impl Store {
                  ALTER TABLE account_settings ADD COLUMN sieve_active INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        migrate_sieve_hash(&conn)?;
+        migrate_rule_run_state(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -1945,11 +1988,61 @@ fn restrict_permissions(_path: &Path) {}
 // ---- folder management, rules ----------------------------------------------
 
 /// Sieve settings of an account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SieveSettings {
     pub port: u16,
     /// Our script is uploaded and active on the server.
     pub active: bool,
+    /// SHA-256 hex of the script bytes last uploaded. `None` when the
+    /// script is off, or when an older cache recorded only the active flag.
+    #[serde(default)]
+    pub script_hash: Option<String>,
+}
+
+/// Automatic rule attempts before the run is left failed and surfaced.
+pub const MAX_RULE_ATTEMPTS: i64 = 5;
+
+/// Seconds to wait after `attempts` failures (1, 2, 4, 8, then 16 minutes).
+pub fn rule_backoff_secs(attempts: i64) -> i64 {
+    let exp = attempts.saturating_sub(1).clamp(0, 4) as u32;
+    60 * (1_i64 << exp)
+}
+
+/// Whether an automatic rule run may execute now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleAdmission {
+    /// `done` lists action ids that already succeeded and must be skipped.
+    Proceed { done: Vec<String> },
+    /// Succeeded earlier, or gave up after [`MAX_RULE_ATTEMPTS`].
+    Finished,
+    /// A previous attempt failed and the backoff has not elapsed.
+    Waiting { next_try: i64 },
+}
+
+/// Result of recording one failed automatic rule attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleFailure {
+    pub attempts: i64,
+    pub gave_up: bool,
+    /// When the next attempt may run. `None` once the run has given up.
+    pub next_try: Option<i64>,
+}
+
+/// Stored progress for one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRunState {
+    pub status: String,
+    pub done: Vec<String>,
+    pub attempts: i64,
+    pub next_try: i64,
+    pub last_error: Option<String>,
+    pub folder_id: Option<i64>,
+    pub uid: Option<u32>,
+}
+
+fn parse_done(json: &str) -> Result<Vec<String>> {
+    serde_json::from_str(json)
+        .map_err(|e| Error::Invalid(format!("rule progress is unreadable: {e}")))
 }
 
 impl Store {
@@ -2177,18 +2270,265 @@ impl Store {
         self.rules()
     }
 
-    /// Record that rules ran on a message; false if they already had
-    /// (loop guard against re-processing, e.g. after a UIDVALIDITY reset or
-    /// a message filed back into the INBOX).
-    pub fn claim_rule_run(&self, account_id: i64, message_key: &str) -> Result<bool> {
+    /// Open an automatic rule run. A finished row is the loop guard (a
+    /// message filed back into the inbox is not processed again). A pending
+    /// row is retried, skipping actions already recorded, once `now` has
+    /// reached `next_try`. The sync checkpoint is not involved: it advances
+    /// before rules run, so retries are found from this table.
+    pub fn admit_rule_run(
+        &self,
+        account_id: i64,
+        message_key: &str,
+        folder_id: i64,
+        uid: u32,
+        now: i64,
+    ) -> Result<RuleAdmission> {
         if message_key.is_empty() {
-            return Ok(true);
+            return Ok(RuleAdmission::Proceed { done: Vec::new() });
         }
-        let n = self.db().execute(
-            "INSERT OR IGNORE INTO rule_runs (account_id, message_key, at) VALUES (?1, ?2, ?3)",
+        let db = self.db();
+        let existing = db
+            .query_row(
+                "SELECT status, done_actions, next_try FROM rule_runs
+                 WHERE account_id = ?1 AND message_key = ?2",
+                params![account_id, message_key],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match existing {
+            Some((status, _, _)) if status == "done" || status == "failed" => {
+                Ok(RuleAdmission::Finished)
+            }
+            Some((status, _, next_try)) if status == "pending" && next_try > now => {
+                Ok(RuleAdmission::Waiting { next_try })
+            }
+            Some((_, done_json, _)) => {
+                let done = parse_done(&done_json)?;
+                db.execute(
+                    "UPDATE rule_runs SET folder_id = ?3, uid = ?4
+                     WHERE account_id = ?1 AND message_key = ?2 AND status = 'pending'",
+                    params![account_id, message_key, folder_id, uid],
+                )?;
+                Ok(RuleAdmission::Proceed { done })
+            }
+            None => {
+                db.execute(
+                    "INSERT INTO rule_runs
+                       (account_id, message_key, at, status, folder_id, uid, done_actions, attempts, next_try, reported)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, '[]', 0, ?3, 0)",
+                    params![account_id, message_key, now, folder_id, uid],
+                )?;
+                Ok(RuleAdmission::Proceed { done: Vec::new() })
+            }
+        }
+    }
+
+    /// Remember one action that already succeeded, so a retry skips it.
+    pub fn record_rule_action(
+        &self,
+        account_id: i64,
+        message_key: &str,
+        action: &str,
+    ) -> Result<()> {
+        if message_key.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT done_actions FROM rule_runs WHERE account_id = ?1 AND message_key = ?2",
+                params![account_id, message_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        let mut done = parse_done(&current)?;
+        if !done.iter().any(|d| d == action) {
+            done.push(action.to_string());
+        }
+        let json = serde_json::to_string(&done).map_err(|e| Error::Invalid(e.to_string()))?;
+        tx.execute(
+            "UPDATE rule_runs SET done_actions = ?3 WHERE account_id = ?1 AND message_key = ?2",
+            params![account_id, message_key, json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The run finished; the message is not processed again.
+    pub fn complete_rule_run(&self, account_id: i64, message_key: &str) -> Result<()> {
+        if message_key.is_empty() {
+            return Ok(());
+        }
+        self.db().execute(
+            "UPDATE rule_runs SET status = 'done', at = ?3, last_error = NULL, reported = 1
+             WHERE account_id = ?1 AND message_key = ?2",
             params![account_id, message_key, chrono::Utc::now().timestamp()],
         )?;
-        Ok(n == 1)
+        Ok(())
+    }
+
+    /// Count a failed attempt. After [`MAX_RULE_ATTEMPTS`] the run is
+    /// `failed` and stays that way; earlier failures wait out
+    /// [`rule_backoff_secs`]. Completed actions are kept.
+    pub fn fail_rule_run(
+        &self,
+        account_id: i64,
+        message_key: &str,
+        error: &str,
+        now: i64,
+    ) -> Result<RuleFailure> {
+        let db = self.db();
+        let prev: i64 = db
+            .query_row(
+                "SELECT attempts FROM rule_runs WHERE account_id = ?1 AND message_key = ?2",
+                params![account_id, message_key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let attempts = prev + 1;
+        let gave_up = attempts >= MAX_RULE_ATTEMPTS;
+        let next_try = (!gave_up).then(|| now.saturating_add(rule_backoff_secs(attempts)));
+        let status = if gave_up { "failed" } else { "pending" };
+        db.execute(
+            "UPDATE rule_runs SET attempts = ?3, status = ?4, next_try = ?5, last_error = ?6,
+               at = ?7, reported = 0
+             WHERE account_id = ?1 AND message_key = ?2",
+            params![
+                account_id,
+                message_key,
+                attempts,
+                status,
+                next_try.unwrap_or(0),
+                error,
+                now
+            ],
+        )?;
+        Ok(RuleFailure {
+            attempts,
+            gave_up,
+            next_try,
+        })
+    }
+
+    /// Pending runs in this folder whose backoff has elapsed.
+    pub fn due_rule_uids(&self, account_id: i64, folder_id: i64, now: i64) -> Result<Vec<u32>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT uid FROM rule_runs
+             WHERE account_id = ?1 AND folder_id = ?2 AND status = 'pending'
+               AND next_try <= ?3 AND uid IS NOT NULL",
+        )?;
+        let rows = st.query_map(params![account_id, folder_id, now], |r| r.get::<_, u32>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The message left the folder, so a pending run cannot continue.
+    pub fn fail_pending_uid(
+        &self,
+        account_id: i64,
+        folder_id: i64,
+        uid: u32,
+        error: &str,
+    ) -> Result<bool> {
+        let n = self.db().execute(
+            "UPDATE rule_runs SET status = 'failed', attempts = max(attempts, ?4),
+               last_error = ?5, reported = 0, at = ?6
+             WHERE account_id = ?1 AND folder_id = ?2 AND uid = ?3 AND status = 'pending'",
+            params![
+                account_id,
+                folder_id,
+                uid,
+                MAX_RULE_ATTEMPTS,
+                error,
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Make every pending retry for the account eligible now.
+    pub fn release_rule_retries(&self, account_id: i64) -> Result<usize> {
+        Ok(self.db().execute(
+            "UPDATE rule_runs SET next_try = 0 WHERE account_id = ?1 AND status = 'pending'",
+            [account_id],
+        )?)
+    }
+
+    /// Permanent failures not yet included in a sync report.
+    pub fn unreported_rule_failures(&self, account_id: i64) -> Result<Vec<String>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT last_error FROM rule_runs
+             WHERE account_id = ?1 AND status = 'failed' AND reported = 0 AND last_error IS NOT NULL
+             ORDER BY at, message_key",
+        )?;
+        let rows = st.query_map([account_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn mark_rule_failures_reported(&self, account_id: i64) -> Result<()> {
+        self.db().execute(
+            "UPDATE rule_runs SET reported = 1
+             WHERE account_id = ?1 AND status = 'failed' AND reported = 0",
+            [account_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn rule_run(&self, account_id: i64, message_key: &str) -> Result<Option<RuleRunState>> {
+        self.db()
+            .query_row(
+                "SELECT status, done_actions, attempts, next_try, last_error, folder_id, uid
+                 FROM rule_runs WHERE account_id = ?1 AND message_key = ?2",
+                params![account_id, message_key],
+                |r| {
+                    Ok(RuleRunState {
+                        status: r.get(0)?,
+                        done: parse_done(&r.get::<_, String>(1)?).unwrap_or_default(),
+                        attempts: r.get(2)?,
+                        next_try: r.get(3)?,
+                        last_error: r.get(4)?,
+                        folder_id: r.get(5)?,
+                        uid: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn rule_runs(&self, account_id: i64) -> Result<Vec<(String, RuleRunState)>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT message_key, status, done_actions, attempts, next_try, last_error, folder_id, uid
+             FROM rule_runs WHERE account_id = ?1 ORDER BY message_key",
+        )?;
+        let rows = st.query_map([account_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RuleRunState {
+                    status: r.get(1)?,
+                    done: parse_done(&r.get::<_, String>(2)?).unwrap_or_default(),
+                    attempts: r.get(3)?,
+                    next_try: r.get(4)?,
+                    last_error: r.get(5)?,
+                    folder_id: r.get(6)?,
+                    uid: r.get(7)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Count a forward against the hourly budget; false = over the limit.
@@ -2215,12 +2555,13 @@ impl Store {
         Ok(self
             .db()
             .query_row(
-                "SELECT sieve_port, sieve_active FROM account_settings WHERE account_id = ?1",
+                "SELECT sieve_port, sieve_active, sieve_hash FROM account_settings WHERE account_id = ?1",
                 [account_id],
                 |r| {
                     Ok(SieveSettings {
                         port: r.get(0)?,
                         active: r.get(1)?,
+                        script_hash: r.get(2)?,
                     })
                 },
             )
@@ -2228,6 +2569,7 @@ impl Store {
             .unwrap_or(SieveSettings {
                 port: crate::managesieve::DEFAULT_PORT,
                 active: false,
+                script_hash: None,
             }))
     }
 
@@ -2236,10 +2578,13 @@ impl Store {
             return Err(Error::Invalid("bad ManageSieve port".into()));
         }
         self.account(account_id)?;
+        let hash = if s.active { s.script_hash } else { None };
         self.db().execute(
-            "INSERT INTO account_settings (account_id, sieve_port, sieve_active) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id) DO UPDATE SET sieve_port = excluded.sieve_port, sieve_active = excluded.sieve_active",
-            params![account_id, s.port, s.active],
+            "INSERT INTO account_settings (account_id, sieve_port, sieve_active, sieve_hash)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET sieve_port = excluded.sieve_port,
+               sieve_active = excluded.sieve_active, sieve_hash = excluded.sieve_hash",
+            params![account_id, s.port, s.active, hash],
         )?;
         Ok(())
     }
